@@ -1,0 +1,16 @@
+CIFAR-100 Model Config (Strategy 2 extension; 6 models x 5 seeds [1,10,42,100,500]),,,,,,,,,,,,
+Model,Batch Size,Epochs,Learning Rate,Weight Decay,Warmup Epochs,ETA_Min,Early Stopping,Classifier (FC),Dropout,Scheduler,Optimizer,Loss
+ViT Base (vit_base_patch16_224),64,40,2.00E-05,1.00E-07,NUM_EPOCHS * 0.06,1.00E-06,8,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+VGG16 (vgg16),64,100,5.00E-04,1.00E-06,NUM_EPOCHS * 0.06,1.00E-06,15,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+ResNet101 (resnet101),128,60,3.00E-04,1.00E-06,NUM_EPOCHS * 0.06,1.00E-06,12,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+MobileNetV2 (mobilenet_v2),128,60,3.00E-04,1.00E-06,NUM_EPOCHS * 0.06,1.00E-06,12,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+DenseNet121 (densenet121),128,60,3.00E-04,1.00E-06,NUM_EPOCHS * 0.06,1.00E-06,12,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+EfficientNetB0 (efficientnet_b0),128,60,5.00E-04,1.00E-06,NUM_EPOCHS * 0.06,1.00E-06,12,"[256, 128]",0.5,Linear warmup+Cosine annealing,Adam,CrossEntropy (label_smoothing=0.1)
+,,,,,,,,,,,,
+Common settings,,,,,,,,,,,,
+Dataset split,45000 train / 5000 val / 10000 test (stratified; official 10k test kept intact),,,,,,,,,,,
+Image size,224x224 (upscaled from 32x32 for ImageNet-pretrained backbones),,,,,,,,,,,
+Strategy 2 k-values,"Baseline (k=1), k=2, k=3, k=4, k=5",,,,,,,,,,,
+Sampler,None (CIFAR-100 is class-balanced; USE_WEIGHTED_SAMPLER=False),,,,,,,,,,,
+Checkpoint pool,KEEP_TOP_K=5 + KEEP_LAST_N=1 (top-5 needed for k<=5); epoch pool deleted after aggregation,,,,,,,,,,,
+Note,"Optimizer hardcoded to Adam in base train.py (ViT used AdamW in prior datasets); kept as Adam to avoid editing source.",,,,,,,,,,,
