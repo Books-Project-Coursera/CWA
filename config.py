@@ -31,7 +31,7 @@ class Config:
     LR_DECAY_FACTOR = 0.5  # Multiply LR by this factor when decaying
     
     # ===================== Sampler Configuration =====================
-    USE_WEIGHTED_SAMPLER = True  # Bật/tắt WeightedRandomSampler (xử lý class imbalance ở data level)
+    USE_WEIGHTED_SAMPLER = False  # Bật/tắt WeightedRandomSampler (xử lý class imbalance ở data level)
     
     # ===================== Cross-Validation Configuration =====================
     USE_CROSS_VALIDATION = False  # Bật/tắt Cross-Validation (dùng sklearn StratifiedKFold)
@@ -40,7 +40,7 @@ class Config:
     # ===================== Loss Function Configuration =====================
     # Loss function: 'cross_entropy' or 'poly_focal'
     LOSS_FUNCTION = 'cross_entropy'  # Thay đổi thành 'poly_focal' để sử dụng PolyFocalLoss
-    LABEL_SMOOTHING = 0.15  # Label smoothing factor (only used for CrossEntropyLoss)
+    LABEL_SMOOTHING = 0.0  # Label smoothing factor (only used for CrossEntropyLoss)
     # PolyFocalLoss parameters (only used when LOSS_FUNCTION = 'poly_focal')
     FOCAL_GAMMA = 2.0       # Focusing parameter: higher = more focus on hard examples
     POLY_EPSILON = 1.0      # Poly coefficient: boosts gradient for ambiguous samples
@@ -88,11 +88,13 @@ class Config:
         RESULTS_DIR = "results"
     
     # Checkpoint management - TỰ ĐỘNG XÓA SAU KHI EVALUATE
-    AUTO_DELETE_CHECKPOINTS = False  # Set True để xóa checkpoints sau khi evaluate, False để giữ lại
+    AUTO_DELETE_CHECKPOINTS = True  # Set True để xóa checkpoints sau khi evaluate, False để giữ lại
+    SAVE_STRATEGY_CHECKPOINTS = False  # Set False để không lưu checkpoint của Strategy 1/2/3 sau evaluate
     KEEP_RESULTS = True             # Luôn giữ results (Excel, charts)
     
     # Random seed for reproducibility
-    RANDOM_SEED = 42
+    SEEDS = [1, 10, 100, 500]
+    RANDOM_SEED = SEEDS[0]
         
     # ===================== W&B Configuration =====================
     # W&B tracking
@@ -123,6 +125,9 @@ class Config:
         
         if cls.EARLY_STOPPING_PATIENCE >= cls.NUM_EPOCHS:
             raise ValueError("Early stopping patience should be less than num_epochs")
+
+        if cls.WARMUP_EPOCHS >= cls.NUM_EPOCHS:
+            raise ValueError("Warmup epochs should be less than num_epochs")
         
         print(f"✓ Config validated successfully")
         print(f"  Dataset: {cls.DATASET_PATH}")

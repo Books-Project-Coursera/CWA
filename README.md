@@ -29,6 +29,21 @@ pip install -r requirements.txt
 python main.py
 ```
 
+CLI overrides are available, so you do not need to edit `config.py` for every server run:
+
+```bash
+python main.py --model resnet18 --run-name resnet18
+python main.py --model resnet18 --seed 100 --run-name resnet18_seed100
+python main.py --model vit_base --batch-size 64 --epochs 50 --lr 2e-5 --fc-layers 256 128 --dropout 0.5
+python main.py --model resnet18,densenet121 --results-dir /scratch/$USER/potato_results
+```
+
+`argparse` is part of the Python standard library, so no extra package is needed in `requirements.txt`.
+
+For concurrent terminals, every run creates an isolated folder under `results/` (or `--results-dir`). Training checkpoints are also isolated per run, so two terminals running the same model will not overwrite each other.
+
+By default, `python main.py --model <name>` runs the configured seeds `1, 10, 100, 500` sequentially. Use `--seed <value>` to run only one seed in a terminal.
+
 Pipeline tự động: Validate config → Load dataset → Train từng model → Evaluate 3 strategies → Export Excel + Charts.
 
 Kết quả mỗi lần chạy lưu riêng tại `results/<run_number>/` gồm:
@@ -111,7 +126,7 @@ Kết quả bao gồm cả **per-class breakdown** (Precision, Recall, F1, Speci
 3. Chọn model trong `MODELS`
 4. Chạy `python main.py`
 
-Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`, `cudnn.deterministic`.
+Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`. Thêm `--deterministic` nếu cần bật deterministic CUDA/cuBLAS.
 
 ## Ghi chú
 
@@ -121,19 +136,22 @@ Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`, `cudnn.deterministic`
 
 ## 💾 Checkpoints
 
-Checkpoints được lưu trong `checkpoints/`:
+Training checkpoints are temporary by default. They are written during training/evaluation, then deleted after evaluation because `AUTO_DELETE_CHECKPOINTS=True`. Strategy checkpoints are not saved because `SAVE_STRATEGY_CHECKPOINTS=False`.
 
 ```
-checkpoints/
-├── vgg16/
-│   ├── epoch_001_val_loss_0.xxxx.pth
-│   ├── epoch_002_val_loss_0.xxxx.pth
-│   ├── best_checkpoint.pth
-│   └── checkpoint_info.json
-├── resnet101/
-│   └── ...
-└── ...
+results/<run_number>/
+├── training_checkpoints/
+│   └── <model_name>/
+│       ├── epoch_001_val_loss_0.xxxx.pth
+│       ├── best_checkpoint.pth
+│       └── checkpoint_info.json
+└── <model_name>/
+    ├── checkpoints/
+    ├── training_curves/
+    └── <model_name>_results.xlsx
 ```
+
+If you pass `--checkpoints-dir /scratch/...`, the code still creates a per-run subfolder inside that directory. Use `--keep-checkpoints` only when you explicitly need checkpoint files for later debugging.
 
 ## 🔧 Tùy chỉnh
 
@@ -178,6 +196,24 @@ MODELS = [
     # Thêm/bớt models ở đây
 ]
 ```
+
+## High-Compute Server Notes
+
+Run one model per terminal or one model per scheduler job:
+
+```bash
+python main.py --model resnet18 --run-name resnet18
+python main.py --model densenet121 --run-name densenet121
+python main.py --model vit_base_patch16_224 --run-name vit_b16
+```
+
+On SLURM-style systems, prefer the scheduler GPU assignment:
+
+```bash
+srun --gres=gpu:1 --cpus-per-task=8 python main.py --model resnet18 --num-workers 8 --results-dir $SCRATCH/potato_results
+```
+
+Use `--deterministic` only when exact reproducibility is more important than speed. That flag sets `CUBLAS_WORKSPACE_CONFIG`; without it, the code uses faster cuDNN benchmarking. There is no separate `culabs` package to install.
 
 ## 📋 Requirements
 

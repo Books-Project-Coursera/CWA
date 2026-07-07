@@ -2,12 +2,29 @@
 Main script to run complete baseline research pipeline
 """
 import os
+import argparse
+import re
 import shutil
+import subprocess
+import sys
 
-# Force CPU mode if GPU has memory issues
-# os.environ['CUDA_VISIBLE_DEVICES'] = ''  # Uncomment this line to force CPU mode
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+def _preparse_environment_args():
+    """Apply CUDA-related CLI args before torch is imported."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--gpu", "--cuda-visible-devices", dest="cuda_visible_devices")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--cublas-workspace-config", default=":4096:8")
+    args, _ = parser.parse_known_args()
+
+    if args.cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", args.cublas_workspace_config)
+
+
+_preparse_environment_args()
 import torch
 import numpy as np
 import pandas as pd
@@ -21,7 +38,222 @@ from evaluate import evaluate_all_strategies, export_results_to_excel, create_pe
 from visualization import print_dataset_statistics
 
 
-def get_next_run_folder(base_results_dir):
+SUPPORTED_MODELS = [
+    "vgg16",
+    "resnet18",
+    "resnet101",
+    "mobilenet_v2",
+    "densenet121",
+    "efficientnet_b0",
+    "convnext_tiny",
+    "vit_base_patch16_224",
+    "swin_tiny_patch4_window7_224",
+    "convit_tiny",
+]
+
+MODEL_ALIASES = {
+    "vit_base": "vit_base_patch16_224",
+    "vit_b16": "vit_base_patch16_224",
+    "efficientnet_b0": "efficientnet_b0",
+    "efficientnet-b0": "efficientnet_b0",
+    "mobilenetv2": "mobilenet_v2",
+    "mobilenet_v2": "mobilenet_v2",
+}
+
+
+def sanitize_run_name(value):
+    """Return a filesystem-safe run name."""
+    value = value.strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._-") or "run"
+
+
+def parse_model_list(values):
+    """Parse repeated, space-separated, or comma-separated model args."""
+    if not values:
+        return None
+
+    models = []
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                models.append(MODEL_ALIASES.get(item, item))
+
+    if any(model.lower() == "all" for model in models):
+        return SUPPORTED_MODELS.copy()
+
+    invalid = [model for model in models if model not in SUPPORTED_MODELS]
+    if invalid:
+        raise ValueError(
+            "Unsupported model(s): "
+            + ", ".join(invalid)
+            + ". Supported models: "
+            + ", ".join(SUPPORTED_MODELS)
+        )
+
+    return models
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate pretrained image classification models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        "--models",
+        dest="models",
+        nargs="+",
+        help="Model(s) to run. Use a space-separated list, comma-separated list, or 'all'.",
+    )
+    parser.add_argument("--dataset-path", help="Dataset directory. Overrides Config.DATASET_PATH.")
+    parser.add_argument("--results-dir", "--output-dir", dest="results_dir", help="Base directory for run outputs.")
+    parser.add_argument(
+        "--checkpoints-dir",
+        help="Optional base directory for training checkpoints. A per-run subfolder is still created.",
+    )
+    parser.add_argument("--run-name", help="Optional readable name for this run folder.")
+    parser.add_argument(
+        "--gpu",
+        "--cuda-visible-devices",
+        dest="cuda_visible_devices",
+        help="CUDA_VISIBLE_DEVICES value, e.g. 0, 1, or 0,1. Set before torch import.",
+    )
+    parser.add_argument("--batch-size", type=int, help="Override Config.BATCH_SIZE.")
+    parser.add_argument("--epochs", type=int, help="Override Config.NUM_EPOCHS.")
+    parser.add_argument("--warmup-epochs", type=int, help="Override Config.WARMUP_EPOCHS.")
+    parser.add_argument("--eta-min", type=float, help="Override Config.ETA_MIN for CosineAnnealingLR.")
+    parser.add_argument("--early-stopping", type=int, help="Override Config.EARLY_STOPPING_PATIENCE.")
+    parser.add_argument(
+        "--fc-layers",
+        nargs="+",
+        type=int,
+        help="Hidden layer sizes for the classifier head, e.g. --fc-layers 256 128.",
+    )
+    parser.add_argument("--dropout", type=float, help="Override Config.DROPOUT_RATE.")
+    parser.add_argument("--num-workers", type=int, help="Override Config.NUM_WORKERS.")
+    parser.add_argument("--seed", type=int, help="Override Config.RANDOM_SEED.")
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        help="Run these seeds sequentially. If omitted and --seed is not set, Config.SEEDS is used.",
+    )
+    parser.add_argument("--lr", type=float, help="Override Config.LEARNING_RATE.")
+    parser.add_argument("--weight-decay", type=float, help="Override Config.WEIGHT_DECAY.")
+    parser.add_argument("--cv", action="store_true", help="Enable cross-validation.")
+    parser.add_argument("--no-cv", action="store_true", help="Disable cross-validation.")
+    parser.add_argument("--cv-splits", type=int, help="Override Config.CV_N_SPLITS.")
+    parser.add_argument("--weighted-sampler", action="store_true", help="Enable WeightedRandomSampler.")
+    parser.add_argument("--no-weighted-sampler", action="store_true", help="Disable WeightedRandomSampler.")
+    parser.add_argument("--auto-delete-checkpoints", action="store_true", help="Delete training checkpoints after evaluation.")
+    parser.add_argument("--keep-checkpoints", action="store_true", help="Keep training checkpoints after evaluation.")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic CUDA behavior. Slower, but more reproducible.",
+    )
+    parser.add_argument(
+        "--cublas-workspace-config",
+        default=":4096:8",
+        help="CUBLAS_WORKSPACE_CONFIG used only with --deterministic.",
+    )
+    return parser.parse_args()
+
+
+def apply_cli_overrides(args):
+    models = parse_model_list(args.models)
+    if models:
+        Config.MODELS = models
+
+    overrides = [
+        ("DATASET_PATH", args.dataset_path),
+        ("RESULTS_DIR", args.results_dir),
+        ("CHECKPOINTS_DIR", args.checkpoints_dir),
+        ("BATCH_SIZE", args.batch_size),
+        ("NUM_EPOCHS", args.epochs),
+        ("WARMUP_EPOCHS", args.warmup_epochs),
+        ("ETA_MIN", args.eta_min),
+        ("EARLY_STOPPING_PATIENCE", args.early_stopping),
+        ("DROPOUT_RATE", args.dropout),
+        ("NUM_WORKERS", args.num_workers),
+        ("RANDOM_SEED", args.seed),
+        ("LEARNING_RATE", args.lr),
+        ("WEIGHT_DECAY", args.weight_decay),
+        ("CV_N_SPLITS", args.cv_splits),
+    ]
+    for attr, value in overrides:
+        if value is not None:
+            setattr(Config, attr, value)
+
+    if args.fc_layers is not None:
+        Config.CLASSIFIER_CONFIG = args.fc_layers
+
+    if args.epochs is not None and args.warmup_epochs is None:
+        Config.WARMUP_EPOCHS = max(1, int(Config.NUM_EPOCHS * 0.1))
+
+    if args.cv and args.no_cv:
+        raise ValueError("Use only one of --cv or --no-cv.")
+    if args.cv:
+        Config.USE_CROSS_VALIDATION = True
+    if args.no_cv:
+        Config.USE_CROSS_VALIDATION = False
+
+    if args.weighted_sampler and args.no_weighted_sampler:
+        raise ValueError("Use only one of --weighted-sampler or --no-weighted-sampler.")
+    if args.weighted_sampler:
+        Config.USE_WEIGHTED_SAMPLER = True
+    if args.no_weighted_sampler:
+        Config.USE_WEIGHTED_SAMPLER = False
+
+    if args.auto_delete_checkpoints and args.keep_checkpoints:
+        raise ValueError("Use only one of --auto-delete-checkpoints or --keep-checkpoints.")
+    if args.auto_delete_checkpoints:
+        Config.AUTO_DELETE_CHECKPOINTS = True
+    if args.keep_checkpoints:
+        Config.AUTO_DELETE_CHECKPOINTS = False
+
+
+def run_seed_jobs_if_needed(args):
+    """Run each configured seed as a separate process with its own output folder."""
+    if args.seed is not None:
+        return False
+
+    seeds = args.seeds if args.seeds else getattr(Config, "SEEDS", None)
+    if not seeds:
+        return False
+
+    seeds = [int(seed) for seed in seeds]
+    if len(seeds) <= 1:
+        Config.RANDOM_SEED = seeds[0]
+        return False
+
+    base_args = sys.argv[1:]
+    original_run_name = args.run_name
+
+    print("\n" + "=" * 70)
+    print(f" MULTI-SEED RUN: {seeds}")
+    print("=" * 70)
+
+    for seed in seeds:
+        child_args = base_args + ["--seed", str(seed)]
+        if original_run_name:
+            child_args += ["--run-name", f"{sanitize_run_name(original_run_name)}_seed{seed}"]
+        else:
+            model_part = "_".join(Config.MODELS) if Config.MODELS else "models"
+            child_args += ["--run-name", f"{sanitize_run_name(model_part)}_seed{seed}"]
+
+        print(f"\n[Seed {seed}] Starting: {sys.executable} {os.path.basename(__file__)} {' '.join(child_args)}")
+        subprocess.run([sys.executable, __file__, *child_args], check=True)
+
+    print("\n" + "=" * 70)
+    print(" MULTI-SEED RUN COMPLETED")
+    print("=" * 70)
+    return True
+
+
+def get_next_run_folder(base_results_dir, run_name=None):
     """
     Tạo folder mới cho mỗi lần chạy
     Tự động tăng số thứ tự: results/1/, results/2/, results/3/, ...
@@ -34,6 +266,33 @@ def get_next_run_folder(base_results_dir):
         run_number: Số thứ tự lần chạy
     """
     os.makedirs(base_results_dir, exist_ok=True)
+
+    if run_name:
+        safe_name = sanitize_run_name(run_name)
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pid = os.getpid()
+        candidates = [
+            safe_name,
+            f"{safe_name}_{suffix}_{pid}",
+        ]
+
+        for candidate in candidates:
+            run_folder = os.path.join(base_results_dir, candidate)
+            try:
+                os.mkdir(run_folder)
+                return run_folder, candidate
+            except FileExistsError:
+                continue
+
+        counter = 1
+        while True:
+            run_id = f"{safe_name}_{suffix}_{pid}_{counter}"
+            run_folder = os.path.join(base_results_dir, run_id)
+            try:
+                os.mkdir(run_folder)
+                return run_folder, run_id
+            except FileExistsError:
+                counter += 1
     
     # Tìm tất cả các folder có dạng số
     existing_runs = []
@@ -43,16 +302,16 @@ def get_next_run_folder(base_results_dir):
             existing_runs.append(int(item))
     
     # Tìm số tiếp theo
-    if existing_runs:
-        next_run = max(existing_runs) + 1
-    else:
-        next_run = 1
+    next_run = max(existing_runs) + 1 if existing_runs else 1
     
     # Tạo folder mới
-    run_folder = os.path.join(base_results_dir, str(next_run))
-    os.makedirs(run_folder, exist_ok=True)
-    
-    return run_folder, next_run
+    while True:
+        run_folder = os.path.join(base_results_dir, str(next_run))
+        try:
+            os.mkdir(run_folder)
+            return run_folder, next_run
+        except FileExistsError:
+            next_run += 1
 
 
 def save_model_results(model_name, results, output_dir):
@@ -206,6 +465,7 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("keep_last_n_checkpoints", Config.KEEP_LAST_N_CHECKPOINTS),
         ("keep_top_k_checkpoints", Config.KEEP_TOP_K_CHECKPOINTS),
         ("auto_delete_checkpoints", Config.AUTO_DELETE_CHECKPOINTS),
+        ("save_strategy_checkpoints", Config.SAVE_STRATEGY_CHECKPOINTS),
         ("experiment_name", Config.EXPERIMENT_NAME),
     ]
     
@@ -251,7 +511,11 @@ def main():
     4. Combine all results to Excel
     5. Generate combined performance charts
     """
-    
+    args = parse_args()
+    apply_cli_overrides(args)
+    if run_seed_jobs_if_needed(args):
+        return
+
     print("\n" + "="*70)
     print(" BASELINE RESEARCH - PRETRAINED MODELS EVALUATION")
     print("="*70)
@@ -266,10 +530,14 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(Config.RANDOM_SEED)
         torch.cuda.manual_seed_all(Config.RANDOM_SEED)
-        # For CUDA reproducibility (may impact performance slightly)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    # torch.use_deterministic_algorithms(True,warn_only=False)
+        if args.deterministic:
+            # Reproducibility mode is slower and requires CUBLAS_WORKSPACE_CONFIG.
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
     print("✓ Random seeds set successfully")
     
     # Step 1: Validate configuration
@@ -277,12 +545,17 @@ def main():
     Config.validate_config()
     
     # Tạo folder riêng cho lần chạy này
-    run_folder, run_number = get_next_run_folder(Config.RESULTS_DIR)
+    run_folder, run_number = get_next_run_folder(Config.RESULTS_DIR, args.run_name)
     print(f"\n📁 Lần chạy thứ: {run_number}")
     print(f"📁 Kết quả sẽ được lưu tại: {run_folder}")
     
-    # Create output directories
-    os.makedirs(Config.CHECKPOINTS_DIR, exist_ok=True)
+    # Keep training checkpoints isolated per run to allow concurrent terminals.
+    if args.checkpoints_dir:
+        run_checkpoints_dir = os.path.join(Config.CHECKPOINTS_DIR, sanitize_run_name(str(run_number)))
+    else:
+        run_checkpoints_dir = os.path.join(run_folder, "training_checkpoints")
+    os.makedirs(run_checkpoints_dir, exist_ok=True)
+    print(f"Training checkpoints: {run_checkpoints_dir}")
     
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -394,7 +667,10 @@ def main():
                     )
                     
                     # Evaluate trên fold test set (phần data luân phiên làm test)
-                    strategy_ckpt_dir = os.path.join(fold_folder, model_name, 'checkpoints')
+                    strategy_ckpt_dir = (
+                        os.path.join(fold_folder, model_name, 'checkpoints')
+                        if Config.SAVE_STRATEGY_CHECKPOINTS else None
+                    )
                     results = evaluate_all_strategies(
                         model_name, checkpoint_manager, fold_test_loader, fold_train_loader,
                         num_classes, device, class_names=class_names, save_dir=strategy_ckpt_dir
@@ -413,7 +689,7 @@ def main():
                     save_model_results(model_name, results, fold_folder)
 
                     # === Chỉ giữ lại Strategy 1 checkpoint (best val_loss) của fold này ===
-                    if os.path.exists(strategy_ckpt_dir):
+                    if strategy_ckpt_dir and os.path.exists(strategy_ckpt_dir):
                         pth_files = [f for f in os.listdir(strategy_ckpt_dir) if f.endswith('.pth')]
                         strategy1_src = os.path.join(strategy_ckpt_dir, 'Strategy_1_best.pth')
                         strategy1_dst = os.path.join(strategy_ckpt_dir, f'strategy1_fold{fold_idx}_checkpoint.pth')
@@ -569,14 +845,18 @@ def main():
                 device,
                 class_names=class_names,
                 train_labels=train_labels,
-                save_dir=run_folder
+                save_dir=run_folder,
+                checkpoints_dir=run_checkpoints_dir
             )
             print(f"  ✓ Training completed for {model_name}")
             
             # 3.2: Evaluate with 3 strategies
             print(f"\n  [3.2] Evaluating {model_name} with 3 strategies...")
             # Tạo folder lưu checkpoint cho các strategy
-            strategy_checkpoint_dir = os.path.join(run_folder, model_name, 'checkpoints')
+            strategy_checkpoint_dir = (
+                os.path.join(run_folder, model_name, 'checkpoints')
+                if Config.SAVE_STRATEGY_CHECKPOINTS else None
+            )
             results = evaluate_all_strategies(
                 model_name,
                 checkpoint_manager,
@@ -603,7 +883,7 @@ def main():
             # 3.4: Delete checkpoints to free disk space (conditional)
             if Config.AUTO_DELETE_CHECKPOINTS:
                 print(f"\n  [3.4] Cleaning up checkpoints for {model_name}...")
-                delete_model_checkpoints(model_name, Config.CHECKPOINTS_DIR)
+                delete_model_checkpoints(model_name, run_checkpoints_dir)
             else:
                 print(f"\n  [3.4] Keeping checkpoints for {model_name} (AUTO_DELETE_CHECKPOINTS=False)")
             
@@ -657,9 +937,14 @@ def main():
     print(f"  - Run Config: {os.path.join(run_folder, 'run_config.xlsx')}")
     print(f"  - Individual Results: {run_folder}/<model_name>/")
     print(f"\n💾 Disk Space Optimization:")
-    print(f"  - All checkpoints deleted after evaluation")
-    print(f"  - Only results (Excel + Charts) kept")
-    print(f"  - Estimated space saved: ~160GB (checkpoints)")
+    if Config.AUTO_DELETE_CHECKPOINTS:
+        print(f"  - Training checkpoints were deleted after evaluation")
+    else:
+        print(f"  - Training checkpoints kept at: {run_checkpoints_dir}")
+    if Config.SAVE_STRATEGY_CHECKPOINTS:
+        print(f"  - Strategy checkpoints/results kept under: {run_folder}/<model_name>/")
+    else:
+        print(f"  - Strategy checkpoints were not saved")
     
     # Find best model (based on Strategy 1 F1-Score)
     strategy_1_df = df[df['Strategy'] == 'Strategy 1']
