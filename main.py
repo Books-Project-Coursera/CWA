@@ -133,6 +133,16 @@ def parse_args():
     )
     parser.add_argument("--dropout", type=float, help="Override Config.DROPOUT_RATE.")
     parser.add_argument("--num-workers", type=int, help="Override Config.NUM_WORKERS.")
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        help="Print DataLoader and compute timing for the first N training batches.",
+    )
+    parser.add_argument(
+        "--dataset-stats",
+        action="store_true",
+        help="Print image-size dataset statistics before training. This opens up to 1000 images per run.",
+    )
     parser.add_argument("--seed", type=int, help="Override Config.RANDOM_SEED.")
     parser.add_argument(
         "--seeds",
@@ -178,6 +188,7 @@ def apply_cli_overrides(args):
         ("EARLY_STOPPING_PATIENCE", args.early_stopping),
         ("DROPOUT_RATE", args.dropout),
         ("NUM_WORKERS", args.num_workers),
+        ("PROFILE_BATCHES", args.profile_batches),
         ("RANDOM_SEED", args.seed),
         ("LEARNING_RATE", args.lr),
         ("WEIGHT_DECAY", args.weight_decay),
@@ -189,6 +200,9 @@ def apply_cli_overrides(args):
 
     if args.fc_layers is not None:
         Config.CLASSIFIER_CONFIG = args.fc_layers
+
+    if args.dataset_stats:
+        Config.PRINT_DATASET_STATS = True
 
     if args.epochs is not None and args.warmup_epochs is None:
         Config.WARMUP_EPOCHS = max(1, int(Config.NUM_EPOCHS * 0.1))
@@ -817,14 +831,11 @@ def main():
     print(f"\n[Step 3/6] Training and evaluating {len(Config.MODELS)} models...")
     print("  Strategy: Train → Evaluate → Save Results → Delete Checkpoints")
     
-    # Display dataset statistics once before training
-    print("\n" + "="*70)
-    print("Dataset Statistics")
-    print("="*70)
-    
-    print_dataset_statistics(train_paths + val_paths + test_paths, 
-                           train_labels + val_labels + test_labels, 
-                           class_names)
+    # Optional: opens up to 1000 images, so keep disabled for high-compute runs.
+    if Config.PRINT_DATASET_STATS:
+        print_dataset_statistics(train_paths + val_paths + test_paths,
+                                 train_labels + val_labels + test_labels,
+                                 class_names)
     
     all_model_results = {}
     successfully_processed = []

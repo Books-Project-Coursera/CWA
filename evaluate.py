@@ -71,7 +71,7 @@ def update_bn(model, train_loader, device, num_batches=100):
         for batch_idx, (images, _) in enumerate(train_loader):
             if batch_idx >= num_batches:
                 break
-            images = images.to(device)
+            images = images.to(device, non_blocking=True)
             _ = model(images)
     
     # Set everything back to eval mode
@@ -174,8 +174,8 @@ def evaluate_model(model, test_loader, device, num_classes, class_names=None):
 
     with torch.no_grad():
         for images, labels in tqdm(test_loader, desc='Evaluating', leave=False):
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             outputs = model(images)
             loss = criterion(outputs, labels)

@@ -22,6 +22,8 @@ class Config:
     # Kaggle có 2 CPU cores, nên dùng NUM_WORKERS = 2
     # Set to 0 to avoid multiprocessing issues with limited memory
     NUM_WORKERS = 16
+    PROFILE_BATCHES = 0  # Set >0 to print DataLoader vs GPU compute timing for first N train batches
+    PRINT_DATASET_STATS = False  # Opens up to 1000 images before training; keep off for server runs
     
     # Early Stopping
     EARLY_STOPPING_PATIENCE = 10  # Stop if val_loss doesn't improve for 15 epochs

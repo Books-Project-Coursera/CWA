@@ -176,10 +176,17 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_ba
     running_loss = 0.0
     correct = 0
     total = 0
+    profile_batches = getattr(Config, 'PROFILE_BATCHES', 0)
+    profile_data_time = 0.0
+    profile_compute_time = 0.0
+    profile_count = 0
+    end_time = time.time()
     
     pbar = tqdm(train_loader, desc='Training', leave=False)
-    for images, labels in pbar:
-        images, labels = images.to(device), labels.to(device)
+    for batch_idx, (images, labels) in enumerate(pbar, 1):
+        data_loaded_time = time.time()
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
         
         # Forward pass
         optimizer.zero_grad()
@@ -189,15 +196,34 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_ba
         # Backward pass
         loss.backward()
         optimizer.step()
+
+        if profile_batches and batch_idx <= profile_batches:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            batch_end_time = time.time()
+            profile_data_time += data_loaded_time - end_time
+            profile_compute_time += batch_end_time - data_loaded_time
+            profile_count += 1
+            end_time = batch_end_time
         
         # Statistics
         running_loss += loss.item() * images.size(0)
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
         correct += (predicted == labels).sum().item()
+
+        if not profile_batches or batch_idx > profile_batches:
+            end_time = time.time()
         
         # Update progress bar
         pbar.set_postfix({'loss': loss.item(), 'acc': 100. * correct / total})
+
+    if profile_count:
+        print(
+            f"  Profile first {profile_count} train batches: "
+            f"data={profile_data_time / profile_count:.3f}s/batch, "
+            f"compute={profile_compute_time / profile_count:.3f}s/batch"
+        )
     
     epoch_loss = running_loss / total
     epoch_acc = 100. * correct / total
@@ -215,7 +241,8 @@ def validate(model, val_loader, criterion, device):
     with torch.no_grad():
         pbar = tqdm(val_loader, desc='Validation', leave=False)
         for images, labels in pbar:
-            images, labels = images.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             
             outputs = model(images)
             loss = criterion(outputs, labels)
