@@ -57,8 +57,8 @@ Mở `config.py`, chỉnh các biến cần thiết:
 
 | Nhóm | Biến quan trọng | Mô tả |
 |------|-----------------|-------|
-| **Dataset** | `DATASET_PATH` | Đường dẫn tới thư mục dataset (mỗi class = 1 subfolder) |
-| | `TRAIN_RATIO / VAL_RATIO / TEST_RATIO` | Tỉ lệ chia data (mặc định 70/15/15) |
+| **Dataset** | `DATASET_NAME` | Hugging Face dataset ID, mặc định `zh-plus/tiny-imagenet` |
+| | `VALIDATION_RATIO` | Tỉ lệ validation lấy stratified từ official train (mặc định 0.1) |
 | **Model** | `MODELS` | List model cần train (comment/uncomment để chọn) |
 | | `CLASSIFIER_CONFIG` | Hidden layers của classifier head, VD: `[512]` |
 | | `DROPOUT_RATE` | Dropout rate cho classifier |
@@ -122,7 +122,7 @@ Kết quả bao gồm cả **per-class breakdown** (Precision, Recall, F1, Speci
 ## Reproduce kết quả
 
 1. Set `RANDOM_SEED = 42` (mặc định) — đảm bảo cùng data split, cùng weight init
-2. Đặt đúng `DATASET_PATH`
+2. Kiểm tra `DATASET_NAME` (dataset sẽ tự tải/cache qua Hugging Face)
 3. Chọn model trong `MODELS`
 4. Chạy `python main.py`
 
@@ -132,7 +132,8 @@ Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`. Thêm `--deterministi
 
 - **WRS + Focal Loss đồng thời**: Không lỗi code, nhưng có thể double-correct class imbalance. Cân nhắc chỉ bật 1 trong 2.
 - **LR Scheduler**: Linear Warmup → Cosine Annealing
-- **Data Augmentation** (chỉ train): RandomFlip, RandomRotation(90°), ColorJitter
+- **Data Augmentation** (chỉ train): resize bicubic 224, horizontal flip,
+  Mixup/CutMix kiểu DeiT và Random Erasing
 
 ## 💾 Checkpoints
 
@@ -179,9 +180,14 @@ Trong `dataset.py`, function `get_transforms()`:
 
 ```python
 transform = transforms.Compose([
-    transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
+    transforms.Resize(
+        (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+        interpolation=InterpolationMode.BICUBIC,
+    ),
     transforms.RandomHorizontalFlip(p=0.5),
-    # Thêm augmentation khác...
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    transforms.RandomErasing(p=0.25),
 ])
 ```
 
@@ -215,6 +221,31 @@ srun --gres=gpu:1 --cpus-per-task=8 python main.py --model resnet18 --num-worker
 
 Use `--deterministic` only when exact reproducibility is more important than speed. That flag sets `CUBLAS_WORKSPACE_CONFIG`; without it, the code uses faster cuDNN benchmarking. There is no separate `culabs` package to install.
 
+## H100 profile
+
+The default profile targets one H100:
+
+- batch 512 for training, validation, and testing;
+- BF16 autocast, fused AdamW, and `torch.compile(mode="max-autotune")`;
+- 16 DataLoader workers with pinned memory and persistent workers;
+- learning rate 5e-5 at batch 512, automatically scaled with batch size;
+- linear warmup for 5 epochs followed by cosine decay to 1e-6.
+
+Run the default batch-512 profile:
+
+```bash
+python main.py --model vit_base_patch16_224 --seed 1
+```
+
+Run batch 1024; LR is automatically scaled to 1e-4 unless `--lr` is given:
+
+```bash
+python main.py --model vit_base_patch16_224 --seed 1 --batch-size 1024
+```
+
+Every run writes dataset, model, optimizer, scheduler, augmentation, precision,
+DataLoader, evaluation, and runtime environment settings to `run_config.xlsx`.
+
 ## 📋 Requirements
 
 - Python >= 3.8
@@ -231,7 +262,7 @@ Code này được thiết kế để:
 - Export kết quả professional
 - Tái sử dụng cho nhiều experiments
 
-Chỉ cần thay đổi `DATASET_PATH` trong `config.py` và chạy `python main.py`!
+Chỉ cần kiểm tra `DATASET_NAME` trong `config.py` và chạy `python main.py`!
 
 ## 📝 Citation
 
@@ -244,7 +275,7 @@ Nếu sử dụng code này cho research, vui lòng ghi nguồn phù hợp.
 - Giảm `NUM_WORKERS`
 
 ### Lỗi không tìm thấy dataset:
-- Kiểm tra đường dẫn `DATASET_PATH` trong `config.py`
+- Kiểm tra `DATASET_NAME` và kết nối/cache Hugging Face
 - Đảm bảo folder structure đúng format (classes trong subfolder)
 
 ### Model không train:

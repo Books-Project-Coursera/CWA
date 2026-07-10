@@ -29,6 +29,7 @@ import torch
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from datasets import concatenate_datasets
 from sklearn.model_selection import StratifiedKFold
 
 from config import Config
@@ -107,7 +108,12 @@ def parse_args():
         nargs="+",
         help="Model(s) to run. Use a space-separated list, comma-separated list, or 'all'.",
     )
-    parser.add_argument("--dataset-path", help="Dataset directory. Overrides Config.DATASET_PATH.")
+    parser.add_argument(
+        "--dataset-name",
+        "--dataset-path",
+        dest="dataset_name",
+        help="Hugging Face dataset identifier. Overrides Config.DATASET_NAME.",
+    )
     parser.add_argument("--results-dir", "--output-dir", dest="results_dir", help="Base directory for run outputs.")
     parser.add_argument(
         "--checkpoints-dir",
@@ -178,7 +184,7 @@ def apply_cli_overrides(args):
         Config.MODELS = models
 
     overrides = [
-        ("DATASET_PATH", args.dataset_path),
+        ("DATASET_NAME", args.dataset_name),
         ("RESULTS_DIR", args.results_dir),
         ("CHECKPOINTS_DIR", args.checkpoints_dir),
         ("BATCH_SIZE", args.batch_size),
@@ -198,6 +204,15 @@ def apply_cli_overrides(args):
         if value is not None:
             setattr(Config, attr, value)
 
+    if (
+        args.batch_size is not None
+        and args.lr is None
+        and Config.AUTO_SCALE_LEARNING_RATE
+    ):
+        Config.LEARNING_RATE = Config.BASE_LEARNING_RATE * (
+            Config.BATCH_SIZE / Config.LR_REFERENCE_BATCH_SIZE
+        )
+
     if args.fc_layers is not None:
         Config.CLASSIFIER_CONFIG = args.fc_layers
 
@@ -205,7 +220,7 @@ def apply_cli_overrides(args):
         Config.PRINT_DATASET_STATS = True
 
     if args.epochs is not None and args.warmup_epochs is None:
-        Config.WARMUP_EPOCHS = max(1, int(Config.NUM_EPOCHS * 0.1))
+        Config.WARMUP_EPOCHS = min(5, max(1, int(Config.NUM_EPOCHS * 0.1)))
 
     if args.cv and args.no_cv:
         raise ValueError("Use only one of --cv or --no-cv.")
@@ -418,45 +433,94 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         class_names: Danh sách tên class
         train_count, val_count, test_count: Số lượng ảnh mỗi split
     """
+    import platform
+    import datasets as hf_datasets
+    import timm
+    import torchvision
+
     is_focal = Config.LOSS_FUNCTION == 'poly_focal'
-    
-    # Sheet 1: Dataset & Splitting
+    cuda_available = torch.cuda.is_available()
+    gpu_names = (
+        ", ".join(
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
+        )
+        if cuda_available else "CPU only"
+    )
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = "N/A"
+        git_dirty = "N/A"
+
     dataset_rows = [
-        ("dataset_path", Config.DATASET_PATH),
+        ("dataset_name", Config.DATASET_NAME),
+        ("official_train_split", Config.HF_TRAIN_SPLIT),
+        ("official_test_split", Config.HF_TEST_SPLIT),
         ("num_classes", num_classes),
         ("class_names", ", ".join(class_names) if class_names else ""),
-        ("train_ratio", Config.TRAIN_RATIO),
-        ("val_ratio", Config.VAL_RATIO),
-        ("test_ratio", Config.TEST_RATIO),
+        ("validation_ratio_from_official_train", Config.VALIDATION_RATIO),
         ("train_samples", train_count),
         ("val_samples", val_count),
         ("test_samples", test_count),
         ("image_size", Config.IMAGE_SIZE),
+        ("resize_interpolation", Config.RESIZE_INTERPOLATION),
+        ("normalization_mean", str(Config.IMAGE_MEAN)),
+        ("normalization_std", str(Config.IMAGE_STD)),
         ("random_seed", Config.RANDOM_SEED),
+        ("all_configured_seeds", str(Config.SEEDS)),
     ]
-    
-    # Sheet 2: Model
+
     model_rows = [
         ("models", ", ".join(Config.MODELS)),
+        ("vit_pretrained_model_id", Config.VIT_PRETRAINED_MODEL_ID),
+        ("pretrained", Config.PRETRAINED),
         ("classifier_config", str(Config.CLASSIFIER_CONFIG)),
-        ("dropout_rate", Config.DROPOUT_RATE),
+        ("classifier_dropout_rate", Config.DROPOUT_RATE),
+        ("model_drop_rate", Config.MODEL_DROP_RATE),
+        ("attention_drop_rate", Config.MODEL_ATTN_DROP_RATE),
+        ("drop_path_rate", Config.MODEL_DROP_PATH_RATE),
     ]
-    
-    # Sheet 3: Training Hyperparameters
+
     training_rows = [
-        ("batch_size", Config.BATCH_SIZE),
+        ("batch_size_train_val_test", Config.BATCH_SIZE),
+        ("effective_global_batch_size", Config.BATCH_SIZE),
         ("num_epochs", Config.NUM_EPOCHS),
-        ("learning_rate", Config.LEARNING_RATE),
-        ("weight_decay", Config.WEIGHT_DECAY),
-        ("warmup_epochs", Config.WARMUP_EPOCHS),
-        ("eta_min (CosineAnnealing)", Config.ETA_MIN),
-        ("num_workers", Config.NUM_WORKERS),
         ("early_stopping_patience", Config.EARLY_STOPPING_PATIENCE),
-        ("lr_decay_patience", Config.LR_DECAY_PATIENCE),
-        ("lr_decay_factor", Config.LR_DECAY_FACTOR),
+        ("gradient_clip_norm", Config.GRAD_CLIP_NORM),
     ]
-    
-    # Sheet 4: Loss Function
+
+    optimizer_scheduler_rows = [
+        ("optimizer", Config.OPTIMIZER),
+        ("optimizer_betas", str(Config.OPTIMIZER_BETAS)),
+        ("optimizer_epsilon", Config.OPTIMIZER_EPS),
+        ("fused_optimizer_requested", Config.USE_FUSED_OPTIMIZER),
+        ("fused_optimizer_effective", Config.USE_FUSED_OPTIMIZER and cuda_available),
+        ("learning_rate", Config.LEARNING_RATE),
+        ("base_learning_rate", Config.BASE_LEARNING_RATE),
+        ("auto_scale_learning_rate", Config.AUTO_SCALE_LEARNING_RATE),
+        ("lr_reference_batch_size", Config.LR_REFERENCE_BATCH_SIZE),
+        ("weight_decay", Config.WEIGHT_DECAY),
+        ("weight_decay_exclusions", "bias, 1D/norm params, model no_weight_decay set"),
+        ("scheduler", Config.SCHEDULER),
+        ("warmup_epochs", Config.WARMUP_EPOCHS),
+        ("warmup_start_factor", Config.WARMUP_START_FACTOR),
+        ("cosine_eta_min", Config.ETA_MIN),
+    ]
+
     loss_rows = [
         ("loss_function", Config.LOSS_FUNCTION),
         ("label_smoothing", Config.LABEL_SMOOTHING if not is_focal else 0),
@@ -464,15 +528,46 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("poly_epsilon", Config.POLY_EPSILON if is_focal else 0),
         ("class_weight_method", Config.CLASS_WEIGHT_METHOD if is_focal else "N/A"),
     ]
-    
-    # Sheet 5: Sampler & Cross-Validation
+
+    augmentation_rows = [
+        ("horizontal_flip_probability", Config.HORIZONTAL_FLIP_PROB),
+        ("use_mixup_cutmix", Config.USE_MIXUP_CUTMIX),
+        ("mixup_alpha", Config.MIXUP_ALPHA if Config.USE_MIXUP_CUTMIX else 0),
+        ("cutmix_alpha", Config.CUTMIX_ALPHA if Config.USE_MIXUP_CUTMIX else 0),
+        ("mixup_or_cutmix_probability", Config.MIXUP_PROB if Config.USE_MIXUP_CUTMIX else 0),
+        ("cutmix_switch_probability", Config.MIXUP_SWITCH_PROB if Config.USE_MIXUP_CUTMIX else 0),
+        ("mixup_mode", Config.MIXUP_MODE if Config.USE_MIXUP_CUTMIX else "disabled"),
+        ("random_erasing_probability", Config.RANDOM_ERASING_PROB),
+        ("random_erasing_scale", str(Config.RANDOM_ERASING_SCALE)),
+        ("random_erasing_ratio", str(Config.RANDOM_ERASING_RATIO)),
+        ("random_erasing_value", Config.RANDOM_ERASING_VALUE),
+        ("validation_augmentation", "resize + normalize only"),
+        ("test_augmentation", "resize + normalize only"),
+    ]
+
+    precision_dataloader_rows = [
+        ("amp_requested", Config.USE_AMP),
+        ("amp_dtype", Config.AMP_DTYPE if Config.USE_AMP else "float32"),
+        ("amp_effective", Config.USE_AMP and cuda_available),
+        ("float32_matmul_precision", Config.FLOAT32_MATMUL_PRECISION),
+        ("torch_compile_requested", Config.USE_TORCH_COMPILE),
+        ("torch_compile_mode", Config.TORCH_COMPILE_MODE),
+        ("torch_compile_effective", Config.USE_TORCH_COMPILE and cuda_available),
+        ("num_workers", Config.NUM_WORKERS),
+        ("prefetch_factor", Config.PREFETCH_FACTOR),
+        ("persistent_workers", Config.PERSISTENT_WORKERS),
+        ("pin_memory", Config.PIN_MEMORY),
+        ("train_drop_last", Config.TRAIN_DROP_LAST),
+    ]
+
     sampler_cv_rows = [
         ("use_weighted_random_sampler", Config.USE_WEIGHTED_SAMPLER),
         ("use_cross_validation", Config.USE_CROSS_VALIDATION),
         ("cv_n_splits", Config.CV_N_SPLITS if Config.USE_CROSS_VALIDATION else 0),
+        ("cv_pool", "official train only" if Config.USE_CROSS_VALIDATION else "N/A"),
+        ("external_test", f"official {Config.HF_TEST_SPLIT}"),
     ]
-    
-    # Sheet 6: Evaluation & Output
+
     eval_rows = [
         ("top_k_values", str(Config.TOP_K_VALUES)),
         ("last_n_epochs", Config.LAST_N_EPOCHS),
@@ -482,8 +577,27 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("save_strategy_checkpoints", Config.SAVE_STRATEGY_CHECKPOINTS),
         ("experiment_name", Config.EXPERIMENT_NAME),
     ]
-    
-    # Sheet 7: Compatibility Notes
+
+    runtime_rows = [
+        ("run_timestamp", datetime.now().isoformat(timespec="seconds")),
+        ("command", " ".join([sys.executable, *sys.argv])),
+        ("hostname", platform.node()),
+        ("platform", platform.platform()),
+        ("git_commit", git_commit),
+        ("git_worktree_dirty", git_dirty),
+        ("python_version", platform.python_version()),
+        ("torch_version", torch.__version__),
+        ("torchvision_version", torchvision.__version__),
+        ("timm_version", timm.__version__),
+        ("datasets_version", hf_datasets.__version__),
+        ("cuda_available", cuda_available),
+        ("cuda_runtime_version", torch.version.cuda or "N/A"),
+        ("cudnn_version", torch.backends.cudnn.version() or "N/A"),
+        ("visible_gpu_count", torch.cuda.device_count()),
+        ("gpu_names", gpu_names),
+        ("bf16_supported", torch.cuda.is_bf16_supported() if cuda_available else False),
+    ]
+
     notes_rows = [
         ("WRS + Focal Loss", 
          "BOTH ACTIVE - WRS handles imbalance at data level, Focal Loss at loss level. "
@@ -491,7 +605,9 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
          if (Config.USE_WEIGHTED_SAMPLER and is_focal) else "No conflict"),
         ("Metrics Averaging", 
          "All metrics (Precision, Recall, F1, AUC) use MACRO averaging. "
-         "Accuracy is computed as overall (correct/total)."),
+            "Accuracy is computed as overall (correct/total)."),
+        ("Batch 1024 LR", "Use learning_rate=1e-4 when scaling train batch from 512 to 1024."),
+        ("Train accuracy with Mixup", "Expected correctness under soft target distributions."),
     ]
     
     config_path = os.path.join(run_folder, "run_config.xlsx")
@@ -500,15 +616,19 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
             ("Dataset & Splitting", dataset_rows),
             ("Model", model_rows),
             ("Training Hyperparams", training_rows),
+            ("Optimizer & Scheduler", optimizer_scheduler_rows),
             ("Loss Function", loss_rows),
+            ("Augmentation", augmentation_rows),
+            ("Precision & DataLoader", precision_dataloader_rows),
             ("Sampler & CV", sampler_cv_rows),
             ("Evaluation & Output", eval_rows),
+            ("Runtime Environment", runtime_rows),
             ("Notes", notes_rows),
         ]:
             df = pd.DataFrame(rows, columns=["Parameter", "Value"])
             df.to_excel(writer, sheet_name=sheet_name, index=False)
     
-    print(f"  ✓ Full run config exported to: {config_path}")
+    print(f"  [OK] Full run config exported to: {config_path}")
     return config_path
 
 
@@ -527,6 +647,7 @@ def main():
     """
     args = parse_args()
     apply_cli_overrides(args)
+    torch.set_float32_matmul_precision(Config.FLOAT32_MATMUL_PRECISION)
     if run_seed_jobs_if_needed(args):
         return
 
@@ -576,17 +697,24 @@ def main():
     print(f"Using device: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+        if Config.USE_AMP and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "USE_AMP=True requires a CUDA GPU with BF16 support for this pipeline"
+            )
+        print(
+            f"H100 profile: batch={Config.BATCH_SIZE}, "
+            f"precision={Config.AMP_DTYPE if Config.USE_AMP else 'float32'}, "
+            f"workers={Config.NUM_WORKERS}"
+        )
     else:
         print("⚠ Running in CPU mode. Training will be slower but uses less memory.")
         print("  To enable GPU: Increase Windows virtual memory (paging file) to 16-32GB")
     
     # Step 2: Load dataset
     print("\n[Step 2/6] Loading and splitting dataset...")
-    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, class_names = load_dataset(
-        Config.DATASET_PATH,
-        Config.TRAIN_RATIO,
-        Config.VAL_RATIO,
-        Config.TEST_RATIO,
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, class_names = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
         Config.RANDOM_SEED
     )
     
@@ -599,9 +727,9 @@ def main():
         run_folder, 
         num_classes=num_classes, 
         class_names=class_names,
-        train_count=len(train_paths),
-        val_count=len(val_paths),
-        test_count=len(test_paths)
+        train_count=len(train_data),
+        val_count=len(val_data),
+        test_count=len(test_data)
     )
     
     # Warn if both WRS and Focal Loss are active
@@ -617,11 +745,12 @@ def main():
         print(f" PURE CROSS-VALIDATION ({Config.CV_N_SPLITS}-Fold Stratified)")
         print(f"{'='*70}")
         
-        # Gộp toàn bộ data (train + val + test) → 1 pool duy nhất
-        all_paths = train_paths + val_paths + test_paths
-        all_labels = train_labels + val_labels + test_labels
+        # Fold only the official training pool; keep official valid untouched.
+        all_data = concatenate_datasets([train_data, val_data])
+        all_labels = train_labels + val_labels
         
-        print(f"  Total data: {len(all_paths)} images → chia {Config.CV_N_SPLITS} fold")
+        print(f"  CV pool: {len(all_data)} official-train images")
+        print(f"  External test: {len(test_data)} official-valid images")
         
         skf = StratifiedKFold(
             n_splits=Config.CV_N_SPLITS, 
@@ -631,32 +760,27 @@ def main():
         
         all_fold_results = {}  # {model_name: [fold_results]}
         
-        for fold_idx, (train_idx, test_idx) in enumerate(skf.split(all_paths, all_labels), 1):
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_data, all_labels), 1):
             print(f"\n{'='*70}")
             print(f" FOLD {fold_idx}/{Config.CV_N_SPLITS}")
             print(f"{'='*70}")
             
-            fold_train_paths = [all_paths[i] for i in train_idx]
+            fold_train_data = all_data.select(train_idx.tolist())
             fold_train_labels = [all_labels[i] for i in train_idx]
-            fold_test_paths = [all_paths[i] for i in test_idx]
-            fold_test_labels = [all_labels[i] for i in test_idx]
+            fold_val_data = all_data.select(val_idx.tolist())
+            fold_val_labels = [all_labels[i] for i in val_idx]
             
-            # Tách 1 phần từ train làm validation cho early stopping
-            from sklearn.model_selection import train_test_split
-            fold_train_paths, fold_val_paths, fold_train_labels, fold_val_labels = train_test_split(
-                fold_train_paths, fold_train_labels,
-                test_size=0.15,
-                stratify=fold_train_labels,
-                random_state=Config.RANDOM_SEED
+            print(
+                f"  Train: {len(fold_train_data)} | "
+                f"Val (fold): {len(fold_val_data)} | "
+                f"Test (external): {len(test_data)}"
             )
-            
-            print(f"  Train: {len(fold_train_paths)} | Val: {len(fold_val_paths)} | Test (fold): {len(fold_test_paths)}")
             
             # Create dataloaders for this fold
             fold_train_loader, fold_val_loader, fold_test_loader = create_dataloaders(
-                fold_train_paths, fold_train_labels,
-                fold_val_paths, fold_val_labels,
-                fold_test_paths, fold_test_labels,
+                fold_train_data, fold_train_labels,
+                fold_val_data, fold_val_labels,
+                test_data, test_labels,
                 Config.BATCH_SIZE,
                 Config.NUM_WORKERS
             )
@@ -820,9 +944,9 @@ def main():
     # ===================== NORMAL MODE (no CV) =====================
     # Create dataloaders
     train_loader, val_loader, test_loader = create_dataloaders(
-        train_paths, train_labels,
-        val_paths, val_labels,
-        test_paths, test_labels,
+        train_data, train_labels,
+        val_data, val_labels,
+        test_data, test_labels,
         Config.BATCH_SIZE,
         Config.NUM_WORKERS
     )
@@ -833,7 +957,7 @@ def main():
     
     # Optional: opens up to 1000 images, so keep disabled for high-compute runs.
     if Config.PRINT_DATASET_STATS:
-        print_dataset_statistics(train_paths + val_paths + test_paths,
+        print_dataset_statistics(concatenate_datasets([train_data, val_data, test_data]),
                                  train_labels + val_labels + test_labels,
                                  class_names)
     

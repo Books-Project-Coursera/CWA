@@ -22,6 +22,16 @@ from torch.optim.lr_scheduler import LinearLR
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+
+def autocast_context(device):
+    """Use native BF16 autocast on CUDA and a no-op context elsewhere."""
+    enabled = Config.USE_AMP and device.type == "cuda"
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=enabled,
+    )
+
 class EarlyStopping:
     """Early stopping based on validation loss"""
     
@@ -154,7 +164,15 @@ class CheckpointManager:
             json.dump(info, f, indent=4)
 
 
-def train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_backbone=True):
+def train_one_epoch(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+    freeze_backbone=True,
+    mixup_fn=None,
+):
     """Train for one epoch"""
     model.train()
     
@@ -187,14 +205,26 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_ba
         data_loaded_time = time.time()
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
+
+        # DeiT-style Mixup/CutMix is a batch-level augmentation. It converts
+        # integer labels into soft class distributions.
+        targets = labels
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, labels)
         
         # Forward pass
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
         
         # Backward pass
         loss.backward()
+        if Config.GRAD_CLIP_NORM is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=Config.GRAD_CLIP_NORM,
+            )
         optimizer.step()
 
         if profile_batches and batch_idx <= profile_batches:
@@ -210,7 +240,12 @@ def train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_ba
         running_loss += loss.item() * images.size(0)
         _, predicted = torch.max(outputs.data, 1)
         total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+        if targets.ndim == 2:
+            # Expected correctness under the soft target distribution. This is
+            # more meaningful than comparing mixed images to one hard label.
+            correct += targets.gather(1, predicted.unsqueeze(1)).sum().item()
+        else:
+            correct += (predicted == targets).sum().item()
 
         if not profile_batches or batch_idx > profile_batches:
             end_time = time.time()
@@ -244,8 +279,9 @@ def validate(model, val_loader, criterion, device):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
             
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with autocast_context(device):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
             
             running_loss += loss.item() * images.size(0)
             _, predicted = torch.max(outputs.data, 1)
@@ -282,6 +318,8 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         history: Training history dictionary
     """
     
+    torch.set_float32_matmul_precision(Config.FLOAT32_MATMUL_PRECISION)
+
     print(f"\n{'='*70}")
     print(f"Training {model_name}")
     print(f"{'='*70}")
@@ -289,6 +327,16 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
     # Create model
     model = get_model(model_name, num_classes, freeze_backbone=False)
     model = model.to(device)
+
+    compile_enabled = Config.USE_TORCH_COMPILE and device.type == "cuda"
+    if compile_enabled:
+        if hasattr(model, "compile"):
+            model.compile(mode=Config.TORCH_COMPILE_MODE)
+        else:
+            model = torch.compile(model, mode=Config.TORCH_COMPILE_MODE)
+        print(f"  torch.compile: ENABLED ({Config.TORCH_COMPILE_MODE})")
+    else:
+        print("  torch.compile: DISABLED")
     
     # Loss and optimizer
     if Config.LOSS_FUNCTION == 'poly_focal':
@@ -321,9 +369,49 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         # ).to(device)
         # print(f"  Class weights: {class_weights.cpu().tolist()}")
         criterion = nn.CrossEntropyLoss(label_smoothing=Config.LABEL_SMOOTHING)
-    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), 
-                          lr=Config.LEARNING_RATE,
-                          weight_decay=Config.WEIGHT_DECAY)  # L2 regularization
+
+    mixup_fn = None
+    if Config.USE_MIXUP_CUTMIX:
+        from timm.data import Mixup
+
+        mixup_fn = Mixup(
+            mixup_alpha=Config.MIXUP_ALPHA,
+            cutmix_alpha=Config.CUTMIX_ALPHA,
+            prob=Config.MIXUP_PROB,
+            switch_prob=Config.MIXUP_SWITCH_PROB,
+            mode=Config.MIXUP_MODE,
+            label_smoothing=Config.LABEL_SMOOTHING,
+            num_classes=num_classes,
+        )
+        print(
+            "  Batch augmentation: "
+            f"Mixup(alpha={Config.MIXUP_ALPHA}) / "
+            f"CutMix(alpha={Config.CUTMIX_ALPHA}), "
+            f"prob={Config.MIXUP_PROB}, "
+            f"switch_prob={Config.MIXUP_SWITCH_PROB}"
+        )
+    optimizer_kwargs = {
+        "lr": Config.LEARNING_RATE,
+        "betas": Config.OPTIMIZER_BETAS,
+        "eps": Config.OPTIMIZER_EPS,
+    }
+    fused_enabled = Config.USE_FUSED_OPTIMIZER and device.type == "cuda"
+    if fused_enabled:
+        optimizer_kwargs["fused"] = True
+    from timm.optim import param_groups_weight_decay
+
+    parameter_groups = param_groups_weight_decay(
+        model,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+    optimizer = optim.AdamW(parameter_groups, **optimizer_kwargs)
+    print(
+        f"  Optimizer: AdamW(lr={Config.LEARNING_RATE}, "
+        f"weight_decay={Config.WEIGHT_DECAY}, fused={fused_enabled})"
+    )
+    print(
+        f"  Precision: {'BF16 AMP' if Config.USE_AMP and device.type == 'cuda' else 'FP32'}"
+    )
     
     # # Learning rate scheduler
     # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -336,7 +424,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         # Sequential LR: Linear Warmup + Cosine Annealing
     scheduler1 = LinearLR(
         optimizer,
-        start_factor=0.1,
+        start_factor=Config.WARMUP_START_FACTOR,
         end_factor=1.0,     
         total_iters=Config.WARMUP_EPOCHS
     )
@@ -375,7 +463,15 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         epoch_start_time = time.time()
         
         # Train
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, freeze_backbone=False)
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            freeze_backbone=False,
+            mixup_fn=mixup_fn,
+        )
         
         # Validate
         val_loss, val_acc = validate(model, val_loader, criterion, device)
@@ -478,6 +574,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
 if __name__ == "__main__":
     # Test training
     from config import Config
+    from datasets import concatenate_datasets
     
     Config.validate_config()
     
@@ -487,18 +584,16 @@ if __name__ == "__main__":
     
     # Load dataset
     print("\nLoading dataset...")
-    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, class_names = load_dataset(
-        Config.DATASET_PATH, 
-        Config.TRAIN_RATIO, 
-        Config.VAL_RATIO, 
-        Config.TEST_RATIO,
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, class_names = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
         Config.RANDOM_SEED
     )
     
     train_loader, val_loader, test_loader = create_dataloaders(
-        train_paths, train_labels, 
-        val_paths, val_labels, 
-        test_paths, test_labels,
+        train_data, train_labels,
+        val_data, val_labels,
+        test_data, test_labels,
         Config.BATCH_SIZE, 
         Config.NUM_WORKERS
     )
@@ -510,7 +605,7 @@ if __name__ == "__main__":
     print("Dataset Statistics")
     print("="*70)
     
-    print_dataset_statistics(train_paths + val_paths + test_paths, 
+    print_dataset_statistics(concatenate_datasets([train_data, val_data, test_data]),
                            train_labels + val_labels + test_labels, 
                            class_names)
     

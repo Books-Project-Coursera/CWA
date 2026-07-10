@@ -175,7 +175,13 @@ def get_model(model_name, num_classes, freeze_backbone=False):
         model.head.fc = CustomClassifier(in_features, num_classes)
 
     elif model_name == 'vit_base_patch16_224':
-        model = timm.create_model('vit_base_patch16_224', pretrained=True, drop_rate=0.1,drop_path_rate=0.2,attn_drop_rate=0.1)
+        model = timm.create_model(
+            Config.VIT_PRETRAINED_MODEL_ID,
+            pretrained=Config.PRETRAINED,
+            drop_rate=Config.MODEL_DROP_RATE,
+            drop_path_rate=Config.MODEL_DROP_PATH_RATE,
+            attn_drop_rate=Config.MODEL_ATTN_DROP_RATE,
+        )
         in_features = model.head.in_features
         # Freeze or unfreeze backbone
         if freeze_backbone:

@@ -16,6 +16,15 @@ from config import Config
 from models import get_model
 
 
+def autocast_context(device):
+    """Use BF16 autocast for CUDA evaluation."""
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=Config.USE_AMP and device.type == "cuda",
+    )
+
+
 def update_bn(model, train_loader, device, num_batches=100):
     """
     Update BatchNorm running statistics after loading averaged weights
@@ -72,7 +81,8 @@ def update_bn(model, train_loader, device, num_batches=100):
             if batch_idx >= num_batches:
                 break
             images = images.to(device, non_blocking=True)
-            _ = model(images)
+            with autocast_context(device):
+                _ = model(images)
     
     # Set everything back to eval mode
     model.eval()
@@ -177,8 +187,9 @@ def evaluate_model(model, test_loader, device, num_classes, class_names=None):
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with autocast_context(device):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             probs = torch.softmax(outputs, dim=1)
             _, preds = torch.max(outputs, 1)
@@ -189,7 +200,7 @@ def evaluate_model(model, test_loader, device, num_classes, class_names=None):
 
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
+            all_probs.extend(probs.float().cpu().numpy())
 
     all_preds = np.array(all_preds)
     all_labels = np.array(all_labels)

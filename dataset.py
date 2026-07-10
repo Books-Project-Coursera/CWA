@@ -1,302 +1,247 @@
-"""
-Dataset loading and preprocessing with data augmentation
-"""
-import os
+"""Tiny ImageNet loading, preprocessing, and PyTorch DataLoaders."""
+
 import random
-from pathlib import Path
-from collections import defaultdict
 
 import torch
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from datasets import Dataset as HFDataset
+from datasets import load_dataset as load_hf_dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
-from PIL import Image
+from torchvision.transforms import InterpolationMode
 
 from config import Config
 
 
 def worker_init_fn_seed(worker_id):
-    """Worker init function for DataLoader reproducibility (must be at module level for pickle)"""
-    random.seed(Config.RANDOM_SEED + worker_id)
+    """Seed Python's RNG independently in every DataLoader worker."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed + worker_id)
 
 
-class ImageDataset(Dataset):
-    """Custom dataset for image classification with error handling for corrupted images"""
+class HFImageDataset(Dataset):
+    """Expose a Hugging Face image-classification split as a PyTorch Dataset."""
 
-    def __init__(self, image_paths, labels, transform=None):
-        self.image_paths = image_paths
-        self.labels = labels
+    def __init__(self, hf_dataset, transform=None):
+        if not isinstance(hf_dataset, HFDataset):
+            raise TypeError("hf_dataset must be a datasets.Dataset instance")
+        self.dataset = hf_dataset
         self.transform = transform
-        self._corrupted_cache = set()  # Cache corrupted image indices
+        self.labels = [int(label) for label in hf_dataset["label"]]
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        label = self.labels[idx]
+        sample = self.dataset[int(idx)]
+        image = sample["image"].convert("RGB")
+        label = int(sample["label"])
 
-        try:
-            # Load image with error handling
-            image = Image.open(img_path).convert('RGB')
+        if self.transform is not None:
+            image = self.transform(image)
 
-            # Apply transforms
-            if self.transform:
-                image = self.transform(image)
-
-            return image, label
-
-        except (OSError, IOError) as e:
-            # Handle corrupted/broken images
-            if idx not in self._corrupted_cache:
-                self._corrupted_cache.add(idx)
-                print(f"\n  Warning: Corrupted image at {img_path}: {str(e)[:50]}")
-
-            # Return a black image with correct dimensions as fallback
-            if self.transform:
-                # Create a dummy black image
-                dummy_image = Image.new('RGB', (Config.IMAGE_SIZE, Config.IMAGE_SIZE), (0, 0, 0))
-                dummy_image = self.transform(dummy_image)
-                return dummy_image, label
-            else:
-                # Without transform, return a tensor of zeros
-                return torch.zeros(3, Config.IMAGE_SIZE, Config.IMAGE_SIZE), label
+        return image, label
 
 
-def get_transforms(split='train'):
-    """
-    Get data transforms with augmentation
+def get_transforms(split="train"):
+    """Build full-image 224px transforms for ImageNet-pretrained models."""
+    common = [
+        transforms.Resize(
+            (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ),
+    ]
 
-    Args:
-        split: 'train', 'val', or 'test'
+    if split == "train":
+        return transforms.Compose(
+            common
+            + [
+                transforms.RandomHorizontalFlip(p=Config.HORIZONTAL_FLIP_PROB),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=Config.IMAGE_MEAN,
+                    std=Config.IMAGE_STD,
+                ),
+                transforms.RandomErasing(
+                    p=Config.RANDOM_ERASING_PROB,
+                    scale=Config.RANDOM_ERASING_SCALE,
+                    ratio=Config.RANDOM_ERASING_RATIO,
+                    value=Config.RANDOM_ERASING_VALUE,
+                ),
+            ]
+        )
 
-    Returns:
-        transforms: torchvision transforms
-    """
-
-    if split == 'train':
-        # Training WITH data augmentation for better generalization
-        # Enable augmentation: Flipping, Rotation, Brightness/Contrast adjustments
-        transform = transforms.Compose([
-            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
-            transforms.RandomHorizontalFlip(p=0.3),  # 30% chance horizontal flip
-            transforms.RandomVerticalFlip(p=0.3),     # 30% chance vertical flip
-            transforms.RandomRotation(degrees=90),    # Random rotation up to 90 degrees
-            transforms.ColorJitter(brightness=(0.8, 1.2), contrast=(0.8, 1.2)),  # Color variation
+    return transforms.Compose(
+        common
+        + [
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
-        ])
-    else:
-        # Validation and test without augmentation
-        transform = transforms.Compose([
-            transforms.Resize((Config.IMAGE_SIZE, Config.IMAGE_SIZE)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                               std=[0.229, 0.224, 0.225])
-        ])
-
-    return transform
+            transforms.Normalize(
+                mean=Config.IMAGE_MEAN,
+                std=Config.IMAGE_STD,
+            ),
+        ]
+    )
 
 
-def load_dataset(dataset_path, train_ratio, val_ratio, test_ratio, random_seed=42):
+def load_dataset(dataset_name, val_ratio=0.1, random_seed=42):
+    """Load Tiny ImageNet and reserve the official validation split for testing.
+
+    The Hugging Face dataset contains 100,000 labelled training images and 10,000
+    labelled validation images. We stratify the official training split into
+    90,000 training and 10,000 validation samples, while leaving the official
+    validation split untouched as the final test set.
     """
-    Load and split dataset into train/val/test sets
-    IMPORTANT: Uses fixed random seed to ensure identical train/val/test splits across all models
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be strictly between 0 and 1")
 
-    Args:
-        dataset_path: Path to dataset directory
-        train_ratio: Ratio for training set
-        val_ratio: Ratio for validation set
-        test_ratio: Ratio for test set
-        random_seed: Random seed for reproducibility
+    print(f"\nLoading Hugging Face dataset: {dataset_name}")
+    dataset = load_hf_dataset(dataset_name)
 
-    Returns:
-        train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, class_names
-    """
+    required_splits = {Config.HF_TRAIN_SPLIT, Config.HF_TEST_SPLIT}
+    missing_splits = required_splits.difference(dataset.keys())
+    if missing_splits:
+        raise ValueError(
+            f"Dataset is missing required split(s): {sorted(missing_splits)}"
+        )
 
-    # CRITICAL: Set random seed for reproducible train/val/test splits
-    random.seed(random_seed)
-    torch.manual_seed(random_seed)
+    official_train = dataset[Config.HF_TRAIN_SPLIT]
+    official_test = dataset[Config.HF_TEST_SPLIT]
+    required_columns = {"image", "label"}
+    for split_name, split_dataset in (
+        (Config.HF_TRAIN_SPLIT, official_train),
+        (Config.HF_TEST_SPLIT, official_test),
+    ):
+        missing_columns = required_columns.difference(split_dataset.column_names)
+        if missing_columns:
+            raise ValueError(
+                f"Split '{split_name}' is missing column(s): {sorted(missing_columns)}"
+            )
 
-    # Get all class directories
-    class_dirs = sorted([d for d in os.listdir(dataset_path)
-                        if os.path.isdir(os.path.join(dataset_path, d))])
+    split = official_train.train_test_split(
+        test_size=val_ratio,
+        stratify_by_column="label",
+        seed=random_seed,
+    )
+    train_data = split["train"]
+    val_data = split["test"]
+    test_data = official_test
 
-    print(f"\nFound {len(class_dirs)} classes: {class_dirs}")
+    label_feature = official_train.features["label"]
+    class_names = list(label_feature.names)
+    train_labels = [int(label) for label in train_data["label"]]
+    val_labels = [int(label) for label in val_data["label"]]
+    test_labels = [int(label) for label in test_data["label"]]
 
-    # Create class to index mapping
-    class_to_idx = {class_name: idx for idx, class_name in enumerate(class_dirs)}
+    print("\nDataset split (stratified):")
+    print(f"  Train: {len(train_data):,} images")
+    print(f"  Val:   {len(val_data):,} images (from official train)")
+    print(f"  Test:  {len(test_data):,} images (official valid, held out)")
+    print(f"  Classes: {len(class_names)}")
+    print(f"  Random seed: {random_seed}")
 
-    # Collect all images per class
-    class_images = defaultdict(list)
-
-    for class_name in class_dirs:
-        class_path = os.path.join(dataset_path, class_name)
-        for img_name in os.listdir(class_path):
-            if img_name.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif')):
-                img_path = os.path.join(class_path, img_name)
-                class_images[class_name].append(img_path)
-
-    # Print dataset statistics
-    print("\nDataset statistics:")
-    total_images = 0
-    for class_name in class_dirs:
-        count = len(class_images[class_name])
-        total_images += count
-        print(f"  {class_name}: {count} images")
-    print(f"  Total: {total_images} images")
-
-    # Split data for each class
-    train_paths, train_labels = [], []
-    val_paths, val_labels = [], []
-    test_paths, test_labels = [], []
-
-    for class_name in class_dirs:
-        images = class_images[class_name]
-        # Sort first for deterministic order, then shuffle with fixed seed
-        images = sorted(images)  # Deterministic base order
-        random.shuffle(images)   # Shuffle with seeded random
-
-        n_total = len(images)
-        n_train = int(n_total * train_ratio)
-        n_val = int(n_total * val_ratio)
-
-        # Split
-        train_imgs = images[:n_train]
-        val_imgs = images[n_train:n_train + n_val]
-        test_imgs = images[n_train + n_val:]
-
-        # Get label index
-        label = class_to_idx[class_name]
-
-        # Add to lists
-        train_paths.extend(train_imgs)
-        train_labels.extend([label] * len(train_imgs))
-
-        val_paths.extend(val_imgs)
-        val_labels.extend([label] * len(val_imgs))
-
-        test_paths.extend(test_imgs)
-        test_labels.extend([label] * len(test_imgs))
-
-    print(f"\nData split:")
-    print(f"  Train: {len(train_paths)} images")
-    print(f"  Val: {len(val_paths)} images")
-    print(f"  Test: {len(test_paths)} images")
-
-    # VERIFICATION: Print first few samples for reproducibility check
-    print(f"\n✓ Reproducibility check (random_seed={random_seed}):")
-    print(f"  First train sample: {Path(train_paths[0]).name if train_paths else 'N/A'}")
-    print(f"  First val sample: {Path(val_paths[0]).name if val_paths else 'N/A'}")
-    print(f"  First test sample: {Path(test_paths[0]).name if test_paths else 'N/A'}")
-
-    return train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, class_dirs
+    return (
+        train_data,
+        train_labels,
+        val_data,
+        val_labels,
+        test_data,
+        test_labels,
+        class_names,
+    )
 
 
-def create_dataloaders(train_paths, train_labels, val_paths, val_labels,
-                       test_paths, test_labels, batch_size, num_workers=4):
-    """
-    Create PyTorch dataloaders
+def create_dataloaders(
+    train_data,
+    train_labels,
+    val_data,
+    val_labels,
+    test_data,
+    test_labels,
+    batch_size,
+    num_workers=4,
+):
+    """Create reproducible PyTorch DataLoaders from Hugging Face splits."""
+    train_dataset = HFImageDataset(train_data, transform=get_transforms("train"))
+    val_dataset = HFImageDataset(val_data, transform=get_transforms("val"))
+    test_dataset = HFImageDataset(test_data, transform=get_transforms("test"))
 
-    Returns:
-        train_loader, val_loader, test_loader
-    """
-
-    # Create datasets
-    train_dataset = ImageDataset(train_paths, train_labels, transform=get_transforms('train'))
-
-    # WeightedRandomSampler (conditional on config)
     sampler = None
     use_shuffle = True
     if Config.USE_WEIGHTED_SAMPLER:
-        # Compute class sample counts
         class_sample_counts = torch.bincount(torch.tensor(train_labels))
-        # Compute class weights (inverse frequency)
-        weights = 1.0 / class_sample_counts.float()
-        # Assign weight to each sample
-        train_targets = torch.tensor(train_labels)
-        samples_weights = weights[train_targets]
-        # Create sampler
+        if torch.any(class_sample_counts == 0):
+            raise ValueError("Weighted sampler cannot handle a class with zero samples")
+        class_weights = 1.0 / class_sample_counts.float()
+        sample_weights = class_weights[torch.tensor(train_labels)]
         sampler = WeightedRandomSampler(
-            weights=samples_weights.double(),
-            num_samples=len(samples_weights),
-            replacement=True
+            weights=sample_weights.double(),
+            num_samples=len(sample_weights),
+            replacement=True,
         )
-        use_shuffle = False  # No shuffle when using sampler
-        print("  ✓ WeightedRandomSampler: ENABLED")
+        use_shuffle = False
+        print("  WeightedRandomSampler: ENABLED")
     else:
-        print("  ✓ WeightedRandomSampler: DISABLED (using default shuffle)")
+        print("  WeightedRandomSampler: DISABLED (dataset is balanced)")
 
-    val_dataset = ImageDataset(val_paths, val_labels, transform=get_transforms('val'))
-    test_dataset = ImageDataset(test_paths, test_labels, transform=get_transforms('test'))
-
-    # Determine if CUDA is available for pin_memory
     use_cuda = torch.cuda.is_available()
+    use_persistent = Config.PERSISTENT_WORKERS and num_workers > 0
+    generator = torch.Generator().manual_seed(Config.RANDOM_SEED)
 
-    # Create dataloaders with proper settings for reproducibility
-    # OPTIMIZATION: persistent_workers=True keeps workers alive between epochs (faster training)
-    # Only use with num_workers > 0
-    use_persistent = num_workers > 0
+    common_loader_args = {
+        "num_workers": num_workers,
+        "pin_memory": Config.PIN_MEMORY and use_cuda,
+        "persistent_workers": use_persistent,
+    }
+    if num_workers > 0:
+        common_loader_args["prefetch_factor"] = Config.PREFETCH_FACTOR
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         sampler=sampler,
         shuffle=use_shuffle,
-        num_workers=num_workers,
-        pin_memory=use_cuda,  # Only use pin_memory with CUDA
-        persistent_workers=use_persistent,  # Keep workers alive between epochs
-        worker_init_fn=worker_init_fn_seed,  # Use module-level function (not lambda) for Windows pickle
-        generator=torch.Generator().manual_seed(Config.RANDOM_SEED),  # Shuffle reproducibility
-        prefetch_factor=2 if num_workers > 0 else None  # Prefetch batches for faster loading
+        drop_last=Config.TRAIN_DROP_LAST,
+        worker_init_fn=worker_init_fn_seed,
+        generator=generator,
+        **common_loader_args,
     )
-
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_cuda,  # Only use pin_memory with CUDA
-        persistent_workers=use_persistent,  # Keep workers alive
-        prefetch_factor=2 if num_workers > 0 else None
+        **common_loader_args,
     )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=use_cuda,  # Only use pin_memory with CUDA
-        persistent_workers=use_persistent,  # Keep workers alive
-        prefetch_factor=2 if num_workers > 0 else None
+        **common_loader_args,
     )
 
     return train_loader, val_loader, test_loader
 
 
 if __name__ == "__main__":
-    # Test dataset loading
-    from config import Config
-
     Config.validate_config()
-
-    train_paths, train_labels, val_paths, val_labels, test_paths, test_labels, class_names = load_dataset(
-        Config.DATASET_PATH,
-        Config.TRAIN_RATIO,
-        Config.VAL_RATIO,
-        Config.TEST_RATIO,
-        Config.RANDOM_SEED
+    loaded = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
+        Config.RANDOM_SEED,
     )
-
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, _ = loaded
     train_loader, val_loader, test_loader = create_dataloaders(
-        train_paths, train_labels,
-        val_paths, val_labels,
-        test_paths, test_labels,
+        train_data,
+        train_labels,
+        val_data,
+        val_labels,
+        test_data,
+        test_labels,
         Config.BATCH_SIZE,
-        Config.NUM_WORKERS
+        Config.NUM_WORKERS,
     )
-
-    print("\n✓ Dataset loaded successfully!")
+    images, labels = next(iter(train_loader))
+    print("\nDataset loaded successfully")
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches: {len(val_loader)}")
     print(f"  Test batches: {len(test_loader)}")
+    print(f"  First batch: images={tuple(images.shape)}, labels={tuple(labels.shape)}")

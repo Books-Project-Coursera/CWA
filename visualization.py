@@ -8,13 +8,14 @@ import random
 from PIL import Image
 
 
-def print_dataset_statistics(image_paths, labels, class_names):
+def print_dataset_statistics(image_data, labels, class_names):
 
     """
     Print comprehensive dataset statistics including image counts and sizes
     
     Args:
-        image_paths: List of image file paths
+        image_data: Hugging Face Dataset with an ``image`` column, or a list
+            of image file paths for backward compatibility
         labels: List of corresponding labels
         class_names: List of class names
     """
@@ -23,7 +24,7 @@ def print_dataset_statistics(image_paths, labels, class_names):
     print("="*70)
     
     # Total images
-    total_images = len(image_paths)
+    total_images = len(image_data)
     print(f"\nTotal Images: {total_images}")
     
     # Images per class
@@ -43,17 +44,22 @@ def print_dataset_statistics(image_paths, labels, class_names):
     heights = []
     
     # Sample images to avoid loading all (can be slow for large datasets)
-    sample_size = min(1000, len(image_paths))
-    sampled_paths = random.sample(image_paths, sample_size)
+    sample_size = min(1000, len(image_data))
+    sampled_indices = random.sample(range(len(image_data)), sample_size)
     
-    for img_path in sampled_paths:
+    for idx in sampled_indices:
         try:
-            with Image.open(img_path) as img:
-                w, h = img.size
-                widths.append(w)
-                heights.append(h)
+            sample = image_data[idx]
+            if isinstance(sample, dict) and "image" in sample:
+                image = sample["image"]
+                w, h = image.size
+            else:
+                with Image.open(sample) as image:
+                    w, h = image.size
+            widths.append(w)
+            heights.append(h)
         except Exception as e:
-            print(f"  Warning: Could not read {img_path}: {e}")
+            print(f"  Warning: Could not read sample {idx}: {e}")
     
     if widths and heights:
         print(f"\nImage Size Statistics (sampled {len(widths)} images):")
@@ -62,10 +68,10 @@ def print_dataset_statistics(image_paths, labels, class_names):
         
         # Check if images have uniform sizes
         if len(set(zip(widths, heights))) == 1:
-            print(f"  ✓ All images have uniform size: {widths[0]}x{heights[0]}")
+            print(f"  [OK] All images have uniform size: {widths[0]}x{heights[0]}")
         else:
             unique_sizes = len(set(zip(widths, heights)))
-            print(f"  ⚠ Images have {unique_sizes} different sizes")
+            print(f"  [WARNING] Images have {unique_sizes} different sizes")
     
     print("="*70)
 
