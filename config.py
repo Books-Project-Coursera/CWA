@@ -12,12 +12,18 @@ class Config:
     VALIDATION_RATIO = 0.1  # Stratified holdout from the official train split
         
     # ===================== Training Configuration =====================
-    BATCH_SIZE = 1128
-    NUM_EPOCHS = 50
-    LEARNING_RATE = 1e-3
+    BATCH_SIZE = 1200               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
+    NUM_EPOCHS = 60
+    LEARNING_RATE = 2e-4            # THAY ĐỔI: 1e-4 → 2e-4
+                                    # Linear scaling rule: LR tỉ lệ với batch size
+                                    # 1e-4 × (1200/512) ≈ 2.34e-4, làm tròn xuống 2e-4
+                                    # (conservative hơn vì ViT nhạy cảm với LR lớn)
     WEIGHT_DECAY = 0.05
-    WARMUP_EPOCHS = 5
-    WARMUP_START_FACTOR = 0.1
+    WARMUP_EPOCHS = 12              # THAY ĐỔI: 10 → 12
+                                    # Batch lớn hơn → ít steps/epoch hơn (90k/1200 = 75 steps)
+                                    # so với trước (90k/512 = 175 steps), cần thêm epoch warmup
+                                    # để đủ số warmup steps bảo vệ backbone
+    WARMUP_START_FACTOR = 0.01      # Bắt đầu từ LR=2e-6, gentle với pretrained backbone
     ETA_MIN = 1e-6
     SCHEDULER = "linear_warmup_cosine"
 
@@ -41,50 +47,41 @@ class Config:
     PERSISTENT_WORKERS = True
     PIN_MEMORY = True
     TRAIN_DROP_LAST = True
-    PROFILE_BATCHES = 0  # Set >0 to print DataLoader vs GPU compute timing for first N train batches
-    PRINT_DATASET_STATS = False  # Opens up to 1000 images before training; keep off for server runs
+    PROFILE_BATCHES = 0
+    PRINT_DATASET_STATS = False
     
     # Early Stopping
     EARLY_STOPPING_PATIENCE = 20
     
     # Learning Rate Decay
-    LR_DECAY_PATIENCE = 5  # Reduce LR if val_loss doesn't improve for 5 epochs
-    LR_DECAY_FACTOR = 0.5  # Multiply LR by this factor when decaying
+    LR_DECAY_PATIENCE = 5
+    LR_DECAY_FACTOR = 0.5
     
     # ===================== Sampler Configuration =====================
-    USE_WEIGHTED_SAMPLER = False  # Bật/tắt WeightedRandomSampler (xử lý class imbalance ở data level)
+    USE_WEIGHTED_SAMPLER = False
     
     # ===================== Cross-Validation Configuration =====================
-    USE_CROSS_VALIDATION = False  # Bật/tắt Cross-Validation (dùng sklearn StratifiedKFold)
-    CV_N_SPLITS = 5              # Số fold cho Cross-Validation
+    USE_CROSS_VALIDATION = False
+    CV_N_SPLITS = 5
     
     # ===================== Loss Function Configuration =====================
-    # Loss function: 'cross_entropy' or 'poly_focal'
-    LOSS_FUNCTION = 'cross_entropy'  # Thay đổi thành 'poly_focal' để sử dụng PolyFocalLoss
-    LABEL_SMOOTHING = 0.1  # DeiT-style label smoothing
-    # PolyFocalLoss parameters (only used when LOSS_FUNCTION = 'poly_focal')
-    FOCAL_GAMMA = 2.0       # Focusing parameter: higher = more focus on hard examples
-    POLY_EPSILON = 1.0      # Poly coefficient: boosts gradient for ambiguous samples
-    CLASS_WEIGHT_METHOD = 'inverse_freq'  # 'inverse_freq' or 'effective_num'
+    LOSS_FUNCTION = 'cross_entropy'
+    LABEL_SMOOTHING = 0.1
+    FOCAL_GAMMA = 2.0
+    POLY_EPSILON = 1.0
+    CLASS_WEIGHT_METHOD = 'inverse_freq'
 
     # ===================== Model Configuration =====================
     MODELS = [
-        # 'vgg16',  
-        # 'resnet18',
-        # 'resnet101',
-        # 'mobilenet_v2'
-        # 'densenet121'
-        # 'efficientnet_b0',
         'vit_base_patch16_224'
     ]
     PRETRAINED = True
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
-    # Custom classifier configuration
-    # Định nghĩa các lớp fully connected tùy chỉnh
-    # Format: [hidden_dim1, hidden_dim2, ..., num_classes]
-    # Đơn giản hóa cho dataset nhỏ (~10k ảnh) để tránh overfitting
-    CLASSIFIER_CONFIG = [512, 256]  # User-selected custom MLP head
+    CLASSIFIER_CONFIG = [256]       # THAY ĐỔI: [512, 256] → [256]
+                                    # Head [512, 256] quá lớn cho TinyImageNet 200 classes.
+                                    # Head phức tạp → gradient lớn → destabilize backbone.
+                                    # [256] đủ capacity mà ít noise hơn khi fine-tune
     DROPOUT_RATE = 0.3
     MODEL_DROP_RATE = 0.0
     MODEL_ATTN_DROP_RATE = 0.0
@@ -96,9 +93,6 @@ class Config:
     IMAGE_MEAN = (0.5, 0.5, 0.5)
     IMAGE_STD = (0.5, 0.5, 0.5)
 
-    # DeiT-style augmentation. MIXUP_ALPHA and CUTMIX_ALPHA are beta
-    # distribution parameters; MIXUP_PROB is the probability of applying
-    # batch mixing, and MIXUP_SWITCH_PROB chooses CutMix instead of Mixup.
     USE_MIXUP_CUTMIX = True
     MIXUP_ALPHA = 0.8
     CUTMIX_ALPHA = 1.0
@@ -112,18 +106,12 @@ class Config:
     RANDOM_ERASING_VALUE = "random"
     
     # ===================== Evaluation Configuration =====================
-    # Strategy 2: Top-K checkpoints to average
     TOP_K_VALUES = [2, 3, 4, 5]
-    
-    # Strategy 3: Number of last epochs to average
     LAST_N_EPOCHS = 10
-    
-    # Checkpoint management - Memory optimization
-    KEEP_LAST_N_CHECKPOINTS = 10  # Keep last N epoch checkpoints
-    KEEP_TOP_K_CHECKPOINTS = 5    # Keep top K best val_loss checkpoints
+    KEEP_LAST_N_CHECKPOINTS = 10
+    KEEP_TOP_K_CHECKPOINTS = 5
     
     # ===================== Output Configuration =====================
-    # Kaggle output được lưu tại /kaggle/working
     if os.path.exists('/kaggle'):
         CHECKPOINTS_DIR = "/kaggle/working/checkpoints"
         RESULTS_DIR = "/kaggle/working/results"
@@ -131,23 +119,20 @@ class Config:
         CHECKPOINTS_DIR = "checkpoints"
         RESULTS_DIR = "results"
     
-    # Checkpoint management - TỰ ĐỘNG XÓA SAU KHI EVALUATE
-    AUTO_DELETE_CHECKPOINTS = True  # Set True để xóa checkpoints sau khi evaluate, False để giữ lại
-    SAVE_STRATEGY_CHECKPOINTS = False  # Set False để không lưu checkpoint của Strategy 1/2/3 sau evaluate
-    KEEP_RESULTS = True             # Luôn giữ results (Excel, charts)
+    AUTO_DELETE_CHECKPOINTS = True
+    SAVE_STRATEGY_CHECKPOINTS = False
+    KEEP_RESULTS = True
     
     # Random seed for reproducibility
     SEEDS = [1, 10, 100, 500]
     RANDOM_SEED = SEEDS[0]
         
     # ===================== W&B Configuration =====================
-    # W&B tracking
-    USE_WANDB = False  # Set to False to disable wandb
-    WANDB_API_KEY = "8ad789629890d812ecffc9f0fce138a75f63f992"  # Your wandb API key
-    WANDB_PROJECT = "BurmeseGrape-Capstone"  # Tên project trên wandb
-    WANDB_ENTITY = None  # Tên team/user wandb (None = default user)
-    # EXPERIMENT_NAME sẽ được set động khi chạy (ví dụ: "experiment_1", "experiment_2")
-    EXPERIMENT_NAME = "baseline_exp1"  # ⚠️ THAY ĐỔI CHO MỖI EXPERIMENT
+    USE_WANDB = False
+    WANDB_API_KEY = "8ad789629890d812ecffc9f0fce138a75f63f992"
+    WANDB_PROJECT = "BurmeseGrape-Capstone"
+    WANDB_ENTITY = None
+    EXPERIMENT_NAME = "baseline_exp1"
     
     @classmethod
     def get_num_classes(cls):
