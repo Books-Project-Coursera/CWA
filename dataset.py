@@ -25,7 +25,9 @@ class HFImageDataset(Dataset):
         self.labels = [int(label) for label in hf_dataset["label"]]
         # Cache ảnh dạng PIL vào RAM ngay khi init
         print("Caching images to RAM...")
-        self._cache = [hf_dataset[i]["image"].convert("RGB") for i in range(len(hf_dataset))]
+        # Tốt hơn nhiều - batch access
+        all_images = hf_dataset["image"]  # Arrow đọc toàn bộ column một lần
+        self._cache = [img.convert("RGB") for img in all_images]
 
     def __getitem__(self, idx):
         image = self._cache[idx]  # O(1), không cần đọc file
