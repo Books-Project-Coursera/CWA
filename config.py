@@ -32,11 +32,11 @@ class Config:
     USE_AMP = True
     AMP_DTYPE = "bfloat16"
     FLOAT32_MATMUL_PRECISION = "high"
-    USE_TORCH_COMPILE = True
-    TORCH_COMPILE_MODE = "max-autotune"
+    USE_TORCH_COMPILE = False
+    TORCH_COMPILE_MODE = "reduce-overhead"
 
     # DataLoader settings for a strong server CPU
-    NUM_WORKERS = 32
+    NUM_WORKERS = 16
     PREFETCH_FACTOR = 2
     PERSISTENT_WORKERS = True
     PIN_MEMORY = True
