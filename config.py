@@ -12,9 +12,9 @@ class Config:
     VALIDATION_RATIO = 0.1  # Stratified holdout from the official train split
         
     # ===================== Training Configuration =====================
-    BATCH_SIZE = 512
+    BATCH_SIZE = 1128
     NUM_EPOCHS = 50
-    LEARNING_RATE = 5e-4
+    LEARNING_RATE = 1e-3
     WEIGHT_DECAY = 0.05
     WARMUP_EPOCHS = 5
     WARMUP_START_FACTOR = 0.1
