@@ -13,11 +13,8 @@ class Config:
         
     # ===================== Training Configuration =====================
     BATCH_SIZE = 512
-    NUM_EPOCHS = 100
-    LR_REFERENCE_BATCH_SIZE = 512
-    BASE_LEARNING_RATE = 5e-5
-    AUTO_SCALE_LEARNING_RATE = True
-    LEARNING_RATE = BASE_LEARNING_RATE * (BATCH_SIZE / LR_REFERENCE_BATCH_SIZE)
+    NUM_EPOCHS = 50
+    LEARNING_RATE = 5e-4
     WEIGHT_DECAY = 0.05
     WARMUP_EPOCHS = 5
     WARMUP_START_FACTOR = 0.1
@@ -39,7 +36,7 @@ class Config:
     TORCH_COMPILE_MODE = "max-autotune"
 
     # DataLoader settings for a strong server CPU
-    NUM_WORKERS = 16
+    NUM_WORKERS = 32
     PREFETCH_FACTOR = 2
     PERSISTENT_WORKERS = True
     PIN_MEMORY = True
@@ -88,7 +85,7 @@ class Config:
     # Format: [hidden_dim1, hidden_dim2, ..., num_classes]
     # Đơn giản hóa cho dataset nhỏ (~10k ảnh) để tránh overfitting
     CLASSIFIER_CONFIG = [512, 256]  # User-selected custom MLP head
-    DROPOUT_RATE = 0.4
+    DROPOUT_RATE = 0.3
     MODEL_DROP_RATE = 0.0
     MODEL_ATTN_DROP_RATE = 0.0
     MODEL_DROP_PATH_RATE = 0.1

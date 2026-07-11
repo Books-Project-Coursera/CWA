@@ -204,15 +204,6 @@ def apply_cli_overrides(args):
         if value is not None:
             setattr(Config, attr, value)
 
-    if (
-        args.batch_size is not None
-        and args.lr is None
-        and Config.AUTO_SCALE_LEARNING_RATE
-    ):
-        Config.LEARNING_RATE = Config.BASE_LEARNING_RATE * (
-            Config.BATCH_SIZE / Config.LR_REFERENCE_BATCH_SIZE
-        )
-
     if args.fc_layers is not None:
         Config.CLASSIFIER_CONFIG = args.fc_layers
 
@@ -510,9 +501,6 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("fused_optimizer_requested", Config.USE_FUSED_OPTIMIZER),
         ("fused_optimizer_effective", Config.USE_FUSED_OPTIMIZER and cuda_available),
         ("learning_rate", Config.LEARNING_RATE),
-        ("base_learning_rate", Config.BASE_LEARNING_RATE),
-        ("auto_scale_learning_rate", Config.AUTO_SCALE_LEARNING_RATE),
-        ("lr_reference_batch_size", Config.LR_REFERENCE_BATCH_SIZE),
         ("weight_decay", Config.WEIGHT_DECAY),
         ("weight_decay_exclusions", "bias, 1D/norm params, model no_weight_decay set"),
         ("scheduler", Config.SCHEDULER),
