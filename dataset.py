@@ -28,7 +28,8 @@ class HFImageDataset(Dataset):
         # Tốt hơn nhiều - batch access
         all_images = hf_dataset["image"]  # Arrow đọc toàn bộ column một lần
         self._cache = [img.convert("RGB") for img in all_images]
-
+    def __len__(self):
+        return len(self._cache)
     def __getitem__(self, idx):
         image = self._cache[idx]  # O(1), không cần đọc file
         label = self.labels[idx]
