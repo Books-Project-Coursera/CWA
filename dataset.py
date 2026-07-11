@@ -19,26 +19,19 @@ def worker_init_fn_seed(worker_id):
 
 
 class HFImageDataset(Dataset):
-    """Expose a Hugging Face image-classification split as a PyTorch Dataset."""
-
     def __init__(self, hf_dataset, transform=None):
-        if not isinstance(hf_dataset, HFDataset):
-            raise TypeError("hf_dataset must be a datasets.Dataset instance")
         self.dataset = hf_dataset
         self.transform = transform
         self.labels = [int(label) for label in hf_dataset["label"]]
-
-    def __len__(self):
-        return len(self.dataset)
+        # Cache ảnh dạng PIL vào RAM ngay khi init
+        print("Caching images to RAM...")
+        self._cache = [hf_dataset[i]["image"].convert("RGB") for i in range(len(hf_dataset))]
 
     def __getitem__(self, idx):
-        sample = self.dataset[int(idx)]
-        image = sample["image"].convert("RGB")
-        label = int(sample["label"])
-
-        if self.transform is not None:
+        image = self._cache[idx]  # O(1), không cần đọc file
+        label = self.labels[idx]
+        if self.transform:
             image = self.transform(image)
-
         return image, label
 
 
