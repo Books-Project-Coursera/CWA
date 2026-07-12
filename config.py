@@ -12,8 +12,8 @@ class Config:
     VALIDATION_RATIO = 0.1  # Stratified holdout from the official train split
         
     # ===================== Training Configuration =====================
-    BATCH_SIZE = 1200               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
-    NUM_EPOCHS = 60
+    BATCH_SIZE = 1024               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
+    NUM_EPOCHS = 70
     LEARNING_RATE = 2e-4            # THAY ĐỔI: 1e-4 → 2e-4
                                     # Linear scaling rule: LR tỉ lệ với batch size
                                     # 1e-4 × (1200/512) ≈ 2.34e-4, làm tròn xuống 2e-4
@@ -51,7 +51,7 @@ class Config:
     PRINT_DATASET_STATS = False
     
     # Early Stopping
-    EARLY_STOPPING_PATIENCE = 20
+    EARLY_STOPPING_PATIENCE = 10
     
     # Learning Rate Decay
     LR_DECAY_PATIENCE = 5
@@ -124,7 +124,7 @@ class Config:
     KEEP_RESULTS = True
     
     # Random seed for reproducibility
-    SEEDS = [1, 10, 100, 500]
+    SEEDS = [1, 10, 42, 100, 500]
     RANDOM_SEED = SEEDS[0]
         
     # ===================== W&B Configuration =====================
