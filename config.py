@@ -13,13 +13,13 @@ class Config:
         
     # ===================== Training Configuration =====================
     BATCH_SIZE = 1024               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
-    NUM_EPOCHS = 70
+    NUM_EPOCHS = 60
     LEARNING_RATE = 2e-4            # THAY ĐỔI: 1e-4 → 2e-4
                                     # Linear scaling rule: LR tỉ lệ với batch size
                                     # 1e-4 × (1200/512) ≈ 2.34e-4, làm tròn xuống 2e-4
                                     # (conservative hơn vì ViT nhạy cảm với LR lớn)
-    WEIGHT_DECAY = 0.05
-    WARMUP_EPOCHS = 12              # THAY ĐỔI: 10 → 12
+    WEIGHT_DECAY = 1e-4
+    WARMUP_EPOCHS = 6            # THAY ĐỔI: 10 → 12
                                     # Batch lớn hơn → ít steps/epoch hơn (90k/1200 = 75 steps)
                                     # so với trước (90k/512 = 175 steps), cần thêm epoch warmup
                                     # để đủ số warmup steps bảo vệ backbone
@@ -28,7 +28,7 @@ class Config:
     SCHEDULER = "linear_warmup_cosine"
 
     # Optimizer
-    OPTIMIZER = "adamw"
+    OPTIMIZER = "adam"
     OPTIMIZER_BETAS = (0.9, 0.999)
     OPTIMIZER_EPS = 1e-8
     USE_FUSED_OPTIMIZER = True
@@ -66,7 +66,7 @@ class Config:
     
     # ===================== Loss Function Configuration =====================
     LOSS_FUNCTION = 'cross_entropy'
-    LABEL_SMOOTHING = 0.1
+    LABEL_SMOOTHING = 0.05
     FOCAL_GAMMA = 2.0
     POLY_EPSILON = 1.0
     CLASS_WEIGHT_METHOD = 'inverse_freq'
@@ -78,7 +78,7 @@ class Config:
     PRETRAINED = True
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
-    CLASSIFIER_CONFIG = [256]       # THAY ĐỔI: [512, 256] → [256]
+    CLASSIFIER_CONFIG = [512,256]       # THAY ĐỔI: [512, 256] → [256]
                                     # Head [512, 256] quá lớn cho TinyImageNet 200 classes.
                                     # Head phức tạp → gradient lớn → destabilize backbone.
                                     # [256] đủ capacity mà ít noise hơn khi fine-tune
