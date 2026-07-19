@@ -18,6 +18,13 @@ dataset/
 checkpoints/
 # results/
 
+# Object detection (Ultralytics) artifacts
+runs/
+datasets/
+*.pt
+*.onnx
+*.engine
+
 # Document
 Document/
 

@@ -12,3 +12,7 @@ Pillow>=10.0.0
 openpyxl>=3.1.0
 wandb>=0.16.0
 
+# Object detection pipeline (Strategy 2 - VOC), see README_DETECTION.md
+ultralytics>=8.2.0
+PyYAML>=6.0
+

@@ -2,6 +2,9 @@
 
 Pipeline tự động train & evaluate pretrained models cho bài toán image classification.
 
+> 🔍 **Nhánh này còn chứa pipeline Object Detection** (Strategy 2 mở rộng — Ultralytics YOLO + Pascal VOC): xem [README_DETECTION.md](README_DETECTION.md).
+> Lưu ý quan trọng khi đọc metrics detection: trong `VOC.yaml` của Ultralytics, split **`val` ≡ `test`** (đều là VOC2007 test) — không có validation set độc lập.
+
 ## Cấu trúc Project
 
 ```
