@@ -218,13 +218,17 @@ def average_checkpoints(ckpt_paths, output_path):
     def is_bn_stat(key):
         return any(marker in key for marker in ("running_mean", "running_var", "num_batches_tracked"))
 
-    avg_state = {}
-    for key, ref_tensor in state_dicts[0].items():
-        if is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
-            # Giữ nguyên từ checkpoint đầu (đã sort theo fitness giảm dần)
-            avg_state[key] = ref_tensor.clone()
-        else:
-            avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
+    # Short-circuit K=1: khớp hành vi của average_weights bên TinyImageNet
+    if len(ckpt_paths) == 1:
+        avg_state = {k: v.clone() for k, v in state_dicts[0].items()}
+    else:
+        avg_state = {}
+        for key, ref_tensor in state_dicts[0].items():
+            if is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
+                # Giữ nguyên từ checkpoint đầu (đã sort theo fitness giảm dần)
+                avg_state[key] = ref_tensor.clone()
+            else:
+                avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
 
     merged_module = modules[0]
     merged_module.load_state_dict(avg_state)
@@ -315,8 +319,20 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     for m in bn_modules:
         m.train()
 
+    # Autocast khớp precision train (repo gốc dùng autocast_context BF16 khi
+    # USE_AMP=True + CUDA). BN chỉ tích lũy mean/var nên không nhạy cảm với
+    # precision, nhưng match train precision cho nhất quán và nhanh hơn trên
+    # GPU. Không ảnh hưởng correctness khi Config.AMP=False.
+    if Config.AMP and device_obj.type == "cuda":
+        autocast_ctx = torch.autocast(
+            device_type="cuda",
+            dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        )
+    else:
+        autocast_ctx = torch.autocast(device_type=device_obj.type, enabled=False)
+
     print(f"      Updating BN stats bằng {num_batches} batch train (device={device_obj})...")
-    with torch.no_grad():
+    with torch.no_grad(), autocast_ctx:
         for i, batch_data in enumerate(loader):
             if i >= num_batches:
                 break
