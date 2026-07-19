@@ -47,6 +47,13 @@ def add_common_args(parser):
     parser.add_argument("--lr0", type=float, help="Override Config.LR0.")
     parser.add_argument("--lrf", type=float, help="Override Config.LRF.")
     parser.add_argument("--patience", type=int, help="Override Config.PATIENCE.")
+    parser.add_argument(
+        "--loss",
+        choices=["bce", "focal"],
+        help="Override Config.LOSS_FUNCTION: 'bce' (mặc định Ultralytics) hoặc 'focal' (FocalBCE).",
+    )
+    parser.add_argument("--focal-gamma", type=float, help="Override Config.FOCAL_GAMMA.")
+    parser.add_argument("--focal-alpha", type=float, help="Override Config.FOCAL_ALPHA.")
     parser.add_argument("--project", help="Override Config.PROJECT (thư mục output gốc).")
     parser.add_argument("--name", help="Override Config.NAME (tên run).")
     parser.add_argument(
@@ -127,6 +134,9 @@ def apply_cli_overrides(args):
         ("LR0", getattr(args, "lr0", None)),
         ("LRF", getattr(args, "lrf", None)),
         ("PATIENCE", getattr(args, "patience", None)),
+        ("LOSS_FUNCTION", getattr(args, "loss", None)),
+        ("FOCAL_GAMMA", getattr(args, "focal_gamma", None)),
+        ("FOCAL_ALPHA", getattr(args, "focal_alpha", None)),
         ("PROJECT", getattr(args, "project", None)),
         ("NAME", getattr(args, "name", None)),
         ("EVAL_SPLIT", getattr(args, "split", None)),

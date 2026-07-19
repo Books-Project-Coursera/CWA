@@ -60,6 +60,18 @@ class Config:
     WARMUP_BIAS_LR = 0.1   # bias LR khi warmup (giảm dần về LR0)
     COS_LR = False         # True = cosine LR (giống SCHEDULER='linear_warmup_cosine' của repo gốc)
 
+    # ===================== Loss Function =====================
+    # Chọn cls loss cho detection — song song LOSS_FUNCTION của nhánh
+    # Strategy2_TinyImageNet ('cross_entropy' | 'poly_focal').
+    # - "bce"  : nn.BCEWithLogitsLoss(reduction="none") — mặc định Ultralytics
+    #            (v8DetectionLoss dùng BCE, không phải CE — vì detection cls
+    #            là multi-label per anchor, không phải single-label softmax).
+    # - "focal": thay bằng FocalBCE (losses.py) — BCE * (1-p_t)^γ * α_factor,
+    #            công thức Focal Loss chuẩn, có hook install_cls_loss.
+    LOSS_FUNCTION = "bce"
+    FOCAL_GAMMA = 1.5  # focusing param — tăng γ dồn học vào hard examples
+    FOCAL_ALPHA = 0.25  # balancing param — 0 tắt
+
     # ===================== Loss Gains =====================
     # Trọng số 3 thành phần loss của Ultralytics YOLO (box regression + class
     # + distribution focal loss). Không có tương ứng trực tiếp trong repo gốc
@@ -198,6 +210,16 @@ class Config:
             if not 0.0 <= float(getattr(cls, prob)) <= 1.0:
                 raise ValueError(f"{prob} must be in [0, 1]")
 
+        if str(cls.LOSS_FUNCTION).lower() not in ("bce", "focal"):
+            raise ValueError(
+                f"LOSS_FUNCTION={cls.LOSS_FUNCTION!r} không hỗ trợ. "
+                "Chọn: 'bce' (Ultralytics default) hoặc 'focal'."
+            )
+        if float(cls.FOCAL_GAMMA) < 0:
+            raise ValueError("FOCAL_GAMMA must be non-negative")
+        if not 0.0 <= float(cls.FOCAL_ALPHA) <= 1.0:
+            raise ValueError("FOCAL_ALPHA must be in [0, 1]")
+
         if cls.EVAL_SPLIT not in cls.VALID_EVAL_SPLITS:
             raise ValueError(f"EVAL_SPLIT must be one of {cls.VALID_EVAL_SPLITS}")
 
@@ -222,5 +244,7 @@ class Config:
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        print(f"  Loss  : {cls.LOSS_FUNCTION}"
+              + (f" (γ={cls.FOCAL_GAMMA}, α={cls.FOCAL_ALPHA})" if cls.LOSS_FUNCTION == 'focal' else ""))
         print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
         print(f"  Eval split: {cls.EVAL_SPLIT or 'mặc định theo data.yaml'}")

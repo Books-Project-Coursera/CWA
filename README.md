@@ -177,7 +177,8 @@ tail -f train_voc.log
 | | `KEEP_TOP_K_CHECKPOINTS` | Số checkpoint giữ trên disk (≥ max K) |
 | | `USE_BN_UPDATE`, `BN_UPDATE_BATCHES` | Re-estimate BN sau average (bắt buộc để mAP không tụt) |
 | **Optimizer/LR** | `LR0`, `LRF`, `MOMENTUM`, `WEIGHT_DECAY`, `WARMUP_EPOCHS`, `WARMUP_MOMENTUM`, `WARMUP_BIAS_LR`, `COS_LR` | Tương đương nhóm Optimizer/Scheduler của repo gốc |
-| **Loss** | `BOX_GAIN`, `CLS_GAIN`, `DFL_GAIN`, `LABEL_SMOOTHING`, `DROPOUT`, `NBS`, `CLOSE_MOSAIC` | Loss gains YOLO + regularization |
+| **Loss** | `LOSS_FUNCTION` (`bce`/`focal`), `FOCAL_GAMMA`, `FOCAL_ALPHA` | Swap cls loss: BCE (Ultralytics default) ↔ FocalBCE — song song `LOSS_FUNCTION` của repo gốc; xem `losses.py` |
+| | `BOX_GAIN`, `CLS_GAIN`, `DFL_GAIN`, `LABEL_SMOOTHING`, `DROPOUT`, `NBS`, `CLOSE_MOSAIC` | Loss gains YOLO + regularization |
 | **Aug** | `HSV_H/S/V`, `DEGREES`, `TRANSLATE`, `SCALE`, `SHEAR`, `PERSPECTIVE`, `FLIPUD`, `FLIPLR`, `MOSAIC`, `MIXUP`, `CUTMIX`, `COPY_PASTE`, `ERASING`, `AUTO_AUGMENT` | Toàn bộ augmentation Ultralytics |
 | **Precision** | `AMP`, `MULTI_SCALE`, `RECT`, `SINGLE_CLS`, `FREEZE`, `DETERMINISTIC` | AMP, multi-scale, freeze N layer đầu |
 | **Eval** | `EVAL_SPLIT` | Split báo cáo cuối (`"test"` mặc định) |

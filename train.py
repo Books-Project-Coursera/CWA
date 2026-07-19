@@ -16,6 +16,7 @@ from pathlib import Path
 from config import Config
 from dataset import prepare_dataset
 from evaluate import RANKING_FILE, print_detection_metrics, run_strategy_evaluation
+from losses import install_cls_loss
 
 
 class TopKCheckpointManager:
@@ -176,6 +177,10 @@ def train_detector():
 
     # Step 2: train
     model = YOLO(Config.MODEL)
+    # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce' — hook init_criterion
+    # để criterion tạo lazily lúc gọi model.loss() dùng FocalBCE. Phải chạy
+    # TRƯỚC model.train() vì trainer sẽ deep-copy model.
+    install_cls_loss(model)
     if Config.USE_STRATEGY2:
         manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
         model.add_callback("on_model_save", manager.on_model_save)

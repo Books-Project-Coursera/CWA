@@ -522,6 +522,10 @@ def export_to_excel(run_dir, strategy_results=None, data=None, split=None, outpu
         ("batch", Config.BATCH),
         ("device", Config.DEVICE if Config.DEVICE is not None else "auto"),
         ("seed", Config.RANDOM_SEED),
+        ("cls_loss", Config.LOSS_FUNCTION + (
+            f" (γ={Config.FOCAL_GAMMA}, α={Config.FOCAL_ALPHA})"
+            if Config.LOSS_FUNCTION == "focal" else ""
+        )),
         ("eval_split", split or Config.EVAL_SPLIT or "mặc định theo data.yaml"),
         ("strategy2", f"Top-K {Config.TOP_K_VALUES}" if Config.USE_STRATEGY2 else "OFF"),
         ("run_dir", run_dir),
