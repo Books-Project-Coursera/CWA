@@ -88,24 +88,21 @@ class Config:
     # ===================== Augmentation =====================
     # Nhóm augmentation của Ultralytics — tương ứng "USE_MIXUP_CUTMIX,
     # MIXUP_ALPHA, HORIZONTAL_FLIP_PROB, RANDOM_ERASING_*" của repo gốc, có
-    # thêm augmentation dành riêng cho detection (HSV, geometric, mosaic).
-    HSV_H = 0.015     # hue jitter (0-1)
-    HSV_S = 0.7       # saturation jitter (0-1)
-    HSV_V = 0.4       # value/brightness jitter (0-1)
-    DEGREES = 0.0     # random rotation ±deg
-    TRANSLATE = 0.1   # random translation (fraction of image)
-    SCALE = 0.5       # random scale (±)
-    SHEAR = 0.0       # random shear deg
-    PERSPECTIVE = 0.0 # random perspective (0-0.001)
-    FLIPUD = 0.0      # xác suất flip trục dọc
-    FLIPLR = 0.5      # xác suất flip trục ngang (tương đương HORIZONTAL_FLIP_PROB)
-    BGR = 0.0         # xác suất đổi channel order BGR
-    MOSAIC = 1.0      # xác suất mosaic 4-image
-    MIXUP = 0.0       # xác suất mixup (repo gốc bật, YOLO detection thường 0)
-    CUTMIX = 0.0      # xác suất cutmix (repo gốc bật, YOLO detection thường 0)
-    COPY_PASTE = 0.0  # copy-paste augmentation cho detection
-    AUTO_AUGMENT = "randaugment"  # randaugment | autoaugment | augmix (classification only cho backbone-pretrain)
-    ERASING = 0.4     # random erasing prob (repo gốc RANDOM_ERASING_PROB=0.25)
+   
+    HSV_H = 0.015
+    HSV_S = 0.7
+    HSV_V = 0.4
+    DEGREES = 0.0
+    TRANSLATE = 0.1
+    SCALE = 0.5
+    SHEAR = 0.0
+    PERSPECTIVE = 0.0
+    FLIPUD = 0.0
+    FLIPLR = 0.5
+    MOSAIC = 1.0
+    MIXUP = 0.1             # Bật nhẹ mixup cho detection — VOC có 20 classes
+    COPY_PASTE = 0.1        # Copy-paste hữu ích cho detection (thêm objects)
+    ERASING = 0.4
 
     # ===================== Precision & Runtime =====================
     # Tương ứng "USE_AMP, AMP_DTYPE, MULTI_SCALE..." của repo gốc.
