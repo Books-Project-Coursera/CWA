@@ -103,7 +103,8 @@ class Config:
     MIXUP = 0.1             # Bật nhẹ mixup cho detection — VOC có 20 classes
     COPY_PASTE = 0.1        # Copy-paste hữu ích cho detection (thêm objects)
     ERASING = 0.4
-
+    BGR = 0.0
+    CUTMIX = 0.0
     # ===================== Precision & Runtime =====================
     # Tương ứng "USE_AMP, AMP_DTYPE, MULTI_SCALE..." của repo gốc.
     AMP = True         # Ultralytics auto-mixed precision (FP16/BF16 theo GPU)
