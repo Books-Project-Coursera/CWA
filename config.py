@@ -1,189 +1,149 @@
 """
-Configuration file for baseline research
+Configuration file for Strategy 2 - Object Detection (Ultralytics YOLO + Pascal VOC)
+
+Nhánh này CHỈ làm object detection với các model YOLO (qua Ultralytics API).
+Mọi tham số chỉnh ở đây; các giá trị hay dùng đều override được qua CLI (main.py).
 """
 import os
 
+
 class Config:
 
-    # Hugging Face Tiny ImageNet. The official `valid` split is kept as test.
-    DATASET_NAME = "zh-plus/tiny-imagenet"
-    HF_TRAIN_SPLIT = "train"
-    HF_TEST_SPLIT = "valid"
-    VALIDATION_RATIO = 0.1  # Stratified holdout from the official train split
-        
-    # ===================== Training Configuration =====================
-    BATCH_SIZE = 1024               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
-    NUM_EPOCHS = 60
-    LEARNING_RATE = 2e-4            # THAY ĐỔI: 1e-4 → 2e-4
-                                    # Linear scaling rule: LR tỉ lệ với batch size
-                                    # 1e-4 × (1200/512) ≈ 2.34e-4, làm tròn xuống 2e-4
-                                    # (conservative hơn vì ViT nhạy cảm với LR lớn)
-    WEIGHT_DECAY = 1e-4
-    WARMUP_EPOCHS = 6            # THAY ĐỔI: 10 → 12
-                                    # Batch lớn hơn → ít steps/epoch hơn (90k/1200 = 75 steps)
-                                    # so với trước (90k/512 = 175 steps), cần thêm epoch warmup
-                                    # để đủ số warmup steps bảo vệ backbone
-    WARMUP_START_FACTOR = 0.01      # Bắt đầu từ LR=2e-6, gentle với pretrained backbone
-    ETA_MIN = 1e-6
-    SCHEDULER = "linear_warmup_cosine"
-
-    # Optimizer
-    OPTIMIZER = "adam"
-    OPTIMIZER_BETAS = (0.9, 0.999)
-    OPTIMIZER_EPS = 1e-8
-    USE_FUSED_OPTIMIZER = True
-    GRAD_CLIP_NORM = 1.0
-
-    # H100 execution settings
-    USE_AMP = True
-    AMP_DTYPE = "bfloat16"
-    FLOAT32_MATMUL_PRECISION = "high"
-    USE_TORCH_COMPILE = False
-    TORCH_COMPILE_MODE = "reduce-overhead"
-
-    # DataLoader settings for a strong server CPU
-    NUM_WORKERS = 16
-    PREFETCH_FACTOR = 2
-    PERSISTENT_WORKERS = True
-    PIN_MEMORY = True
-    TRAIN_DROP_LAST = True
-    PROFILE_BATCHES = 0
-    PRINT_DATASET_STATS = False
-    
-    # Early Stopping
-    EARLY_STOPPING_PATIENCE = 10
-    
-    # Learning Rate Decay
-    LR_DECAY_PATIENCE = 5
-    LR_DECAY_FACTOR = 0.5
-    
-    # ===================== Sampler Configuration =====================
-    USE_WEIGHTED_SAMPLER = False
-    
-    # ===================== Cross-Validation Configuration =====================
-    USE_CROSS_VALIDATION = False
-    CV_N_SPLITS = 5
-    
-    # ===================== Loss Function Configuration =====================
-    LOSS_FUNCTION = 'cross_entropy'
-    LABEL_SMOOTHING = 0.05
-    FOCAL_GAMMA = 2.0
-    POLY_EPSILON = 1.0
-    CLASS_WEIGHT_METHOD = 'inverse_freq'
-
     # ===================== Model Configuration =====================
-    MODELS = [
-        'vit_base_patch16_224'
-    ]
+    # KHÔNG chốt cứng version YOLO nào làm mặc định — bạn TỰ SET giá trị này
+    # (hoặc truyền --model khi chạy). Nhận mọi giá trị mà ultralytics.YOLO()
+    # nhận, đổi version = sửa đúng 1 dòng:
+    #   - Pretrained weights : "yolov8n.pt" | "yolo11n.pt" | "yolov5nu.pt" | ...
+    #   - Custom weights     : "path/to/your_best.pt"
+    #   - Train from scratch : "yolov8n.yaml" (hoặc .yaml kiến trúc custom)
+    MODEL = None  # <-- ĐẶT MODEL CỦA BẠN Ở ĐÂY, ví dụ: "yolov8n.pt"
+
+    # ===================== Dataset Configuration =====================
+    # "VOC.yaml" = Pascal VOC built-in của Ultralytics, TỰ ĐỘNG DOWNLOAD lần đầu
+    # (https://docs.ultralytics.com/datasets/detect/voc). Data đã tải sẵn /
+    # data custom: trỏ tới file data.yaml của bạn.
+    #
+    # ⚠️ VOC.yaml GỐC: split `val` và `test` TRÙNG NHAU (đều là VOC2007 test,
+    # 4952 ảnh) — KHÔNG có validation set độc lập. Strategy 2 cần chọn/average
+    # checkpoint theo fitness trên val ĐỘC LẬP với test, nên pipeline tự tách
+    # VAL_RATIO từ train làm validation riêng (xem dataset.py):
+    #   train (16551 ảnh) → train' (1 - VAL_RATIO) + val' (VAL_RATIO, holdout)
+    #   test  = VOC2007 test (4952 ảnh), giữ nguyên làm hold-out báo cáo cuối
+    DATA = "VOC.yaml"
+    VAL_RATIO = 0.1  # tỉ lệ tách val' từ train (giống VALIDATION_RATIO nhánh classification)
+                     # = 0 → dùng nguyên data.yaml gốc: val ≡ test, Strategy 2
+                     #   sẽ chọn checkpoint trên chính tập test (leakage) — tránh!
+
+    # ===================== Training Configuration =====================
+    EPOCHS = 100
+    IMGSZ = 640
+    BATCH = 16        # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
+    DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
+    WORKERS = 8
+    OPTIMIZER = "auto"  # auto | SGD | Adam | AdamW | ...
+    LR0 = 0.01
+    LRF = 0.01
+    PATIENCE = 100    # early stopping của Ultralytics (epoch không cải thiện fitness val)
     PRETRAINED = True
-    VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
-    
-    CLASSIFIER_CONFIG = [512,256]       # THAY ĐỔI: [512, 256] → [256]
-                                    # Head [512, 256] quá lớn cho TinyImageNet 200 classes.
-                                    # Head phức tạp → gradient lớn → destabilize backbone.
-                                    # [256] đủ capacity mà ít noise hơn khi fine-tune
-    DROPOUT_RATE = 0.3
-    MODEL_DROP_RATE = 0.0
-    MODEL_ATTN_DROP_RATE = 0.0
-    MODEL_DROP_PATH_RATE = 0.1
-    
-    # ===================== Image Configuration =====================
-    IMAGE_SIZE = 224
-    RESIZE_INTERPOLATION = "bicubic"
-    IMAGE_MEAN = (0.5, 0.5, 0.5)
-    IMAGE_STD = (0.5, 0.5, 0.5)
+    CACHE = False
+    RESUME = False
 
-    USE_MIXUP_CUTMIX = True
-    MIXUP_ALPHA = 0.8
-    CUTMIX_ALPHA = 1.0
-    MIXUP_PROB = 1.0
-    MIXUP_SWITCH_PROB = 0.5
-    MIXUP_MODE = "batch"
-    HORIZONTAL_FLIP_PROB = 0.5
-    RANDOM_ERASING_PROB = 0.25
-    RANDOM_ERASING_SCALE = (0.02, 0.33)
-    RANDOM_ERASING_RATIO = (0.3, 3.3)
-    RANDOM_ERASING_VALUE = "random"
-    
-    # ===================== Evaluation Configuration =====================
+    # Truyền thêm train-arg Ultralytics bất kỳ mà không cần sửa code
+    # (https://docs.ultralytics.com/modes/train/#train-settings)
+    EXTRA_TRAIN_ARGS = {}  # ví dụ: {"cos_lr": True, "close_mosaic": 10}
+
+    # ===================== Strategy Configuration =====================
+    # Strategy 1: best.pt — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn)
+    # Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
+    #             (giống nhánh classification; fitness = 0.1*mAP50 + 0.9*mAP50-95)
+    USE_STRATEGY2 = True
     TOP_K_VALUES = [2, 3, 4, 5]
-    LAST_N_EPOCHS = 10
-    KEEP_LAST_N_CHECKPOINTS = 10
-    KEEP_TOP_K_CHECKPOINTS = 5
-    
+    # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
+    # Ultralytics lưu (save_period=1) rồi TopKCheckpointManager prune NGAY nếu
+    # ngoài Top-K — không lưu tất cả epoch (xem train.py)
+    KEEP_TOP_K_CHECKPOINTS = 5  # nên = max(TOP_K_VALUES)
+
+    # ===================== Evaluation Configuration =====================
+    # Split dùng cho báo cáo cuối (Strategy 1 vs Strategy 2):
+    #   "test" (mặc định — VOC2007 test) | "val" (val' holdout) | None (theo data.yaml)
+    EVAL_SPLIT = "test"
+    CONF = None  # confidence threshold; None = mặc định Ultralytics khi val (0.001)
+    IOU = None   # NMS IoU threshold; None = mặc định Ultralytics
+
     # ===================== Output Configuration =====================
-    if os.path.exists('/kaggle'):
-        CHECKPOINTS_DIR = "/kaggle/working/checkpoints"
-        RESULTS_DIR = "/kaggle/working/results"
-    else:
-        CHECKPOINTS_DIR = "checkpoints"
-        RESULTS_DIR = "results"
-    
-    AUTO_DELETE_CHECKPOINTS = True
-    SAVE_STRATEGY_CHECKPOINTS = False
-    KEEP_RESULTS = True
-    
-    # Random seed for reproducibility
-    SEEDS = [1, 10, 42, 100, 500]
-    RANDOM_SEED = SEEDS[0]
-        
-    # ===================== W&B Configuration =====================
-    USE_WANDB = False
-    WANDB_API_KEY = "8ad789629890d812ecffc9f0fce138a75f63f992"
-    WANDB_PROJECT = "BurmeseGrape-Capstone"
-    WANDB_ENTITY = None
-    EXPERIMENT_NAME = "baseline_exp1"
-    
+    PROJECT = os.path.join("results", "detection")  # thư mục output gốc
+    NAME = None          # None = Ultralytics tự đánh số (train, train2, ...)
+    EXIST_OK = False
+    EXCEL_OUTPUT = None  # None = <run_dir>/detection_results.xlsx
+
+    # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...)
+    RANDOM_SEED = 1
+
+    # ===================== Edge AI Export (optional) =====================
+    # Hook xuất model sau train bằng model.export() — TẮT MẶC ĐỊNH.
+    # Bật EXPORT_ENABLED=True (hoặc --export-after-train) khi cần deploy edge.
+    EXPORT_ENABLED = False
+    EXPORT_FORMAT = "onnx"   # onnx | engine (TensorRT) | openvino | tflite | ...
+    EXPORT_HALF = False      # FP16 (hữu ích cho TensorRT/edge)
+    EXPORT_IMGSZ = None      # None = dùng IMGSZ phía trên
+    EXPORT_DYNAMIC = False
+    EXPORT_SIMPLIFY = True
+    EXPORT_DEVICE = None     # export TensorRT cần GPU → "0" nếu format engine
+
+    VALID_EVAL_SPLITS = (None, "val", "test", "train")
+
     @classmethod
-    def get_num_classes(cls):
-        """Return the known number of Tiny ImageNet classes."""
-        return 200
-    
-    @classmethod
-    def validate_config(cls):
-        """Validate configuration"""
-        if not cls.DATASET_NAME:
-            raise ValueError("DATASET_NAME must not be empty")
-
-        if not 0.0 < cls.VALIDATION_RATIO < 1.0:
-            raise ValueError("VALIDATION_RATIO must be strictly between 0 and 1")
-
-        for name in ("MIXUP_PROB", "MIXUP_SWITCH_PROB", "RANDOM_ERASING_PROB"):
-            value = getattr(cls, name)
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be between 0 and 1")
-
-        if cls.USE_MIXUP_CUTMIX and cls.LOSS_FUNCTION != "cross_entropy":
+    def validate_config(cls, require_model=True):
+        """Validate configuration (giữ pattern validate_config của repo gốc)."""
+        if require_model and not cls.MODEL:
             raise ValueError(
-                "Mixup/CutMix currently requires LOSS_FUNCTION='cross_entropy' "
-                "because PolyFocalLoss only accepts hard labels"
+                "Chưa set model. Đặt Config.MODEL trong config.py "
+                "(ví dụ: 'yolov8n.pt', 'yolo11n.pt', 'yolov5nu.pt', .pt/.yaml custom) "
+                "hoặc truyền --model khi chạy CLI."
             )
-        
-        if cls.EARLY_STOPPING_PATIENCE >= cls.NUM_EPOCHS:
-            raise ValueError("Early stopping patience should be less than num_epochs")
 
-        if cls.WARMUP_EPOCHS >= cls.NUM_EPOCHS:
-            raise ValueError("Warmup epochs should be less than num_epochs")
+        if not cls.DATA:
+            raise ValueError("DATA must not be empty (VOC.yaml hoặc path tới data.yaml custom)")
 
-        if cls.ETA_MIN >= cls.LEARNING_RATE:
-            raise ValueError("ETA_MIN must be smaller than LEARNING_RATE")
+        if not 0.0 <= float(cls.VAL_RATIO) < 1.0:
+            raise ValueError("VAL_RATIO must be in [0, 1)")
 
-        if cls.BATCH_SIZE <= 0:
-            raise ValueError("BATCH_SIZE must be positive")
+        if int(cls.EPOCHS) <= 0:
+            raise ValueError("EPOCHS must be positive")
 
-        if cls.NUM_WORKERS < 0:
-            raise ValueError("NUM_WORKERS must be non-negative")
+        if int(cls.IMGSZ) <= 0:
+            raise ValueError("IMGSZ must be positive")
 
-        if cls.PREFETCH_FACTOR <= 0:
-            raise ValueError("PREFETCH_FACTOR must be positive")
+        # BATCH = -1 hợp lệ (auto-batch của Ultralytics); chỉ cấm 0
+        if int(cls.BATCH) == 0:
+            raise ValueError("BATCH must be positive, or -1 for Ultralytics auto-batch")
 
-        if cls.AMP_DTYPE != "bfloat16":
-            raise ValueError("This H100 pipeline currently supports AMP_DTYPE='bfloat16'")
+        if int(cls.WORKERS) < 0:
+            raise ValueError("WORKERS must be non-negative")
 
-        if cls.OPTIMIZER.lower() != "adamw":
-            raise ValueError("This training pipeline currently supports OPTIMIZER='adamw'")
-        
+        if cls.EVAL_SPLIT not in cls.VALID_EVAL_SPLITS:
+            raise ValueError(f"EVAL_SPLIT must be one of {cls.VALID_EVAL_SPLITS}")
+
+        if cls.USE_STRATEGY2:
+            if not cls.TOP_K_VALUES or any(int(k) <= 1 for k in cls.TOP_K_VALUES):
+                raise ValueError("TOP_K_VALUES must be a non-empty list of ints > 1")
+            if int(cls.KEEP_TOP_K_CHECKPOINTS) < max(cls.TOP_K_VALUES):
+                raise ValueError(
+                    "KEEP_TOP_K_CHECKPOINTS must be >= max(TOP_K_VALUES) "
+                    "để đủ checkpoint cho mọi giá trị K"
+                )
+            if float(cls.VAL_RATIO) == 0.0:
+                print(
+                    "⚠ WARNING: USE_STRATEGY2=True nhưng VAL_RATIO=0 → không có val "
+                    "độc lập, checkpoint sẽ được chọn trên chính tập test (leakage)!"
+                )
+
+        if cls.EXPORT_ENABLED and not cls.EXPORT_FORMAT:
+            raise ValueError("EXPORT_ENABLED=True requires EXPORT_FORMAT (e.g. onnx, engine)")
+
         print("[OK] Config validated successfully")
-        print(f"  Dataset: {cls.DATASET_NAME}")
-        print(f"  Number of classes: {cls.get_num_classes()}")
-        print(f"  Models to train: {len(cls.MODELS)}")
+        print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
+        print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
+        print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
+        print(f"  Eval split: {cls.EVAL_SPLIT or 'mặc định theo data.yaml'}")

@@ -1,243 +1,168 @@
-"""Tiny ImageNet loading, preprocessing, and PyTorch DataLoaders."""
+"""
+Chuẩn bị dataset VOC với VALIDATION SET ĐỘC LẬP tách từ train.
 
+Vấn đề: VOC.yaml gốc của Ultralytics có val ≡ test (cùng là VOC2007 test,
+4952 ảnh) → không có val độc lập, không dùng được Strategy 2 đúng nghĩa
+(chọn/average checkpoint trên val rồi báo cáo trên test).
+
+Giải pháp: sau khi Ultralytics tải/định vị VOC (check_det_dataset), tách
+VAL_RATIO ảnh từ pool train (trainval 2007+2012, 16551 ảnh) làm val' riêng:
+  - Ghi 2 file list ảnh: holdout_train_*.txt / holdout_val_*.txt tại dataset
+    root (Ultralytics hỗ trợ split dạng txt list, label tự suy từ images→labels)
+  - Sinh data yaml mới: train=train', val=val', test=VOC2007 test (giữ nguyên)
+  - Idempotent theo (seed, ratio): chạy lại không tách lại, dùng file có sẵn
+
+Với data custom đã có val độc lập: set Config.VAL_RATIO = 0 để dùng nguyên
+data.yaml của bạn (pipeline sẽ không tách gì cả).
+"""
+import os
 import random
+from pathlib import Path
 
-import torch
-from datasets import Dataset as HFDataset
-from datasets import load_dataset as load_hf_dataset
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
-from torchvision import transforms
-from torchvision.transforms import InterpolationMode
+import yaml
 
 from config import Config
 
-
-def worker_init_fn_seed(worker_id):
-    """Seed Python's RNG independently in every DataLoader worker."""
-    worker_seed = torch.initial_seed() % (2**32)
-    random.seed(worker_seed + worker_id)
+# Đuôi ảnh hợp lệ — khớp IMG_FORMATS của Ultralytics
+IMG_EXTENSIONS = {".bmp", ".dng", ".jpeg", ".jpg", ".mpo", ".png", ".tif", ".tiff", ".webp", ".pfm"}
 
 
-class HFImageDataset(Dataset):
-    def __init__(self, hf_dataset, transform=None):
-        self.dataset = hf_dataset
-        self.transform = transform
-        self.labels = [int(label) for label in hf_dataset["label"]]
-        # Cache ảnh dạng PIL vào RAM ngay khi init
-        print("Caching images to RAM...")
-        # Tốt hơn nhiều - batch access
-        all_images = hf_dataset["image"]  # Arrow đọc toàn bộ column một lần
-        self._cache = [img.convert("RGB") for img in all_images]
-    def __len__(self):
-        return len(self._cache)
-    def __getitem__(self, idx):
-        image = self._cache[idx]  # O(1), không cần đọc file
-        label = self.labels[idx]
-        if self.transform:
-            image = self.transform(image)
-        return image, label
+def _collect_images(sources):
+    """Gom (đệ quy) mọi file ảnh từ list thư mục/file txt nguồn train."""
+    if isinstance(sources, (str, Path)):
+        sources = [sources]
 
-
-def get_transforms(split="train"):
-    """Build full-image 224px transforms for ImageNet-pretrained models."""
-    common = [
-        transforms.Resize(
-            (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
-            interpolation=InterpolationMode.BICUBIC,
-            antialias=True,
-        ),
-    ]
-
-    if split == "train":
-        return transforms.Compose(
-            common
-            + [
-                transforms.RandomHorizontalFlip(p=Config.HORIZONTAL_FLIP_PROB),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=Config.IMAGE_MEAN,
-                    std=Config.IMAGE_STD,
-                ),
-                transforms.RandomErasing(
-                    p=Config.RANDOM_ERASING_PROB,
-                    scale=Config.RANDOM_ERASING_SCALE,
-                    ratio=Config.RANDOM_ERASING_RATIO,
-                    value=Config.RANDOM_ERASING_VALUE,
-                ),
-            ]
-        )
-
-    return transforms.Compose(
-        common
-        + [
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=Config.IMAGE_MEAN,
-                std=Config.IMAGE_STD,
-            ),
-        ]
-    )
-
-
-def load_dataset(dataset_name, val_ratio=0.1, random_seed=42):
-    """Load Tiny ImageNet and reserve the official validation split for testing.
-
-    The Hugging Face dataset contains 100,000 labelled training images and 10,000
-    labelled validation images. We stratify the official training split into
-    90,000 training and 10,000 validation samples, while leaving the official
-    validation split untouched as the final test set.
-    """
-    if not 0.0 < val_ratio < 1.0:
-        raise ValueError("val_ratio must be strictly between 0 and 1")
-
-    print(f"\nLoading Hugging Face dataset: {dataset_name}")
-    dataset = load_hf_dataset(dataset_name)
-
-    required_splits = {Config.HF_TRAIN_SPLIT, Config.HF_TEST_SPLIT}
-    missing_splits = required_splits.difference(dataset.keys())
-    if missing_splits:
-        raise ValueError(
-            f"Dataset is missing required split(s): {sorted(missing_splits)}"
-        )
-
-    official_train = dataset[Config.HF_TRAIN_SPLIT]
-    official_test = dataset[Config.HF_TEST_SPLIT]
-    required_columns = {"image", "label"}
-    for split_name, split_dataset in (
-        (Config.HF_TRAIN_SPLIT, official_train),
-        (Config.HF_TEST_SPLIT, official_test),
-    ):
-        missing_columns = required_columns.difference(split_dataset.column_names)
-        if missing_columns:
-            raise ValueError(
-                f"Split '{split_name}' is missing column(s): {sorted(missing_columns)}"
+    images = []
+    for source in sources:
+        source = Path(source)
+        if source.is_dir():
+            images.extend(
+                p for p in sorted(source.rglob("*")) if p.suffix.lower() in IMG_EXTENSIONS
             )
-
-    split = official_train.train_test_split(
-        test_size=val_ratio,
-        stratify_by_column="label",
-        seed=random_seed,
-    )
-    train_data = split["train"]
-    val_data = split["test"]
-    test_data = official_test
-
-    label_feature = official_train.features["label"]
-    class_names = list(label_feature.names)
-    train_labels = [int(label) for label in train_data["label"]]
-    val_labels = [int(label) for label in val_data["label"]]
-    test_labels = [int(label) for label in test_data["label"]]
-
-    print("\nDataset split (stratified):")
-    print(f"  Train: {len(train_data):,} images")
-    print(f"  Val:   {len(val_data):,} images (from official train)")
-    print(f"  Test:  {len(test_data):,} images (official valid, held out)")
-    print(f"  Classes: {len(class_names)}")
-    print(f"  Random seed: {random_seed}")
-
-    return (
-        train_data,
-        train_labels,
-        val_data,
-        val_labels,
-        test_data,
-        test_labels,
-        class_names,
-    )
+        elif source.is_file() and source.suffix == ".txt":
+            # Nguồn đã là txt list → đọc từng dòng (path tương đối với thư mục cha)
+            base = source.parent
+            for line in source.read_text().splitlines():
+                line = line.strip()
+                if line:
+                    images.append((base / line).resolve())
+        else:
+            raise FileNotFoundError(f"Train source not found: {source}")
+    return images
 
 
-def create_dataloaders(
-    train_data,
-    train_labels,
-    val_data,
-    val_labels,
-    test_data,
-    test_labels,
-    batch_size,
-    num_workers=4,
-):
-    """Create reproducible PyTorch DataLoaders from Hugging Face splits."""
-    train_dataset = HFImageDataset(train_data, transform=get_transforms("train"))
-    val_dataset = HFImageDataset(val_data, transform=get_transforms("val"))
-    test_dataset = HFImageDataset(test_data, transform=get_transforms("test"))
+def _write_holdout_split(root, train_images, test_entry, names, val_ratio, seed):
+    """
+    Tách train/val theo (seed, ratio), ghi txt list + data yaml tại dataset root.
 
-    sampler = None
-    use_shuffle = True
-    if Config.USE_WEIGHTED_SAMPLER:
-        class_sample_counts = torch.bincount(torch.tensor(train_labels))
-        if torch.any(class_sample_counts == 0):
-            raise ValueError("Weighted sampler cannot handle a class with zero samples")
-        class_weights = 1.0 / class_sample_counts.float()
-        sample_weights = class_weights[torch.tensor(train_labels)]
-        sampler = WeightedRandomSampler(
-            weights=sample_weights.double(),
-            num_samples=len(sample_weights),
-            replacement=True,
-        )
-        use_shuffle = False
-        print("  WeightedRandomSampler: ENABLED")
-    else:
-        print("  WeightedRandomSampler: DISABLED (dataset is balanced)")
+    Args:
+        root: dataset root (Path) — mọi path trong txt/yaml tương đối với đây
+        train_images: list Path ảnh thuộc pool train gốc
+        test_entry: giá trị split test giữ nguyên từ data.yaml gốc (str/list)
+        names: dict class id → tên class
+        val_ratio, seed: tỉ lệ tách val và seed shuffle (quyết định tên file)
 
-    use_cuda = torch.cuda.is_available()
-    use_persistent = Config.PERSISTENT_WORKERS and num_workers > 0
-    generator = torch.Generator().manual_seed(Config.RANDOM_SEED)
+    Returns:
+        Path tới data yaml mới (train', val', test).
+    """
+    root = Path(root)
+    tag = f"seed{seed}_val{int(round(val_ratio * 100))}"
+    yaml_path = root / f"holdout_{tag}.yaml"
+    train_txt = root / f"holdout_train_{tag}.txt"
+    val_txt = root / f"holdout_val_{tag}.txt"
 
-    common_loader_args = {
-        "num_workers": num_workers,
-        "pin_memory": Config.PIN_MEMORY and use_cuda,
-        "persistent_workers": use_persistent,
+    # Idempotent: cùng seed + ratio → dùng lại split đã sinh (đảm bảo reproduce)
+    if yaml_path.exists() and train_txt.exists() and val_txt.exists():
+        print(f"  ✓ Dùng lại holdout split đã có: {yaml_path}")
+        return yaml_path
+
+    if len(train_images) < 2:
+        raise ValueError(f"Pool train quá nhỏ để tách val: {len(train_images)} ảnh")
+
+    # Shuffle có seed riêng, không đụng global random state
+    images = sorted(str(p) for p in train_images)
+    random.Random(seed).shuffle(images)
+    n_val = max(1, int(round(len(images) * val_ratio)))
+    val_images, train_split = images[:n_val], images[n_val:]
+
+    def _relative(p):
+        # "./images/train2007/xxx.jpg" — Ultralytics resolve tương đối với `path`
+        return "./" + os.path.relpath(p, root).replace(os.sep, "/")
+
+    train_txt.write_text("\n".join(_relative(p) for p in train_split) + "\n")
+    val_txt.write_text("\n".join(_relative(p) for p in val_images) + "\n")
+
+    data_yaml = {
+        "path": str(root),
+        "train": train_txt.name,
+        "val": val_txt.name,
+        "test": test_entry,
+        "names": names,
     }
-    if num_workers > 0:
-        common_loader_args["prefetch_factor"] = Config.PREFETCH_FACTOR
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        f.write(
+            "# Auto-generated by dataset.py — VOC voi validation set DOC LAP tach tu train\n"
+            f"# seed={seed}, val_ratio={val_ratio} | train'={len(train_split)} | "
+            f"val'={len(val_images)} | test giu nguyen (VOC2007 test)\n"
+        )
+        yaml.safe_dump(data_yaml, f, sort_keys=False, allow_unicode=True)
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        shuffle=use_shuffle,
-        drop_last=Config.TRAIN_DROP_LAST,
-        worker_init_fn=worker_init_fn_seed,
-        generator=generator,
-        **common_loader_args,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        **common_loader_args,
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        **common_loader_args,
-    )
-
-    return train_loader, val_loader, test_loader
+    print(f"  ✓ Đã tách holdout val: train'={len(train_split)} | val'={len(val_images)} ảnh")
+    print(f"  ✓ Data yaml mới: {yaml_path}")
+    return yaml_path
 
 
-if __name__ == "__main__":
-    Config.validate_config()
-    loaded = load_dataset(
-        Config.DATASET_NAME,
-        Config.VALIDATION_RATIO,
-        Config.RANDOM_SEED,
+def prepare_dataset():
+    """
+    Trả về path data yaml dùng cho train/eval:
+    - VAL_RATIO > 0: tải/định vị dataset qua Ultralytics rồi sinh holdout yaml
+      (val' độc lập tách từ train, test giữ nguyên).
+    - VAL_RATIO = 0: trả nguyên Config.DATA (cảnh báo nếu là VOC.yaml gốc).
+    """
+    if not Config.VAL_RATIO:
+        if str(Config.DATA).endswith("VOC.yaml"):
+            print(
+                "⚠ WARNING: VAL_RATIO=0 với VOC.yaml gốc → val ≡ test (VOC2007). "
+                "Metrics 'val' trong lúc train đo trên chính tập test!"
+            )
+        return Config.DATA
+
+    # check_det_dataset: resolve + TỰ DOWNLOAD dataset nếu chưa có (VOC ~2.8GB)
+    from ultralytics.data.utils import check_det_dataset
+
+    print(f"\n[Dataset] Chuẩn bị {Config.DATA} với val holdout {Config.VAL_RATIO:.0%} từ train...")
+    data = check_det_dataset(str(Config.DATA))
+    root = Path(data["path"])
+
+    train_images = _collect_images(data["train"])
+    print(f"  Pool train gốc: {len(train_images)} ảnh")
+
+    # Giữ nguyên split test của data.yaml gốc (VOC: images/test2007).
+    # Nếu data.yaml không khai báo test → dùng val gốc làm test (và cảnh báo).
+    test_entry = data.get("test") or data.get("val")
+    if not data.get("test"):
+        print("  ⚠ data.yaml gốc không có split 'test' → dùng split 'val' gốc làm test")
+    # Đưa test entry về path tương đối với root nếu đang là path tuyệt đối
+    if isinstance(test_entry, (list, tuple)):
+        test_entry = [_to_relative(root, t) for t in test_entry]
+    else:
+        test_entry = _to_relative(root, test_entry)
+
+    return str(
+        _write_holdout_split(
+            root=root,
+            train_images=train_images,
+            test_entry=test_entry,
+            names=data["names"],
+            val_ratio=float(Config.VAL_RATIO),
+            seed=int(Config.RANDOM_SEED),
+        )
     )
-    train_data, train_labels, val_data, val_labels, test_data, test_labels, _ = loaded
-    train_loader, val_loader, test_loader = create_dataloaders(
-        train_data,
-        train_labels,
-        val_data,
-        val_labels,
-        test_data,
-        test_labels,
-        Config.BATCH_SIZE,
-        Config.NUM_WORKERS,
-    )
-    images, labels = next(iter(train_loader))
-    print("\nDataset loaded successfully")
-    print(f"  Train batches: {len(train_loader)}")
-    print(f"  Val batches: {len(val_loader)}")
-    print(f"  Test batches: {len(test_loader)}")
-    print(f"  First batch: images={tuple(images.shape)}, labels={tuple(labels.shape)}")
+
+
+def _to_relative(root, path_value):
+    """Đổi path tuyệt đối về tương đối với dataset root (giữ nguyên nếu đã tương đối)."""
+    path_str = str(path_value)
+    if os.path.isabs(path_str):
+        return os.path.relpath(path_str, root).replace(os.sep, "/")
+    return path_str

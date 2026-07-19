@@ -1,682 +1,438 @@
 """
-Evaluation script with 3 strategies and result export
+Evaluation cho Strategy 2 - Object Detection (Ultralytics YOLO + Pascal VOC).
+
+- Metrics đọc TRỰC TIẾP từ DetMetrics của Ultralytics (results.box.*:
+  map50, map, mp, mr, per-class AP, fitness) — không tự tính lại mAP.
+- Strategy 1: best.pt (checkpoint fitness cao nhất trên val', Ultralytics tự chọn).
+- Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
+  (giống average_weights của nhánh classification, áp dụng cho ckpt YOLO).
+- Export Excel 2 sheet: "Summary" (run info + overall + per-class theo strategy)
+  và "PerEpoch" (parse results.csv do Ultralytics tự sinh trong run dir).
 """
+import json
 import os
-import copy
-import torch
-import numpy as np
+import re
+from datetime import datetime
+from pathlib import Path
+
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
-from sklearn.metrics import (accuracy_score, precision_score, recall_score, 
-                            f1_score, roc_auc_score, confusion_matrix)
+import yaml
 
 from config import Config
-from models import get_model
+
+# File ranking do TopKCheckpointManager (train.py) ghi trong <run_dir>/weights/
+RANKING_FILE = "strategy2_checkpoints.json"
+
+INDEPENDENT_VAL_NOTE = (
+    "Validation set (val') ĐỘC LẬP được tách từ train theo VAL_RATIO — chỉ dùng để "
+    "chọn best.pt / rank Top-K checkpoint. Test = VOC2007 test (4952 ảnh), giữ nguyên "
+    "làm hold-out, chỉ dùng cho báo cáo cuối."
+)
+VAL_TEST_WARNING = (
+    "VAL_RATIO=0: dùng nguyên data.yaml gốc. Với VOC.yaml của Ultralytics, split 'val' "
+    "và 'test' TRÙNG NHAU (đều là VOC2007 test) — không có val độc lập, checkpoint được "
+    "chọn trên chính tập test (nguy cơ leakage khi đọc số liệu)."
+)
 
 
-def autocast_context(device):
-    """Use BF16 autocast for CUDA evaluation."""
-    return torch.autocast(
-        device_type=device.type,
-        dtype=torch.bfloat16,
-        enabled=Config.USE_AMP and device.type == "cuda",
+# ==================== Metrics extraction (từ DetMetrics) ====================
+
+def extract_overall_metrics(metrics):
+    """Trả về dict metrics overall từ DetMetrics (metrics.box.*)."""
+    box = metrics.box
+    overall = {
+        "Precision": float(box.mp),
+        "Recall": float(box.mr),
+        "mAP@0.5": float(box.map50),
+        "mAP@0.75": float(box.map75),
+        "mAP@0.5:0.95": float(box.map),
+    }
+    # fitness = 0.1*mAP50 + 0.9*mAP50-95 (định nghĩa của Ultralytics)
+    fitness = getattr(metrics, "fitness", None)
+    if fitness is not None:
+        overall["Fitness"] = float(fitness)
+    return overall
+
+
+def extract_per_class_metrics(metrics):
+    """
+    List dict per-class (P, R, AP@0.5, AP@0.5:0.95) từ DetMetrics.
+    box.ap_class_index = các class-id thực sự xuất hiện trong tập eval;
+    box.class_result(i) trả (p, r, ap50, ap) cho phần tử thứ i.
+    """
+    box = metrics.box
+    names = getattr(metrics, "names", {}) or {}
+    rows = []
+    for i, class_idx in enumerate(getattr(box, "ap_class_index", [])):
+        class_idx = int(class_idx)
+        p, r, ap50, ap = box.class_result(i)
+        rows.append({
+            "Class ID": class_idx,
+            "Class": str(names.get(class_idx, class_idx)),
+            "Precision": float(p),
+            "Recall": float(r),
+            "AP@0.5": float(ap50),
+            "AP@0.5:0.95": float(ap),
+        })
+    return rows
+
+
+def print_detection_metrics(metrics, header="DETECTION EVALUATION RESULTS"):
+    """In metrics detection ra console (format banner giống repo gốc)."""
+    overall = extract_overall_metrics(metrics)
+    per_class = extract_per_class_metrics(metrics)
+
+    print("\n" + "=" * 70)
+    print(f" {header}")
+    print("=" * 70)
+    for key, value in overall.items():
+        print(f"  {key:<14}: {value:.4f}")
+
+    if per_class:
+        print("-" * 70)
+        print(f"  {'Class':<18} {'Precision':>10} {'Recall':>10} {'AP@0.5':>10} {'AP@0.5:0.95':>12}")
+        for row in per_class:
+            print(
+                f"  {row['Class']:<18} {row['Precision']:>10.4f} {row['Recall']:>10.4f} "
+                f"{row['AP@0.5']:>10.4f} {row['AP@0.5:0.95']:>12.4f}"
+            )
+    print("=" * 70)
+    return overall, per_class
+
+
+# ==================== model.val() wrapper ====================
+
+def build_val_args(data, split=None):
+    """Map Config → kwargs của model.val()."""
+    val_args = {
+        "data": str(data),
+        "imgsz": int(Config.IMGSZ),
+        "workers": int(Config.WORKERS),
+    }
+    # auto-batch (-1) chỉ dành cho train → khi val dùng mặc định nếu BATCH=-1
+    if int(Config.BATCH) > 0:
+        val_args["batch"] = int(Config.BATCH)
+    if Config.DEVICE is not None:
+        val_args["device"] = Config.DEVICE
+    if split:  # None = dùng split mặc định của data.yaml ('val')
+        val_args["split"] = split
+    if Config.CONF is not None:
+        val_args["conf"] = float(Config.CONF)
+    if Config.IOU is not None:
+        val_args["iou"] = float(Config.IOU)
+    return val_args
+
+
+def evaluate_weights(weights, data, split=None, header=None):
+    """Chạy model.val() với weights đã train, in metrics, trả về DetMetrics."""
+    from ultralytics import YOLO
+
+    if not weights:
+        raise ValueError(
+            "Cần weights đã train để eval: truyền --weights path/to/best.pt "
+            "(hoặc set Config.MODEL trỏ tới weights đã train trên VOC)."
+        )
+
+    model = YOLO(str(weights))
+    metrics = model.val(**build_val_args(data, split))
+    print_detection_metrics(
+        metrics, header=header or f"EVALUATION (split={split or 'default'}) — {Path(str(weights)).name}"
     )
+    return metrics
 
 
-def update_bn(model, train_loader, device, num_batches=100):
+# ==================== Strategy 2: ranking + weight averaging ====================
+
+def rank_checkpoints(run_dir):
     """
-    Update BatchNorm running statistics after loading averaged weights
-    
-    IMPORTANT: For frozen backbone models, we should NOT update the backbone BN layers
-    because they already have good statistics from ImageNet pretraining.
-    We only need to update BN layers in the classifier (if any).
-    
-    However, since our custom classifiers don't use BatchNorm, 
-    we can skip this step entirely for most cases.
-    
-    For safety, we only update BN layers that are in trainable (unfrozen) parts.
-    
-    Args:
-        model: Model with averaged weights
-        train_loader: Training data loader
-        device: Device to run on
-        num_batches: Number of batches to use for BN update (default 100)
-    """
-    # First, identify which BN layers are in trainable parts
-    trainable_bn_layers = []
-    
-    for name, module in model.named_modules():
-        if isinstance(module, (torch.nn.BatchNorm2d, torch.nn.BatchNorm1d)):
-            # Check if this BN layer has trainable parameters
-            has_trainable = False
-            for param in module.parameters():
-                if param.requires_grad:
-                    has_trainable = True
-                    break
-            
-            if has_trainable:
-                trainable_bn_layers.append((name, module))
-    
-    # If no trainable BN layers, skip update entirely
-    if not trainable_bn_layers:
-        print(f"      (No trainable BN layers found, skipping BN update)")
-        return
-    
-    print(f"      (Found {len(trainable_bn_layers)} trainable BN layers to update)")
-    
-    # Set model to eval mode first
-    model.eval()
-    
-    # Only set trainable BN layers to train mode and reset their statistics
-    for name, module in trainable_bn_layers:
-        module.train()
-        module.momentum = None  # Use cumulative moving average
-        module.reset_running_stats()
-    
-    # Forward pass to accumulate BN statistics (no gradient computation)
-    with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(train_loader):
-            if batch_idx >= num_batches:
-                break
-            images = images.to(device, non_blocking=True)
-            with autocast_context(device):
-                _ = model(images)
-    
-    # Set everything back to eval mode
-    model.eval()
+    Rank các checkpoint epoch còn trên disk theo fitness trên val' (giảm dần).
 
-
-def average_weights(checkpoint_paths, device):
-    """
-    Average model weights from multiple checkpoints
-    
-    IMPORTANT FOR FROZEN BACKBONE MODELS:
-    - Frozen backbone weights are IDENTICAL across all checkpoints (they don't change during training)
-    - Only the classifier/head weights differ between checkpoints
-    - BatchNorm running statistics (running_mean, running_var) should NOT be averaged
-      because they track population statistics, not learned parameters
-    
-    This function averages ALL learnable weights (including frozen ones, which are identical anyway)
-    and keeps the BatchNorm running statistics from the FIRST checkpoint.
-    
-    Args:
-        checkpoint_paths: List of checkpoint file paths
-        device: Device to load checkpoints on
-    
-    Returns:
-        averaged_state_dict: Averaged state dictionary
-    """
-    
-    if not checkpoint_paths:
-        return None
-    
-    if len(checkpoint_paths) == 1:
-        # Only one checkpoint, no need to average
-        checkpoint = torch.load(checkpoint_paths[0], map_location=device)
-        return checkpoint['model_state_dict']
-    
-    # Load first checkpoint as base
-    first_checkpoint = torch.load(checkpoint_paths[0], map_location=device)
-    averaged_state_dict = copy.deepcopy(first_checkpoint['model_state_dict'])
-    
-    # Identify keys to average vs keys to keep from first checkpoint
-    keys_to_average = []
-    keys_to_keep = []
-    
-    for key in averaged_state_dict.keys():
-        # Skip BatchNorm running statistics - these should NOT be averaged
-        # They are population statistics, not learned parameters
-        if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-            keys_to_keep.append(key)
-        else:
-            keys_to_average.append(key)
-    
-    # Sum weights from remaining checkpoints (only for keys_to_average)
-    for checkpoint_path in checkpoint_paths[1:]:
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        state_dict = checkpoint['model_state_dict']
-        
-        for key in keys_to_average:
-            averaged_state_dict[key] = averaged_state_dict[key] + state_dict[key]
-    
-    # Compute average
-    num_checkpoints = len(checkpoint_paths)
-    for key in keys_to_average:
-        averaged_state_dict[key] = averaged_state_dict[key] / num_checkpoints
-    
-    # keys_to_keep already have values from first checkpoint (no changes needed)
-    
-    return averaged_state_dict
-
-
-def evaluate_model(model, test_loader, device, num_classes, class_names=None):
-    """
-    Evaluate model and compute metrics including test loss, per-class metrics, and confusion matrix
-
-    Args:
-        model: Model to evaluate
-        test_loader: Test data loader
-        device: Device to run on
-        num_classes: Number of classes
-        class_names: List of class names (optional, defaults to Class 0, Class 1, ...)
+    Nguồn chính: strategy2_checkpoints.json (TopKCheckpointManager ghi lúc train).
+    Fallback: tự tính fitness = 0.1*mAP50 + 0.9*mAP50-95 từ results.csv
+    (khi run dir được copy từ máy khác mà thiếu file json).
 
     Returns:
-        result: Dictionary with keys:
-            - 'metrics': Overall macro-averaged metrics
-            - 'per_class': Per-class metrics dict {class_name: {metric: value}}
-            - 'confusion_matrix': Confusion matrix as numpy array
+        list[(Path, fitness, epoch)] sorted theo fitness giảm dần.
     """
+    weights_dir = Path(run_dir) / "weights"
+    ranking_path = weights_dir / RANKING_FILE
+    records = []
 
-    if class_names is None:
-        class_names = [f'Class {i}' for i in range(num_classes)]
-
-    model.eval()
-    all_preds = []
-    all_labels = []
-    all_probs = []
-    running_loss = 0.0
-    total = 0
-
-    # Create criterion for test loss calculation
-    criterion = torch.nn.CrossEntropyLoss()
-
-    with torch.no_grad():
-        for images, labels in tqdm(test_loader, desc='Evaluating', leave=False):
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            with autocast_context(device):
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-
-            probs = torch.softmax(outputs, dim=1)
-            _, preds = torch.max(outputs, 1)
-
-            # Accumulate loss
-            running_loss += loss.item() * images.size(0)
-            total += labels.size(0)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.float().cpu().numpy())
-
-    all_preds = np.array(all_preds)
-    all_labels = np.array(all_labels)
-    all_probs = np.array(all_probs)
-
-    # Compute test loss
-    test_loss = running_loss / total
-
-    # Compute macro-averaged metrics
-    accuracy = accuracy_score(all_labels, all_preds) * 100
-    precision = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-    recall = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-    # AUC (one-vs-rest)
-    try:
-        auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') * 100
-    except:
-        auc = 0.0
-    metrics = {
-        'Test Loss': test_loss,
-        'Accuracy (%)': accuracy,
-        'Precision (%)': precision,
-        'Recall (%)': recall,
-        'F1-Score (%)': f1,
-        'AUC (%)': auc
-    }
-
-    # ========== Per-class metrics ==========
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
-
-    # Per-class precision, recall, f1 from sklearn
-    pc_precision = precision_score(all_labels, all_preds, average=None, labels=list(range(num_classes)), zero_division=0) * 100
-    pc_recall = recall_score(all_labels, all_preds, average=None, labels=list(range(num_classes)), zero_division=0) * 100
-    pc_f1 = f1_score(all_labels, all_preds, average=None, labels=list(range(num_classes)), zero_division=0) * 100
-
-    per_class = {}
-    for i in range(num_classes):
-        cls_name = class_names[i]
-
-        # Derive TP, FP, FN, TN from confusion matrix
-        tp = cm[i, i]
-        fn = cm[i, :].sum() - tp
-        fp = cm[:, i].sum() - tp
-        tn = cm.sum() - tp - fn - fp
-
-        # Specificity = TN / (TN + FP)
-        specificity = (tn / (tn + fp) * 100) if (tn + fp) > 0 else 0.0
-
-        # Support = number of true samples for this class
-        support = int(cm[i, :].sum())
-
-        # Per-class AUC (one-vs-rest)
+    if ranking_path.exists():
+        data = json.loads(ranking_path.read_text())
+        for fname, info in data.items():
+            path = weights_dir / fname
+            if path.exists():
+                records.append((path, float(info["fitness"]), int(info["epoch"])))
+    else:
         try:
-            binary_labels = (all_labels == i).astype(int)
-            class_auc = roc_auc_score(binary_labels, all_probs[:, i]) * 100
-        except:
-            class_auc = 0.0
+            df = read_results_csv(run_dir)
+        except FileNotFoundError:
+            return []
+        fitness_by_epoch = {}
+        if "metrics/mAP50(B)" in df.columns and "metrics/mAP50-95(B)" in df.columns:
+            for _, row in df.iterrows():
+                fitness_by_epoch[int(row["epoch"])] = (
+                    0.1 * float(row["metrics/mAP50(B)"]) + 0.9 * float(row["metrics/mAP50-95(B)"])
+                )
+        for path in weights_dir.glob("epoch*.pt"):
+            digits = re.sub(r"\D", "", path.stem)
+            if not digits:
+                continue
+            file_epoch = int(digits)
+            # Tên file epoch{N}.pt đánh số 0-based, cột epoch results.csv 1-based
+            fitness = fitness_by_epoch.get(file_epoch + 1, fitness_by_epoch.get(file_epoch))
+            if fitness is not None:
+                records.append((path, float(fitness), file_epoch))
 
-        # Accuracy = (TP + TN) / Total
-        total = cm.sum()
-        accuracy = ((tp + tn) / total * 100) if total > 0 else 0.0
-
-        per_class[cls_name] = {
-            'Accuracy (%)': accuracy,
-            'Precision (%)': pc_precision[i],
-            'Recall (%)': pc_recall[i],
-            'F1-Score (%)': pc_f1[i],
-            'Specificity (%)': specificity,
-            'AUC (%)': class_auc,
-            'Support': support
-        }
-
-    result = {
-        'metrics': metrics,
-        'per_class': per_class,
-        'confusion_matrix': cm
-    }
-
-    return result
+    records.sort(key=lambda r: (-r[1], -r[2]))
+    return records
 
 
-def _print_eval_results(metrics, per_class, prefix="    ", header="TEST RESULTS"):
-    """Helper to print macro and per-class evaluation results"""
-    print(f"{prefix}{'='*60}")
-    print(f"{prefix}📊 {header}:")
-    print(f"{prefix}{'='*60}")
-    print(f"{prefix}Test Loss : {metrics['Test Loss']:>6.4f}")
-    print(f"{prefix}Accuracy  : {metrics['Accuracy (%)']:>6.2f}%")
-    print(f"{prefix}Precision : {metrics['Precision (%)']:>6.2f}%")
-    print(f"{prefix}Recall    : {metrics['Recall (%)']:>6.2f}%")
-    print(f"{prefix}F1-Score  : {metrics['F1-Score (%)']:>6.2f}%")
-    print(f"{prefix}AUC       : {metrics['AUC (%)']:>6.2f}%")
-
-    # Per-class breakdown
-    print(f"{prefix}{'-'*60}")
-    print(f"{prefix}Per-Class Breakdown:")
-    print(f"{prefix}{'-'*60}")
-    header_fmt = f"{prefix}  {'Class':<35} {'Acc':>6} {'Prec':>6} {'Rec':>6} {'F1':>6} {'Spec':>6} {'AUC':>6} {'Sup':>5}"
-    print(header_fmt)
-    print(f"{prefix}  {'-'*35} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*6} {'-'*5}")
-    for cls_name, cls_metrics in per_class.items():
-        print(f"{prefix}  {cls_name:<35} "
-              f"{cls_metrics['Accuracy (%)']:>5.1f}% "
-              f"{cls_metrics['Precision (%)']:>5.1f}% "
-              f"{cls_metrics['Recall (%)']:>5.1f}% "
-              f"{cls_metrics['F1-Score (%)']:>5.1f}% "
-              f"{cls_metrics['Specificity (%)']:>5.1f}% "
-              f"{cls_metrics['AUC (%)']:>5.1f}% "
-              f"{cls_metrics['Support']:>5d}")
-    print(f"{prefix}{'='*60}")
-
-
-def strategy_1_best_checkpoint(model_name, checkpoint_manager, test_loader, num_classes, device, class_names=None, save_dir=None):
+def average_checkpoints(ckpt_paths, output_path):
     """
-    Strategy 1: Evaluate best checkpoint based on lowest val_loss
+    Average weights của nhiều checkpoint YOLO (Strategy 2 — tương đương
+    average_weights của nhánh classification, áp dụng cho ckpt Ultralytics).
+
+    Dùng EMA weights (phần Ultralytics thực sự deploy trong mỗi ckpt); tensor
+    float được average, tensor int (vd BN num_batches_tracked) lấy từ ckpt tốt
+    nhất. Ckpt output chỉ chứa model (bỏ optimizer) nên nhẹ, load lại bằng
+    YOLO(path) như ckpt thường.
+    """
+    import torch
+
+    ckpts = [torch.load(str(p), map_location="cpu", weights_only=False) for p in ckpt_paths]
+    # YOLO(path) load (ckpt['ema'] or ckpt['model']) → average đúng phần EMA
+    modules = [(ck.get("ema") or ck["model"]).float() for ck in ckpts]
+    state_dicts = [m.state_dict() for m in modules]
+
+    avg_state = {}
+    for key, ref_tensor in state_dicts[0].items():
+        if ref_tensor.dtype.is_floating_point:
+            avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
+        else:
+            avg_state[key] = ref_tensor.clone()
+
+    merged_module = modules[0]
+    merged_module.load_state_dict(avg_state)
+
+    torch.save(
+        {
+            "model": merged_module.half(),
+            "ema": None,
+            "optimizer": None,
+            "epoch": -1,
+            "train_args": ckpts[0].get("train_args", {}),
+            "date": datetime.now().isoformat(timespec="seconds"),
+        },
+        str(output_path),
+    )
+    return Path(output_path)
+
+
+def run_strategy_evaluation(run_dir, data=None, split=None):
+    """
+    Đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split
+    báo cáo (mặc định Config.EVAL_SPLIT='test' — VOC2007 test), in bảng so
+    sánh và export Excel.
 
     Returns:
-        result: Dictionary with 'metrics', 'per_class', 'confusion_matrix'
+        dict {strategy_name: DetMetrics}
     """
+    run_dir = Path(run_dir)
+    data = data or resolve_data_from_run(run_dir) or Config.DATA
+    split = split or Config.EVAL_SPLIT
 
-    print(f"\n  Strategy 1: Best checkpoint (lowest val_loss)")
-
-    # Get best checkpoint
-    epoch, val_loss, checkpoint_path = checkpoint_manager.get_best_checkpoint()
-    print(f"    Best checkpoint: Epoch {epoch}, Val Loss: {val_loss:.4f}")
-
-    # Load model
-    model = get_model(model_name, num_classes, freeze_backbone=False)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
-
-    # Evaluate
-    result = evaluate_model(model, test_loader, device, num_classes, class_names)
-
-    # Save strategy checkpoint to results folder
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, 'Strategy_1_best.pth')
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'strategy': 'Strategy 1',
-            'epoch': epoch,
-            'val_loss': val_loss
-        }, save_path)
-        print(f"    ✓ Strategy checkpoint saved: {save_path}")
-
-    # Hiển thị chi tiết kết quả
-    _print_eval_results(result['metrics'], result['per_class'], prefix="    ", header="TEST RESULTS - Strategy 1")
-
-    return result
-
-
-def strategy_2_top_k_average(model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names=None, save_dir=None):
-    """
-    Strategy 2: Average top-K checkpoints and evaluate
-    CRITICAL: Update BatchNorm stats after loading averaged weights
-
-    Returns:
-        results: Dictionary with k as key and result dict as value
-    """
-
-    print(f"\n  Strategy 2: Top-K checkpoint averaging")
+    print("\n" + "=" * 70)
+    print(f" STRATEGY EVALUATION (split={split or 'default'}, data={data})")
+    print("=" * 70)
 
     results = {}
 
-    for k in Config.TOP_K_VALUES:
-        print(f"    K={k}:")
+    # ----- Strategy 1: best.pt (fitness cao nhất trên val') -----
+    best_weights = run_dir / "weights" / "best.pt"
+    if best_weights.exists():
+        results["Strategy 1 (best.pt)"] = evaluate_weights(
+            best_weights, data, split, header=f"Strategy 1 — best.pt (split={split})"
+        )
+    else:
+        print(f"  ⚠ Không tìm thấy {best_weights} — bỏ qua Strategy 1")
 
-        # Get top K checkpoints
-        top_k = checkpoint_manager.get_top_k_checkpoints(k)
+    # ----- Strategy 2: average Top-K checkpoint tốt nhất trên val' -----
+    if Config.USE_STRATEGY2:
+        ranked = rank_checkpoints(run_dir)
+        if not ranked:
+            print("  ⚠ Không tìm thấy checkpoint epoch nào để average — bỏ qua Strategy 2")
+            print("    (cần train với USE_STRATEGY2=True để lưu Top-K checkpoint)")
+        else:
+            print(f"\n  Checkpoint khả dụng (rank theo fitness val'): "
+                  f"{[(p.name, round(f, 4)) for p, f, _ in ranked]}")
+            for k in Config.TOP_K_VALUES:
+                k = int(k)
+                if k > len(ranked):
+                    print(f"  ⚠ Top-{k}: chỉ có {len(ranked)} checkpoint — bỏ qua")
+                    continue
+                avg_path = run_dir / "weights" / f"strategy2_top{k}_avg.pt"
+                average_checkpoints([p for p, _, _ in ranked[:k]], avg_path)
+                results[f"Strategy 2 (Top-{k} avg)"] = evaluate_weights(
+                    avg_path, data, split, header=f"Strategy 2 — Top-{k} average (split={split})"
+                )
 
-        if len(top_k) < k:
-            print(f"      Warning: Only {len(top_k)} checkpoints available")
+    if not results:
+        print("  ✗ Không có strategy nào được đánh giá")
+        return results
 
-        checkpoint_paths = [path for _, _, path in top_k]
+    # ----- Bảng so sánh (giống format tổng hợp của repo gốc) -----
+    print("\n" + "=" * 70)
+    print(f" STRATEGY COMPARISON (split={split or 'default'})")
+    print("=" * 70)
+    for name, metrics in results.items():
+        m = extract_overall_metrics(metrics)
+        print(
+            f"  {name:<26} mAP50: {m['mAP@0.5']:.4f} | mAP50-95: {m['mAP@0.5:0.95']:.4f} | "
+            f"P: {m['Precision']:.4f} | R: {m['Recall']:.4f}"
+        )
+    best_name = max(results, key=lambda n: extract_overall_metrics(results[n])["mAP@0.5:0.95"])
+    print(f"\n🏆 Best strategy (mAP@0.5:0.95): {best_name}")
 
-        # Average weights
-        averaged_weights = average_weights(checkpoint_paths, device)
-
-        # Load model with averaged weights
-        model = get_model(model_name, num_classes, freeze_backbone=False)
-        model.load_state_dict(averaged_weights, strict=True)  # Use strict=True since we handle all keys properly
-        model = model.to(device)
-
-        # CRITICAL: Update BatchNorm statistics with training data
-        print(f"      Updating BatchNorm statistics...")
-        update_bn(model, train_loader, device, num_batches=100)
-
-        # Evaluate
-        result = evaluate_model(model, test_loader, device, num_classes, class_names)
-        results[k] = result
-
-        # Save strategy checkpoint to results folder
-        if save_dir:
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f'Strategy_2_K{k}.pth')
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'strategy': f'Strategy 2 (K={k})',
-                'k': k,
-                'checkpoint_epochs': [ep for ep, _, _ in top_k]
-            }, save_path)
-            print(f"      ✓ Strategy checkpoint saved: {save_path}")
-
-        # Hiển thị chi tiết kết quả
-        _print_eval_results(result['metrics'], result['per_class'], prefix="      ", header=f"TEST RESULTS - Strategy 2 (K={k})")
-
+    export_to_excel(run_dir, strategy_results=results, data=data, split=split)
     return results
 
 
-def strategy_3_last_n_average(model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names=None, save_dir=None):
-    """
-    Strategy 3: Average last N epoch checkpoints
-    CRITICAL: This is the most important strategy - must update BatchNorm stats!
-
-    Returns:
-        result: Dictionary with 'metrics', 'per_class', 'confusion_matrix'
-    """
-
-    print(f"\n  Strategy 3: Last {Config.LAST_N_EPOCHS} epochs averaging")
-
-    # Get last N checkpoints
-    last_n = checkpoint_manager.get_last_n_checkpoints(Config.LAST_N_EPOCHS)
-
-    if len(last_n) < Config.LAST_N_EPOCHS:
-        print(f"    Warning: Only {len(last_n)} checkpoints available")
-
-    checkpoint_paths = [path for _, _, path in last_n]
-    epochs = [epoch for epoch, _, _ in last_n]
-    print(f"    Averaging epochs: {epochs}")
-
-    # Average weights
-    averaged_weights = average_weights(checkpoint_paths, device)
-
-    # Load model with averaged weights
-    model = get_model(model_name, num_classes, freeze_backbone=False)
-    model.load_state_dict(averaged_weights, strict=True)  # Use strict=True since we handle all keys properly
-    model = model.to(device)
-    # CRITICAL: Update BatchNorm statistics with training data
-    # This is ESSENTIAL because frozen backbone may have different BN stats across epochs
-    print(f"    Updating BatchNorm statistics (this ensures model correctness)...")
-    update_bn(model, train_loader, device, num_batches=100)
-
-    # Evaluate
-    result = evaluate_model(model, test_loader, device, num_classes, class_names)
-
-    # Save strategy checkpoint to results folder
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'Strategy_3_last_{Config.LAST_N_EPOCHS}.pth')
-        torch.save({
-            'model_state_dict': model.state_dict(),
-            'strategy': 'Strategy 3',
-            'epochs_averaged': epochs
-        }, save_path)
-        print(f"    ✓ Strategy checkpoint saved: {save_path}")
-
-    # Hiển thị chi tiết kết quả
-    _print_eval_results(result['metrics'], result['per_class'], prefix="    ", header="TEST RESULTS - Strategy 3")
-
-    return result
+def resolve_data_from_run(run_dir):
+    """Lấy path data yaml từ args.yaml mà Ultralytics lưu trong run dir."""
+    args_path = Path(run_dir) / "args.yaml"
+    if args_path.exists():
+        return (yaml.safe_load(args_path.read_text()) or {}).get("data")
+    return None
 
 
-def evaluate_all_strategies(model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names=None, save_dir=None):
-    """
-    Evaluate all 3 strategies for a model
-
-    Args:
-        model_name: Model name
-        checkpoint_manager: Checkpoint manager
-        test_loader: Test data loader
-        train_loader: Training data loader (needed for BatchNorm update in averaging strategies)
-        num_classes: Number of classes
-        device: Device
-        class_names: List of class names
-        save_dir: Directory to save strategy checkpoints (None = don't save)
-
-    Returns:
-        all_results: Dictionary with strategy name as key and result dict as value.
-                     Each result dict has keys: 'metrics', 'per_class', 'confusion_matrix'
-    """
-
-    print(f"\n{'='*70}")
-    print(f"Evaluating {model_name}")
-    print(f"{'='*70}")
-
-    all_results = {}
-
-    # Strategy 1: Best single checkpoint (no averaging, no BN update needed)
-    all_results['Strategy 1'] = strategy_1_best_checkpoint(
-        model_name, checkpoint_manager, test_loader, num_classes, device, class_names, save_dir=save_dir
-    )
-
-    # Strategy 2: Top-K averaging (with BN update)
-    strategy_2_results = strategy_2_top_k_average(
-        model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
-    )
-    for k, result in strategy_2_results.items():
-        all_results[f'Strategy 2 (K={k})'] = result
-
-    # Strategy 3: Last N epochs averaging (with BN update - MOST CRITICAL)
-    all_results['Strategy 3'] = strategy_3_last_n_average(
-        model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
-    )
-
-    return all_results
+def infer_run_dir(weights):
+    """Suy run dir từ vị trí weights chuẩn Ultralytics: <run_dir>/weights/x.pt."""
+    weights_path = Path(str(weights))
+    if weights_path.parent.name == "weights":
+        return weights_path.parent.parent
+    return None
 
 
-def export_results_to_excel(all_model_results, output_path, class_names=None):
-    """
-    Export all results to Excel file with separate sheets for macro and per-class metrics
+# ==================== Excel export (Summary + PerEpoch) ====================
 
-    Args:
-        all_model_results: Dictionary with model_name as key and strategy results as value.
-                           Each strategy result has keys: 'metrics', 'per_class', 'confusion_matrix'
-        output_path: Path to save Excel file
-        class_names: List of class names (for column ordering)
-
-    Returns:
-        df: Macro-averaged results dataframe
-    """
-
-    macro_rows = []
-    per_class_rows = []
-
-    for model_name, strategy_results in all_model_results.items():
-        for strategy_name, result in strategy_results.items():
-            # Macro metrics row
-            macro_row = {
-                'Model': model_name,
-                'Strategy': strategy_name,
-                **result['metrics']
-            }
-            macro_rows.append(macro_row)
-
-            # Per-class metrics rows
-            for cls_name, cls_metrics in result['per_class'].items():
-                pc_row = {
-                    'Model': model_name,
-                    'Strategy': strategy_name,
-                    'Class': cls_name,
-                    **cls_metrics
-                }
-                per_class_rows.append(pc_row)
-
-    # Macro dataframe
-    df = pd.DataFrame(macro_rows)
-    column_order = ['Model', 'Strategy', 'Test Loss', 'Accuracy (%)', 'Precision (%)',
-                   'Recall (%)', 'F1-Score (%)', 'AUC (%)']
-    df = df[column_order]
-
-    # Per-class dataframe
-    df_pc = pd.DataFrame(per_class_rows)
-    pc_column_order = ['Model', 'Strategy', 'Class', 'Accuracy (%)', 'Precision (%)', 'Recall (%)',
-                       'F1-Score (%)', 'Specificity (%)', 'AUC (%)', 'Support']
-    df_pc = df_pc[pc_column_order]
-
-    # Save to Excel with multiple sheets
-    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-        df.to_excel(writer, sheet_name='Overall Metrics', index=False)
-        df_pc.to_excel(writer, sheet_name='Per-Class Metrics', index=False)
-
-    print(f"\n✓ Results exported to: {output_path}")
-    print(f"  - Sheet 'Overall Metrics': Macro-averaged metrics")
-    print(f"  - Sheet 'Per-Class Metrics': Per-class breakdown")
-
+def read_results_csv(run_dir):
+    """Đọc results.csv Ultralytics sinh trong run_dir → DataFrame per-epoch."""
+    csv_path = os.path.join(str(run_dir), "results.csv")
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"results.csv not found in run dir: {run_dir}")
+    df = pd.read_csv(csv_path)
+    # Bản Ultralytics cũ pad khoảng trắng trong header → chuẩn hóa tên cột
+    df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def save_confusion_matrices(all_model_results, output_dir, class_names=None):
+def _data_note(data):
+    """Chọn note đúng theo cách chuẩn bị data (holdout hay data.yaml gốc)."""
+    if "holdout" in os.path.basename(str(data)):
+        return INDEPENDENT_VAL_NOTE
+    return VAL_TEST_WARNING
+
+
+def export_to_excel(run_dir, strategy_results=None, data=None, split=None, output_path=None):
     """
-    Save confusion matrix heatmaps for all models and strategies
+    Xuất Excel 2 sheet cho một run detection:
 
-    Args:
-        all_model_results: Dictionary with model_name as key and strategy results as value
-        output_dir: Directory to save confusion matrix images
-        class_names: List of class names for axis labels
+    - "Summary" : run info + bảng overall metrics theo strategy + per-class AP
+                  theo strategy (cột Strategy — giống Per-Class sheet repo gốc).
+                  Nếu strategy_results=None (export offline) → overall lấy từ
+                  row cuối results.csv, không có per-class AP.
+    - "PerEpoch": toàn bộ results.csv (box/cls/dfl loss train+val, P, R,
+                  mAP50, mAP50-95, lr... — mỗi epoch 1 row).
     """
-    cm_dir = os.path.join(output_dir, 'confusion_matrices')
-    os.makedirs(cm_dir, exist_ok=True)
+    run_dir = str(run_dir)
+    data = data or Config.DATA
 
-    for model_name, strategy_results in all_model_results.items():
-        for strategy_name, result in strategy_results.items():
-            cm = result['confusion_matrix']
+    per_epoch_df = None
+    try:
+        per_epoch_df = read_results_csv(run_dir)
+    except FileNotFoundError:
+        print(f"  ⚠ Không tìm thấy results.csv trong {run_dir} — bỏ qua sheet PerEpoch")
 
-            fig, ax = plt.subplots(figsize=(max(8, len(cm) * 1.2), max(6, len(cm) * 1.0)))
+    # ----- Bảng overall + per-class theo strategy -----
+    overall_rows, per_class_rows = [], []
+    if strategy_results:
+        for name, metrics in strategy_results.items():
+            overall_rows.append({"Strategy": name, **extract_overall_metrics(metrics)})
+            for row in extract_per_class_metrics(metrics):
+                per_class_rows.append({"Strategy": name, **row})
+        summary_source = "model.val() — Ultralytics DetMetrics"
+    elif per_epoch_df is not None:
+        last = per_epoch_df.iloc[-1]
+        column_map = {
+            "Precision": "metrics/precision(B)",
+            "Recall": "metrics/recall(B)",
+            "mAP@0.5": "metrics/mAP50(B)",
+            "mAP@0.5:0.95": "metrics/mAP50-95(B)",
+        }
+        row = {"Strategy": "Last epoch (results.csv)"}
+        for metric_name, column in column_map.items():
+            if column in per_epoch_df.columns:
+                row[metric_name] = float(last[column])
+        overall_rows.append(row)
+        summary_source = "results.csv (epoch cuối) — chạy `strategies`/`eval` để có per-class AP"
+    else:
+        raise ValueError("Không có strategy results lẫn results.csv — không thể export Excel")
 
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                       xticklabels=class_names if class_names else range(len(cm)),
-                       yticklabels=class_names if class_names else range(len(cm)),
-                       ax=ax)
+    # ----- Block Run Info (pattern Parameter/Value như repo gốc) -----
+    try:
+        import ultralytics
+        ultralytics_version = ultralytics.__version__
+    except ImportError:
+        ultralytics_version = "N/A"
 
-            ax.set_xlabel('Predicted Label', fontsize=12)
-            ax.set_ylabel('True Label', fontsize=12)
+    run_info_rows = [
+        ("model", Config.MODEL or "N/A"),
+        ("data", str(data)),
+        ("val_ratio (tách từ train)", Config.VAL_RATIO),
+        ("epochs", Config.EPOCHS),
+        ("imgsz", Config.IMGSZ),
+        ("batch", Config.BATCH),
+        ("device", Config.DEVICE if Config.DEVICE is not None else "auto"),
+        ("seed", Config.RANDOM_SEED),
+        ("eval_split", split or Config.EVAL_SPLIT or "mặc định theo data.yaml"),
+        ("strategy2", f"Top-K {Config.TOP_K_VALUES}" if Config.USE_STRATEGY2 else "OFF"),
+        ("run_dir", run_dir),
+        ("summary_source", summary_source),
+        ("export_date", datetime.now().isoformat(timespec="seconds")),
+        ("ultralytics_version", ultralytics_version),
+        ("NOTE data split", _data_note(data)),
+    ]
 
-            # Clean strategy name for filename
-            safe_strategy = strategy_name.replace(' ', '_').replace('(', '').replace(')', '').replace('=', '')
-            ax.set_title(f'{model_name} - {strategy_name}\nConfusion Matrix', fontsize=13, fontweight='bold')
+    if output_path is None:
+        output_path = Config.EXCEL_OUTPUT or os.path.join(run_dir, "detection_results.xlsx")
+    output_parent = os.path.dirname(output_path)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
 
-            plt.tight_layout()
+    info_df = pd.DataFrame(run_info_rows, columns=["Parameter", "Value"])
+    overall_df = pd.DataFrame(overall_rows)
+    per_class_df = pd.DataFrame(per_class_rows)
 
-            filename = f'{model_name}_{safe_strategy}_cm.png'
-            filepath = os.path.join(cm_dir, filename)
-            plt.savefig(filepath, dpi=200, bbox_inches='tight')
-            plt.close()
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        # Sheet 1 "Summary": Run Info → Overall per strategy → Per-class per strategy
+        info_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
+        next_row = len(info_df) + 2
+        overall_df.to_excel(writer, sheet_name="Summary", index=False, startrow=next_row)
+        next_row += len(overall_df) + 2
+        if not per_class_df.empty:
+            per_class_df.to_excel(writer, sheet_name="Summary", index=False, startrow=next_row)
 
-    print(f"✓ Confusion matrices saved to: {cm_dir}")
+        # Sheet 2 "PerEpoch"
+        if per_epoch_df is not None:
+            per_epoch_df.to_excel(writer, sheet_name="PerEpoch", index=False)
 
-
-def create_performance_charts(df, output_dir):
-    """
-    Create single comprehensive performance comparison chart
-    
-    Args:
-        df: Results dataframe
-        output_dir: Directory to save chart
-    """
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create comprehensive comparison chart
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle('Model Performance Comparison Across All Strategies', 
-                 fontsize=16, fontweight='bold')
-    
-    metrics = ['Accuracy (%)', 'Precision (%)', 'Recall (%)', 'F1-Score (%)', 'AUC (%)']
-    
-    # Plot each metric
-    for idx, metric in enumerate(metrics):
-        ax = axes[idx // 3, idx % 3]
-        
-        # Prepare data for grouped bar chart
-        models = df['Model'].unique()
-        strategies = df['Strategy'].unique()
-        
-        x = np.arange(len(models))
-        width = 0.15
-        
-        for i, strategy in enumerate(strategies):
-            strategy_data = df[df['Strategy'] == strategy]
-            values = [strategy_data[strategy_data['Model'] == model][metric].values[0] 
-                     for model in models]
-            ax.bar(x + i * width, values, width, label=strategy)
-        
-        ax.set_xlabel('Model', fontsize=10)
-        ax.set_ylabel(metric, fontsize=10)
-        ax.set_title(metric, fontsize=12, fontweight='bold')
-        ax.set_xticks(x + width * (len(strategies) - 1) / 2)
-        ax.set_xticklabels(models, rotation=45, ha='right', fontsize=9)
-        ax.legend(fontsize=8)
-        ax.grid(axis='y', alpha=0.3)
-    
-    # Summary table in the last subplot
-    ax = axes[1, 2]
-    ax.axis('off')
-    
-    # Find best performing model for each strategy
-    summary_text = "Best Models per Strategy:\n\n"
-    for strategy in df['Strategy'].unique():
-        strategy_df = df[df['Strategy'] == strategy]
-        best_idx = strategy_df['F1-Score (%)'].idxmax()
-        best_model = strategy_df.loc[best_idx, 'Model']
-        best_f1 = strategy_df.loc[best_idx, 'F1-Score (%)']
-        summary_text += f"{strategy}:\n  {best_model} (F1: {best_f1:.2f}%)\n\n"
-    
-    ax.text(0.1, 0.5, summary_text, fontsize=11, verticalalignment='center',
-            family='monospace', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.tight_layout()
-    chart_path = os.path.join(output_dir, 'performance_comparison.png')
-    plt.savefig(chart_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    print(f"✓ Chart saved to: {chart_path}")
-
-
-if __name__ == "__main__":
-    print("Evaluation script ready. Run main.py to execute full pipeline.")
+    print(f"\n  ✓ Excel exported: {output_path}")
+    print(f"    - Sheet 'Summary' : {len(overall_rows)} strategy row(s) + "
+          f"{len(per_class_rows)} per-class row(s) + run info")
+    if per_epoch_df is not None:
+        print(f"    - Sheet 'PerEpoch': {len(per_epoch_df)} epochs (từ results.csv)")
+    else:
+        print("    - Sheet 'PerEpoch': bỏ qua (không có results.csv)")
+    return output_path

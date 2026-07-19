@@ -1,23 +1,60 @@
-# Baseline Research - Pretrained Models Evaluation
+# Strategy 2 — Object Detection (Ultralytics YOLO + Pascal VOC)
 
-Pipeline tự động train & evaluate pretrained models cho bài toán image classification.
+Nhánh này **chỉ làm object detection với các model YOLO**, dùng **toàn bộ
+Ultralytics API** (train / val / export — không tự viết training loop).
+Kế thừa convention của repo: config-driven (`config.py`), CLI override,
+export metrics ra Excel bằng `pandas` + `openpyxl`.
 
-> 🔍 **Nhánh này còn chứa pipeline Object Detection** (Strategy 2 mở rộng — Ultralytics YOLO + Pascal VOC): xem [README_DETECTION.md](README_DETECTION.md).
-> Lưu ý quan trọng khi đọc metrics detection: trong `VOC.yaml` của Ultralytics, split **`val` ≡ `test`** (đều là VOC2007 test) — không có validation set độc lập.
+Code classification (Tiny ImageNet) nằm ở nhánh `Strategy2_TinyImageNet`.
 
-## Cấu trúc Project
+## Data split: val' độc lập tách từ train (điều kiện của Strategy 2)
+
+`VOC.yaml` gốc của Ultralytics ([docs](https://docs.ultralytics.com/datasets/detect/voc))
+có vấn đề: **split `val` và `test` trùng nhau** (cùng trỏ `images/test2007`) —
+không có validation set độc lập, nên không thể chọn/average checkpoint theo val
+mà không leakage. Pipeline này tự xử lý (xem `dataset.py`):
+
+| Split | Nội dung | Số ảnh |
+|---|---|---|
+| `train'` | trainval VOC2007+2012 **trừ** phần tách ra làm val' | ~14,896 (VAL_RATIO=0.1) |
+| `val'` | **tách ngẫu nhiên từ train** theo `VAL_RATIO` (seed cố định) | ~1,655 |
+| `test` | VOC2007 test — giữ nguyên làm hold-out | 4,952 |
+
+- **val'** chỉ dùng để: chọn `best.pt`, early stopping, rank Top-K checkpoint.
+- **test** chỉ dùng cho **báo cáo cuối** (`EVAL_SPLIT = "test"` mặc định).
+- Split idempotent theo `(seed, ratio)` — chạy lại không tách lại, reproduce được.
+- File sinh ra nằm ở dataset root: `holdout_seed{S}_val{R}.yaml` + 2 file `.txt`
+  danh sách ảnh (Ultralytics hỗ trợ split dạng txt list).
+- Đặt `VAL_RATIO = 0` sẽ dùng nguyên data.yaml gốc → **val ≡ test, Strategy 2
+  bị leakage** — pipeline sẽ in cảnh báo; chỉ dùng khi data custom của bạn đã
+  có val độc lập sẵn.
+
+## 2 Strategy
+
+| Strategy | Mô tả |
+|---|---|
+| **Strategy 1** | `best.pt` — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn) |
+| **Strategy 2** | **Average weights của Top-K checkpoint** tốt nhất trên val' (K = 2, 3, 4, 5) — giống Top-K Average của nhánh classification |
+
+Cơ chế checkpoint cho Strategy 2 (xem `train.py`):
+- Train với `save_period=1` → Ultralytics lưu checkpoint mỗi epoch;
+- `TopKCheckpointManager` (callback `on_model_save`) **prune ngay** checkpoint
+  ngoài Top-K theo fitness val' → **disk chỉ giữ đúng K checkpoint cần thiết**
+  (+ `best.pt`/`last.pt`), không lưu tất cả epoch;
+- Ranking ghi vào `weights/strategy2_checkpoints.json`;
+- Sau train: average EMA weights của Top-K (`strategy2_top{K}_avg.pt`) rồi
+  `model.val()` trên test — so sánh trực tiếp với Strategy 1.
+- Fitness = `0.1*mAP50 + 0.9*mAP50-95` (định nghĩa của Ultralytics, không tự chế).
+
+## Cấu trúc
 
 ```
-├── config.py          # Toàn bộ cấu hình (dataset, training, loss, sampler, CV, ...)
-├── main.py            # Main pipeline - chạy file này
-├── train.py           # Training loop, early stopping, checkpoint management
-├── evaluate.py        # 3 chiến thuật đánh giá + export Excel
-├── models.py          # Pretrained models với custom classifier head
-├── dataset.py         # Data loading, augmentation, WeightedRandomSampler
-├── losses.py          # PolyFocalLoss + class weight computation
-├── visualization.py   # Training curves, dataset statistics
-├── requirements.txt   # Dependencies
-└── results/           # Kết quả tự động lưu theo từng lần chạy (results/1/, results/2/, ...)
+├── config.py       # TOÀN BỘ config (model, data, val ratio, strategy 2, export...)
+├── main.py         # Entrypoint: train / strategies / eval / export / export-model
+├── dataset.py      # Tách val' độc lập từ train, sinh holdout data.yaml
+├── train.py        # model.train() + TopKCheckpointManager + Edge AI hook
+├── evaluate.py     # model.val(), Strategy 1/2, metrics console, Excel 2 sheet
+└── requirements.txt
 ```
 
 ## Cài đặt
@@ -26,265 +63,140 @@ Pipeline tự động train & evaluate pretrained models cho bài toán image cl
 pip install -r requirements.txt
 ```
 
-## Cách chạy
+## 1. Set model (bắt buộc — KHÔNG hardcode trong code)
 
-```bash
-python main.py
-```
-
-CLI overrides are available, so you do not need to edit `config.py` for every server run:
-
-```bash
-python main.py --model resnet18 --run-name resnet18
-python main.py --model resnet18 --seed 100 --run-name resnet18_seed100
-python main.py --model vit_base --batch-size 64 --epochs 50 --lr 2e-5 --fc-layers 256 128 --dropout 0.5
-python main.py --model resnet18,densenet121 --results-dir /scratch/$USER/potato_results
-```
-
-`argparse` is part of the Python standard library, so no extra package is needed in `requirements.txt`.
-
-For concurrent terminals, every run creates an isolated folder under `results/` (or `--results-dir`). Training checkpoints are also isolated per run, so two terminals running the same model will not overwrite each other.
-
-By default, `python main.py --model <name>` runs the configured seeds `1, 10, 100, 500` sequentially. Use `--seed <value>` to run only one seed in a terminal.
-
-Pipeline tự động: Validate config → Load dataset → Train từng model → Evaluate 3 strategies → Export Excel + Charts.
-
-Kết quả mỗi lần chạy lưu riêng tại `results/<run_number>/` gồm:
-- `run_config.xlsx` — toàn bộ config của lần chạy
-- `all_models_results.xlsx` — bảng so sánh tất cả model
-- `<model_name>/` — kết quả chi tiết, confusion matrix, training curves
-
-## Cấu hình (`config.py`)
-
-Mở `config.py`, chỉnh các biến cần thiết:
-
-| Nhóm | Biến quan trọng | Mô tả |
-|------|-----------------|-------|
-| **Dataset** | `DATASET_NAME` | Hugging Face dataset ID, mặc định `zh-plus/tiny-imagenet` |
-| | `VALIDATION_RATIO` | Tỉ lệ validation lấy stratified từ official train (mặc định 0.1) |
-| **Model** | `MODELS` | List model cần train (comment/uncomment để chọn) |
-| | `CLASSIFIER_CONFIG` | Hidden layers của classifier head, VD: `[512]` |
-| | `DROPOUT_RATE` | Dropout rate cho classifier |
-| **Training** | `BATCH_SIZE`, `NUM_EPOCHS`, `LEARNING_RATE` | Hyperparameters cơ bản |
-| | `WEIGHT_DECAY` | L2 regularization |
-| | `EARLY_STOPPING_PATIENCE` | Dừng sớm nếu val_loss không giảm sau N epochs |
-| **Loss** | `LOSS_FUNCTION` | `'cross_entropy'` hoặc `'poly_focal'` |
-| | `label_smoothing` | Label smoothing (chỉ cho CrossEntropy) |
-| | `FOCAL_GAMMA`, `POLY_EPSILON` | Params cho PolyFocalLoss |
-| **Sampler** | `USE_WEIGHTED_SAMPLER` | `True/False` — bật WeightedRandomSampler xử lý class imbalance |
-| **Cross-Val** | `USE_CROSS_VALIDATION` | `True/False` — bật Stratified K-Fold CV |
-| | `CV_N_SPLITS` | Số fold (mặc định 5) |
-| **Output** | `AUTO_DELETE_CHECKPOINTS` | Tự xóa checkpoints sau evaluate để tiết kiệm disk |
-
-## Models hỗ trợ
-
-Uncomment trong `Config.MODELS`:
+Mở `config.py`, sửa đúng 1 dòng:
 
 ```python
-MODELS = [
-    'vgg16',
-    'resnet18',
-    'resnet101',
-    'mobilenet_v2',
-    'densenet121',
-    'efficientnet_b0',
-    'vit_base_patch16_224',
-]
+MODEL = "yolov8n.pt"   # hoặc "yolo11n.pt", "yolov5nu.pt", "path/to/custom.pt", "yolov8n.yaml"
 ```
 
-## 3 Chiến thuật Đánh giá
+Hoặc override lúc chạy: `python main.py train --model yolo11n.pt`.
+`MODEL` nhận mọi giá trị mà `ultralytics.YOLO()` nhận — đổi version YOLO =
+sửa 1 dòng, không đụng code.
 
-| Strategy | Mô tả |
-|----------|-------|
-| **Best Checkpoint** | Checkpoint có val_loss thấp nhất |
-| **Top-K Average** | Trung bình weights của K checkpoint tốt nhất (K = 2,3,4,5) |
-| **Last-N Average** | Trung bình weights của N epoch cuối cùng |
-
-## Cross-Validation
-
-Khi `USE_CROSS_VALIDATION = True`:
-- Data `train + val` gộp thành CV pool
-- `test` giữ nguyên làm hold-out
-- Dùng `StratifiedKFold` (sklearn) chia K fold, giữ tỉ lệ class
-- Kết quả cuối: **mean ± std** qua K fold → lưu vào `cv_summary_results.xlsx`
-
-## Metrics
-
-Tất cả metrics dùng **Macro averaging** (trung bình đều giữa các class):
-
-| Metric | Cách tính |
-|--------|-----------|
-| Accuracy | Overall correct / total |
-| Precision | Macro average |
-| Recall | Macro average |
-| F1-Score | Macro average |
-| AUC | Macro average, one-vs-rest |
-
-Kết quả bao gồm cả **per-class breakdown** (Precision, Recall, F1, Specificity, AUC, Support).
-
-## Reproduce kết quả
-
-1. Set `RANDOM_SEED = 42` (mặc định) — đảm bảo cùng data split, cùng weight init
-2. Kiểm tra `DATASET_NAME` (dataset sẽ tự tải/cache qua Hugging Face)
-3. Chọn model trong `MODELS`
-4. Chạy `python main.py`
-
-Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`. Thêm `--deterministic` nếu cần bật deterministic CUDA/cuBLAS.
-
-## Ghi chú
-
-- **WRS + Focal Loss đồng thời**: Không lỗi code, nhưng có thể double-correct class imbalance. Cân nhắc chỉ bật 1 trong 2.
-- **LR Scheduler**: Linear Warmup → Cosine Annealing
-- **Data Augmentation** (chỉ train): resize bicubic 224, horizontal flip,
-  Mixup/CutMix kiểu DeiT và Random Erasing
-
-## 💾 Checkpoints
-
-Training checkpoints are temporary by default. They are written during training/evaluation, then deleted after evaluation because `AUTO_DELETE_CHECKPOINTS=True`. Strategy checkpoints are not saved because `SAVE_STRATEGY_CHECKPOINTS=False`.
-
-```
-results/<run_number>/
-├── training_checkpoints/
-│   └── <model_name>/
-│       ├── epoch_001_val_loss_0.xxxx.pth
-│       ├── best_checkpoint.pth
-│       └── checkpoint_info.json
-└── <model_name>/
-    ├── checkpoints/
-    ├── training_curves/
-    └── <model_name>_results.xlsx
-```
-
-If you pass `--checkpoints-dir /scratch/...`, the code still creates a per-run subfolder inside that directory. Use `--keep-checkpoints` only when you explicitly need checkpoint files for later debugging.
-
-## 🔧 Tùy chỉnh
-
-### Thay đổi learning rate decay:
-
-Trong `config.py`:
-
-```python
-LR_DECAY_PATIENCE = 5  # Giảm LR sau 5 epochs val_loss không cải thiện
-LR_DECAY_FACTOR = 0.5  # Nhân LR với 0.5
-```
-
-### Thay đổi custom classifier:
-
-Trong `config.py`:
-
-```python
-CLASSIFIER_CONFIG = [256, 128, 64]  # 3 hidden layers
-DROPOUT_RATE = 0.5
-```
-
-### Thay đổi data augmentation:
-
-Trong `dataset.py`, function `get_transforms()`:
-
-```python
-transform = transforms.Compose([
-    transforms.Resize(
-        (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
-        interpolation=InterpolationMode.BICUBIC,
-    ),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ToTensor(),
-    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
-    transforms.RandomErasing(p=0.25),
-])
-```
-
-### Thêm/bớt models:
-
-Trong `config.py`:
-
-```python
-MODELS = [
-    'vgg16',
-    'resnet101',
-    # Thêm/bớt models ở đây
-]
-```
-
-## High-Compute Server Notes
-
-Run one model per terminal or one model per scheduler job:
+## 2. Train
 
 ```bash
-python main.py --model resnet18 --run-name resnet18
-python main.py --model densenet121 --run-name densenet121
-python main.py --model vit_base_patch16_224 --run-name vit_b16
+python main.py train --model yolov8n.pt --device 0 --name yolov8n_voc
+# hoặc chỉnh hết trong config.py rồi:
+python main.py train
 ```
 
-On SLURM-style systems, prefer the scheduler GPU assignment:
+Pipeline tự động: tách val' từ train (nếu chưa có) → train (val mỗi epoch trên
+val', giữ Top-K checkpoint) → in metrics val cuối → **đánh giá Strategy 1 vs
+Strategy 2 (Top-2/3/4/5) trên test** → export Excel.
+
+Output tại `results/detection/<name>/`:
+
+```
+├── weights/
+│   ├── best.pt                     # Strategy 1
+│   ├── last.pt
+│   ├── epoch{N}.pt × K             # Top-K checkpoint (đã prune, chỉ giữ K file)
+│   ├── strategy2_checkpoints.json  # ranking fitness
+│   └── strategy2_top{K}_avg.pt     # weights đã average (Strategy 2)
+├── results.csv                     # per-epoch (nguồn sheet PerEpoch)
+├── detection_results.xlsx          # Excel 2 sheet
+└── args.yaml, plots...             # Ultralytics tự sinh
+```
+
+## 3. Metrics & Excel
+
+Console in cho **từng strategy**: Precision, Recall, mAP@0.5, mAP@0.75,
+mAP@0.5:0.95, Fitness + **AP per class** (đọc từ `results.box.*` của
+Ultralytics — không tự tính lại mAP), kèm bảng so sánh strategy và best
+strategy theo mAP@0.5:0.95.
+
+File `detection_results.xlsx` gồm 2 sheet:
+
+| Sheet | Nội dung |
+|---|---|
+| `Summary` | Run info (model, data, val_ratio, imgsz, epochs, batch, seed, ngày chạy, note data split) + **bảng overall metrics theo strategy** + **AP per class theo strategy** |
+| `PerEpoch` | Mỗi epoch 1 row từ `results.csv`: `train/box_loss`, `train/cls_loss`, `train/dfl_loss`, `val/box_loss`, `val/cls_loss`, `val/dfl_loss`, `metrics/precision(B)`, `metrics/recall(B)`, `metrics/mAP50(B)`, `metrics/mAP50-95(B)`, lr... |
+
+## 4. Các lệnh khác
 
 ```bash
-srun --gres=gpu:1 --cpus-per-task=8 python main.py --model resnet18 --num-workers 8 --results-dir $SCRATCH/potato_results
+# Đánh giá lại Strategy 1 + 2 trên run đã train (không cần train lại)
+python main.py strategies --run-dir results/detection/yolov8n_voc
+
+# Eval 1 file weights bất kỳ trên split tùy chọn
+python main.py eval --weights results/detection/yolov8n_voc/weights/best.pt --split test
+
+# Export Excel offline từ results.csv (không cần GPU/dataset)
+python main.py export --run-dir results/detection/yolov8n_voc --output bao_cao.xlsx
+
+# Edge AI: xuất ONNX / TensorRT
+python main.py export-model --weights .../weights/best.pt --format onnx
+python main.py export-model --weights .../weights/strategy2_top5_avg.pt --format engine --half
 ```
 
-Use `--deterministic` only when exact reproducibility is more important than speed. That flag sets `CUBLAS_WORKSPACE_CONFIG`; without it, the code uses faster cuDNN benchmarking. There is no separate `culabs` package to install.
+## 5. (Optional) Edge AI export sau train
 
-## H100 profile
+Tắt mặc định. Bật trong `config.py` (`EXPORT_ENABLED = True`, chọn
+`EXPORT_FORMAT`/`EXPORT_HALF`...) hoặc thêm cờ `--export-after-train` khi train.
+Dùng `model.export()` của Ultralytics; TensorRT (`engine`) cần GPU + TensorRT.
 
-The default profile targets one H100:
-
-- batch 512 for training, validation, and testing;
-- BF16 autocast, fused AdamW, and `torch.compile(mode="max-autotune")`;
-- 16 DataLoader workers with pinned memory and persistent workers;
-- learning rate 5e-5 at batch 512, automatically scaled with batch size;
-- linear warmup for 5 epochs followed by cosine decay to 1e-6.
-
-Run the default batch-512 profile:
+## Chạy trên Vast.ai (gợi ý workflow)
 
 ```bash
-python main.py --model vit_base_patch16_224 --seed 1
+git clone https://github.com/Dung-04/Capstone_KD && cd Capstone_KD
+git checkout claude/strategy2-object-detection-yolo-ttjplw
+pip install -r requirements.txt
+
+# (tuỳ chọn) trỏ chỗ chứa dataset về volume lớn của instance
+yolo settings datasets_dir=/workspace/datasets
+
+# train — VOC tự download lần đầu (~2.8 GB), val' tự tách từ train
+python main.py train --model yolov8n.pt --device 0 --name yolov8n_voc
+
+# chạy nền + giữ log khi rớt SSH
+nohup python main.py train --model yolov8n.pt --device 0 --name yolov8n_voc \
+    > train_voc.log 2>&1 &
+tail -f train_voc.log
+
+# lấy về máy: results/detection/yolov8n_voc/detection_results.xlsx
 ```
 
-Run batch 1024; LR is automatically scaled to 1e-4 unless `--lr` is given:
+## Config chính (`config.py`)
 
-```bash
-python main.py --model vit_base_patch16_224 --seed 1 --batch-size 1024
-```
+| Nhóm | Biến | Mô tả |
+|---|---|---|
+| **Model** | `MODEL` | Model YOLO — bạn tự set (placeholder `None`), đổi version = 1 dòng |
+| **Dataset** | `DATA` | `VOC.yaml` (auto-download) hoặc data.yaml custom |
+| | `VAL_RATIO` | Tỉ lệ tách val' từ train (mặc định 0.1; 0 = không tách — leakage!) |
+| **Training** | `EPOCHS`, `IMGSZ`, `BATCH`, `DEVICE`, `LR0`, `PATIENCE`... | Hyperparameter Ultralytics |
+| | `EXTRA_TRAIN_ARGS` | Dict truyền thêm train-arg Ultralytics bất kỳ |
+| **Strategy 2** | `USE_STRATEGY2` | Bật/tắt Top-K averaging |
+| | `TOP_K_VALUES` | Các K cần so sánh (mặc định `[2,3,4,5]`) |
+| | `KEEP_TOP_K_CHECKPOINTS` | Số checkpoint giữ trên disk (≥ max K) |
+| **Eval** | `EVAL_SPLIT` | Split báo cáo cuối (`"test"` mặc định) |
+| **Output** | `PROJECT`, `NAME`, `EXCEL_OUTPUT` | Thư mục run + file Excel |
+| **Edge AI** | `EXPORT_ENABLED`, `EXPORT_FORMAT`, `EXPORT_HALF`... | Export sau train (tắt mặc định) |
 
-Every run writes dataset, model, optimizer, scheduler, augmentation, precision,
-DataLoader, evaluation, and runtime environment settings to `run_config.xlsx`.
+## Ghi chú / Assumptions
 
-## 📋 Requirements
+1. **Config bằng `config.py`** (class `Config`, UPPERCASE) theo đúng convention
+   repo gốc; CLI override qua `main.py` như cũ.
+2. **Averaging dùng EMA weights** trong mỗi checkpoint (phần Ultralytics thực sự
+   deploy); tensor int (BN `num_batches_tracked`) lấy từ checkpoint tốt nhất.
+   Không chạy lại BN-update sau khi average (khác classification — YOLO val
+   trực tiếp cho kết quả hợp lệ, có thể thêm sau nếu cần).
+3. **Thư mục run do Ultralytics quản lý** (`PROJECT/NAME`, tự đánh số) — vì
+   `results.csv`, weights, plots đều do Ultralytics ghi; gốc `results/detection`
+   giữ theo pattern `results/` của repo.
+4. Seed mặc định `RANDOM_SEED = 1` — dùng cho cả tách val' và
+   `model.train(seed=...)`; cùng seed + ratio → cùng split (reproduce được).
+5. Checkpoint mỗi epoch chứa cả optimizer state nên hơi nặng, nhưng chỉ tồn tại
+   tối đa `KEEP_TOP_K_CHECKPOINTS` file tại mọi thời điểm; file
+   `strategy2_top{K}_avg.pt` đã strip optimizer nên nhẹ.
 
-- Python >= 3.8
-- PyTorch >= 2.0.0
-- CUDA (recommended) hoặc CPU
-- RAM: >= 8GB
-- GPU: >= 6GB VRAM (recommended)
+## Troubleshooting
 
-## 🎓 Sử dụng cho Research
-
-Code này được thiết kế để:
-- Dễ dàng thay đổi dataset
-- Tự động hóa toàn bộ pipeline
-- Export kết quả professional
-- Tái sử dụng cho nhiều experiments
-
-Chỉ cần kiểm tra `DATASET_NAME` trong `config.py` và chạy `python main.py`!
-
-## 📝 Citation
-
-Nếu sử dụng code này cho research, vui lòng ghi nguồn phù hợp.
-
-## 🐛 Troubleshooting
-
-### Lỗi out of memory:
-- Giảm `BATCH_SIZE` trong `config.py`
-- Giảm `NUM_WORKERS`
-
-### Lỗi không tìm thấy dataset:
-- Kiểm tra `DATASET_NAME` và kết nối/cache Hugging Face
-- Đảm bảo folder structure đúng format (classes trong subfolder)
-
-### Model không train:
-- Kiểm tra GPU/CUDA availability
-- Kiểm tra dependencies đã cài đủ chưa
-
-## 📧 Support
-
-Nếu có vấn đề, vui lòng mở issue hoặc liên hệ.
+- **Out of memory**: giảm `BATCH` (hoặc `--batch -1` để auto theo VRAM), giảm `IMGSZ`.
+- **Dataset tải chậm/hết disk**: `yolo settings datasets_dir=<path>` trỏ về volume lớn.
+- **`strategies` báo không có checkpoint**: run đó train với `USE_STRATEGY2=False`
+  (hoặc `--no-strategy2`) nên không lưu checkpoint epoch — chỉ eval được Strategy 1.
+- **Số class lệch (80 vs 20)**: bạn đang eval weights COCO thô chưa fine-tune
+  trên VOC — hãy train trước rồi eval bằng `best.pt`.
