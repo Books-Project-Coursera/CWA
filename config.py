@@ -16,7 +16,7 @@ class Config:
     #   - Pretrained weights : "yolov8n.pt" | "yolo11n.pt" | "yolov5nu.pt" | ...
     #   - Custom weights     : "path/to/your_best.pt"
     #   - Train from scratch : "yolov8n.yaml" (hoặc .yaml kiến trúc custom)
-    MODEL = None  # <-- ĐẶT MODEL CỦA BẠN Ở ĐÂY, ví dụ: "yolov8n.pt"
+    MODEL = "yolov8s.pt"  # <-- ĐẶT MODEL CỦA BẠN Ở ĐÂY, ví dụ: "yolov8n.pt"
 
     # ===================== Dataset Configuration =====================
     # "VOC.yaml" = Pascal VOC built-in của Ultralytics, TỰ ĐỘNG DOWNLOAD lần đầu
@@ -35,12 +35,12 @@ class Config:
                      #   sẽ chọn checkpoint trên chính tập test (leakage) — tránh!
 
     # ===================== Training Configuration =====================
-    EPOCHS = 100
+    EPOCHS = 50
     IMGSZ = 640
-    BATCH = 16        # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
+    BATCH = -1       # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
-    WORKERS = 8
-    PATIENCE = 100    # Ultralytics early stopping (epoch không cải thiện fitness val)
+    WORKERS = 24
+    PATIENCE = 5    # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
     CACHE = False     # False | "ram" | "disk" — cache dataset
     RESUME = False
@@ -51,14 +51,14 @@ class Config:
     # (OPTIMIZER, LR/WD, WARMUP_*, SCHEDULER=linear_warmup_cosine, ETA_MIN...).
     # Ultralytics SGD-momentum với warmup + cos_lr là tương đương gần nhất.
     OPTIMIZER = "auto"  # auto | SGD | Adam | AdamW | NAdam | RAdam | RMSProp
-    LR0 = 0.01          # LR ban đầu
+    LR0 = 1e-3        # LR ban đầu
     LRF = 0.01          # LR cuối = LR0 * LRF (Ultralytics dùng linear/cosine tới đây)
     MOMENTUM = 0.937    # SGD momentum / Adam β1
     WEIGHT_DECAY = 5e-4
-    WARMUP_EPOCHS = 3.0
+    WARMUP_EPOCHS = 5
     WARMUP_MOMENTUM = 0.8  # momentum khởi động warmup (tăng dần tới MOMENTUM)
     WARMUP_BIAS_LR = 0.1   # bias LR khi warmup (giảm dần về LR0)
-    COS_LR = False         # True = cosine LR (giống SCHEDULER='linear_warmup_cosine' của repo gốc)
+    COS_LR = True      # True = cosine LR (giống SCHEDULER='linear_warmup_cosine' của repo gốc)
 
     # ===================== Loss Function =====================
     # Chọn cls loss cho detection — song song LOSS_FUNCTION của nhánh
@@ -80,7 +80,7 @@ class Config:
     BOX_GAIN = 7.5
     CLS_GAIN = 0.5
     DFL_GAIN = 1.5
-    LABEL_SMOOTHING = 0.0  # giống LABEL_SMOOTHING của repo gốc (chỉ khác 0 nếu cần)
+    LABEL_SMOOTHING = 0.1  # giống LABEL_SMOOTHING của repo gốc (chỉ khác 0 nếu cần)
     DROPOUT = 0.0          # dropout ở detection head (tương đương DROPOUT_RATE repo gốc)
     NBS = 64               # nominal batch size — Ultralytics scale WD theo BATCH/NBS
     CLOSE_MOSAIC = 10      # tắt mosaic ở N epoch cuối (theo YOLOv8 tuning)
@@ -152,7 +152,7 @@ class Config:
     EXCEL_OUTPUT = None  # None = <run_dir>/detection_results.xlsx
 
     # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...)
-    RANDOM_SEED = 1
+    RANDOM_SEED = 42
 
     # ===================== Edge AI Export (optional) =====================
     # Hook xuất model sau train bằng model.export() — TẮT MẶC ĐỊNH.
