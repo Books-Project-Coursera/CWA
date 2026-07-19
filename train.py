@@ -60,29 +60,86 @@ class TopKCheckpointManager:
 def build_train_args(data_yaml):
     """
     Map Config → kwargs của model.train().
+    Group hyperparam theo tuning guide của Ultralytics
+    (https://docs.ultralytics.com/guides/hyperparameter-tuning).
     EXTRA_TRAIN_ARGS được update SAU CÙNG nên có thể ghi đè mọi key chuẩn.
     """
     train_args = {
+        # ---- Training core ----
         "data": str(data_yaml),
         "epochs": int(Config.EPOCHS),
         "imgsz": int(Config.IMGSZ),
         "batch": int(Config.BATCH),
         "workers": int(Config.WORKERS),
         "seed": int(Config.RANDOM_SEED),
-        "optimizer": Config.OPTIMIZER,
-        "lr0": float(Config.LR0),
-        "lrf": float(Config.LRF),
         "patience": int(Config.PATIENCE),
         "pretrained": bool(Config.PRETRAINED),
         "cache": Config.CACHE,
         "resume": bool(Config.RESUME),
+        "deterministic": bool(Config.DETERMINISTIC),
         "project": Config.PROJECT,
         "exist_ok": bool(Config.EXIST_OK),
+
+        # ---- Optimizer & LR schedule ----
+        "optimizer": Config.OPTIMIZER,
+        "lr0": float(Config.LR0),
+        "lrf": float(Config.LRF),
+        "momentum": float(Config.MOMENTUM),
+        "weight_decay": float(Config.WEIGHT_DECAY),
+        "warmup_epochs": float(Config.WARMUP_EPOCHS),
+        "warmup_momentum": float(Config.WARMUP_MOMENTUM),
+        "warmup_bias_lr": float(Config.WARMUP_BIAS_LR),
+        "cos_lr": bool(Config.COS_LR),
+
+        # ---- Loss gains + regularization ----
+        "box": float(Config.BOX_GAIN),
+        "cls": float(Config.CLS_GAIN),
+        "dfl": float(Config.DFL_GAIN),
+        "dropout": float(Config.DROPOUT),
+        "nbs": int(Config.NBS),
+        "close_mosaic": int(Config.CLOSE_MOSAIC),
+
+        # ---- Augmentation ----
+        "hsv_h": float(Config.HSV_H),
+        "hsv_s": float(Config.HSV_S),
+        "hsv_v": float(Config.HSV_V),
+        "degrees": float(Config.DEGREES),
+        "translate": float(Config.TRANSLATE),
+        "scale": float(Config.SCALE),
+        "shear": float(Config.SHEAR),
+        "perspective": float(Config.PERSPECTIVE),
+        "flipud": float(Config.FLIPUD),
+        "fliplr": float(Config.FLIPLR),
+        "bgr": float(Config.BGR),
+        "mosaic": float(Config.MOSAIC),
+        "mixup": float(Config.MIXUP),
+        "cutmix": float(Config.CUTMIX),
+        "copy_paste": float(Config.COPY_PASTE),
+        "auto_augment": Config.AUTO_AUGMENT,
+        "erasing": float(Config.ERASING),
+
+        # ---- Precision & runtime ----
+        "amp": bool(Config.AMP),
+        "multi_scale": float(Config.MULTI_SCALE),
+        "rect": bool(Config.RECT),
+        "single_cls": bool(Config.SINGLE_CLS),
     }
+
+    # label_smoothing: Ultralytics 8.4+ có thể đã bỏ key này — chỉ truyền nếu
+    # còn hỗ trợ để không vỡ khi bản mới hơn strip đi
+    if float(Config.LABEL_SMOOTHING) > 0:
+        from ultralytics.cfg import DEFAULT_CFG_DICT
+        if "label_smoothing" in DEFAULT_CFG_DICT:
+            train_args["label_smoothing"] = float(Config.LABEL_SMOOTHING)
+
+    if Config.FREEZE is not None:
+        train_args["freeze"] = Config.FREEZE
+
     if Config.USE_STRATEGY2:
         # Lưu ckpt mỗi epoch để có nguồn chọn Top-K; TopKCheckpointManager
         # prune ngay nên disk không phình theo số epoch
         train_args["save_period"] = 1
+
     # DEVICE=None → để Ultralytics tự chọn, không truyền key
     if Config.DEVICE is not None:
         train_args["device"] = Config.DEVICE

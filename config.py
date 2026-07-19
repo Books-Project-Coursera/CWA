@@ -40,28 +40,91 @@ class Config:
     BATCH = 16        # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
     WORKERS = 8
-    OPTIMIZER = "auto"  # auto | SGD | Adam | AdamW | ...
-    LR0 = 0.01
-    LRF = 0.01
-    PATIENCE = 100    # early stopping của Ultralytics (epoch không cải thiện fitness val)
+    PATIENCE = 100    # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
-    CACHE = False
+    CACHE = False     # False | "ram" | "disk" — cache dataset
     RESUME = False
+    DETERMINISTIC = True  # Ultralytics đặt torch.deterministic + seed reproducible
 
-    # Truyền thêm train-arg Ultralytics bất kỳ mà không cần sửa code
-    # (https://docs.ultralytics.com/modes/train/#train-settings)
-    EXTRA_TRAIN_ARGS = {}  # ví dụ: {"cos_lr": True, "close_mosaic": 10}
+    # ===================== Optimizer & LR Schedule =====================
+    # Tương ứng nhóm "Optimizer / Scheduler" của Strategy2_TinyImageNet
+    # (OPTIMIZER, LR/WD, WARMUP_*, SCHEDULER=linear_warmup_cosine, ETA_MIN...).
+    # Ultralytics SGD-momentum với warmup + cos_lr là tương đương gần nhất.
+    OPTIMIZER = "auto"  # auto | SGD | Adam | AdamW | NAdam | RAdam | RMSProp
+    LR0 = 0.01          # LR ban đầu
+    LRF = 0.01          # LR cuối = LR0 * LRF (Ultralytics dùng linear/cosine tới đây)
+    MOMENTUM = 0.937    # SGD momentum / Adam β1
+    WEIGHT_DECAY = 5e-4
+    WARMUP_EPOCHS = 3.0
+    WARMUP_MOMENTUM = 0.8  # momentum khởi động warmup (tăng dần tới MOMENTUM)
+    WARMUP_BIAS_LR = 0.1   # bias LR khi warmup (giảm dần về LR0)
+    COS_LR = False         # True = cosine LR (giống SCHEDULER='linear_warmup_cosine' của repo gốc)
+
+    # ===================== Loss Gains =====================
+    # Trọng số 3 thành phần loss của Ultralytics YOLO (box regression + class
+    # + distribution focal loss). Không có tương ứng trực tiếp trong repo gốc
+    # (classification chỉ có 1 loss), nhưng đây là hyperparam then chốt của
+    # detection theo tuning guide.
+    BOX_GAIN = 7.5
+    CLS_GAIN = 0.5
+    DFL_GAIN = 1.5
+    LABEL_SMOOTHING = 0.0  # giống LABEL_SMOOTHING của repo gốc (chỉ khác 0 nếu cần)
+    DROPOUT = 0.0          # dropout ở detection head (tương đương DROPOUT_RATE repo gốc)
+    NBS = 64               # nominal batch size — Ultralytics scale WD theo BATCH/NBS
+    CLOSE_MOSAIC = 10      # tắt mosaic ở N epoch cuối (theo YOLOv8 tuning)
+
+    # ===================== Augmentation =====================
+    # Nhóm augmentation của Ultralytics — tương ứng "USE_MIXUP_CUTMIX,
+    # MIXUP_ALPHA, HORIZONTAL_FLIP_PROB, RANDOM_ERASING_*" của repo gốc, có
+    # thêm augmentation dành riêng cho detection (HSV, geometric, mosaic).
+    HSV_H = 0.015     # hue jitter (0-1)
+    HSV_S = 0.7       # saturation jitter (0-1)
+    HSV_V = 0.4       # value/brightness jitter (0-1)
+    DEGREES = 0.0     # random rotation ±deg
+    TRANSLATE = 0.1   # random translation (fraction of image)
+    SCALE = 0.5       # random scale (±)
+    SHEAR = 0.0       # random shear deg
+    PERSPECTIVE = 0.0 # random perspective (0-0.001)
+    FLIPUD = 0.0      # xác suất flip trục dọc
+    FLIPLR = 0.5      # xác suất flip trục ngang (tương đương HORIZONTAL_FLIP_PROB)
+    BGR = 0.0         # xác suất đổi channel order BGR
+    MOSAIC = 1.0      # xác suất mosaic 4-image
+    MIXUP = 0.0       # xác suất mixup (repo gốc bật, YOLO detection thường 0)
+    CUTMIX = 0.0      # xác suất cutmix (repo gốc bật, YOLO detection thường 0)
+    COPY_PASTE = 0.0  # copy-paste augmentation cho detection
+    AUTO_AUGMENT = "randaugment"  # randaugment | autoaugment | augmix (classification only cho backbone-pretrain)
+    ERASING = 0.4     # random erasing prob (repo gốc RANDOM_ERASING_PROB=0.25)
+
+    # ===================== Precision & Runtime =====================
+    # Tương ứng "USE_AMP, AMP_DTYPE, MULTI_SCALE..." của repo gốc.
+    AMP = True         # Ultralytics auto-mixed precision (FP16/BF16 theo GPU)
+    MULTI_SCALE = 0.0  # >0 = random rescale ảnh mỗi batch (fraction ±); 0 = tắt
+    RECT = False       # rectangular training (nhóm ảnh cùng aspect ratio → nhanh hơn)
+    SINGLE_CLS = False # gộp mọi class thành 1 (chỉ để debug)
+    FREEZE = None      # freeze N layer đầu (backbone); None = không freeze
+
+    # Truyền thêm train-arg Ultralytics bất kỳ mà không cần sửa code, và ghi
+    # đè MỌI key ở trên nếu cần (https://docs.ultralytics.com/modes/train/)
+    EXTRA_TRAIN_ARGS = {}
 
     # ===================== Strategy Configuration =====================
     # Strategy 1: best.pt — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn)
     # Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
-    #             (giống nhánh classification; fitness = 0.1*mAP50 + 0.9*mAP50-95)
+    #             (giống nhánh Strategy2_TinyImageNet; fitness = 0.1*mAP50 + 0.9*mAP50-95)
     USE_STRATEGY2 = True
     TOP_K_VALUES = [2, 3, 4, 5]
     # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
     # Ultralytics lưu (save_period=1) rồi TopKCheckpointManager prune NGAY nếu
     # ngoài Top-K — không lưu tất cả epoch (xem train.py)
     KEEP_TOP_K_CHECKPOINTS = 5  # nên = max(TOP_K_VALUES)
+
+    # BatchNorm update sau khi average — bắt chước update_bn() của repo gốc:
+    # sau average, running_mean/running_var giữ nguyên từ ckpt tốt nhất (không
+    # average vì đây là population stats) nhưng weights đổi → phải chạy
+    # forward pass trên train để re-estimate BN stats khớp weights mới,
+    # nếu không mAP của Strategy 2 sẽ tụt do BN lệch phân phối.
+    USE_BN_UPDATE = True
+    BN_UPDATE_BATCHES = 100  # giống num_batches=100 của repo gốc
 
     # ===================== Evaluation Configuration =====================
     # Split dùng cho báo cáo cuối (Strategy 1 vs Strategy 2):
@@ -120,6 +183,20 @@ class Config:
 
         if int(cls.WORKERS) < 0:
             raise ValueError("WORKERS must be non-negative")
+
+        # Sanity check các hyperparam mới
+        if not 0.0 <= float(cls.MOMENTUM) < 1.0:
+            raise ValueError("MOMENTUM must be in [0, 1)")
+        if not 0.0 <= float(cls.WEIGHT_DECAY) < 1.0:
+            raise ValueError("WEIGHT_DECAY must be in [0, 1)")
+        if float(cls.WARMUP_EPOCHS) < 0:
+            raise ValueError("WARMUP_EPOCHS must be non-negative")
+        if not 0.0 <= float(cls.LABEL_SMOOTHING) < 1.0:
+            raise ValueError("LABEL_SMOOTHING must be in [0, 1)")
+        for prob in ("FLIPUD", "FLIPLR", "BGR", "MOSAIC", "MIXUP", "CUTMIX",
+                     "COPY_PASTE", "ERASING"):
+            if not 0.0 <= float(getattr(cls, prob)) <= 1.0:
+                raise ValueError(f"{prob} must be in [0, 1]")
 
         if cls.EVAL_SPLIT not in cls.VALID_EVAL_SPLITS:
             raise ValueError(f"EVAL_SPLIT must be one of {cls.VALID_EVAL_SPLITS}")

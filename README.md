@@ -42,8 +42,12 @@ Cơ chế checkpoint cho Strategy 2 (xem `train.py`):
   ngoài Top-K theo fitness val' → **disk chỉ giữ đúng K checkpoint cần thiết**
   (+ `best.pt`/`last.pt`), không lưu tất cả epoch;
 - Ranking ghi vào `weights/strategy2_checkpoints.json`;
-- Sau train: average EMA weights của Top-K (`strategy2_top{K}_avg.pt`) rồi
-  `model.val()` trên test — so sánh trực tiếp với Strategy 1.
+- Sau train: average EMA weights của Top-K (`strategy2_top{K}_avg.pt`) —
+  **skip BN running stats** (giữ từ ckpt tốt nhất, không average) rồi
+  **`update_bn_stats`** re-estimate BN trên train (forward pass
+  `BN_UPDATE_BATCHES=100`) — y hệt cơ chế `average_weights` + `update_bn`
+  của nhánh `Strategy2_TinyImageNet`. Cuối cùng `model.val()` trên test —
+  so sánh trực tiếp với Strategy 1.
 - Fitness = `0.1*mAP50 + 0.9*mAP50-95` (định nghĩa của Ultralytics, không tự chế).
 
 ## Cấu trúc
@@ -171,6 +175,11 @@ tail -f train_voc.log
 | **Strategy 2** | `USE_STRATEGY2` | Bật/tắt Top-K averaging |
 | | `TOP_K_VALUES` | Các K cần so sánh (mặc định `[2,3,4,5]`) |
 | | `KEEP_TOP_K_CHECKPOINTS` | Số checkpoint giữ trên disk (≥ max K) |
+| | `USE_BN_UPDATE`, `BN_UPDATE_BATCHES` | Re-estimate BN sau average (bắt buộc để mAP không tụt) |
+| **Optimizer/LR** | `LR0`, `LRF`, `MOMENTUM`, `WEIGHT_DECAY`, `WARMUP_EPOCHS`, `WARMUP_MOMENTUM`, `WARMUP_BIAS_LR`, `COS_LR` | Tương đương nhóm Optimizer/Scheduler của repo gốc |
+| **Loss** | `BOX_GAIN`, `CLS_GAIN`, `DFL_GAIN`, `LABEL_SMOOTHING`, `DROPOUT`, `NBS`, `CLOSE_MOSAIC` | Loss gains YOLO + regularization |
+| **Aug** | `HSV_H/S/V`, `DEGREES`, `TRANSLATE`, `SCALE`, `SHEAR`, `PERSPECTIVE`, `FLIPUD`, `FLIPLR`, `MOSAIC`, `MIXUP`, `CUTMIX`, `COPY_PASTE`, `ERASING`, `AUTO_AUGMENT` | Toàn bộ augmentation Ultralytics |
+| **Precision** | `AMP`, `MULTI_SCALE`, `RECT`, `SINGLE_CLS`, `FREEZE`, `DETERMINISTIC` | AMP, multi-scale, freeze N layer đầu |
 | **Eval** | `EVAL_SPLIT` | Split báo cáo cuối (`"test"` mặc định) |
 | **Output** | `PROJECT`, `NAME`, `EXCEL_OUTPUT` | Thư mục run + file Excel |
 | **Edge AI** | `EXPORT_ENABLED`, `EXPORT_FORMAT`, `EXPORT_HALF`... | Export sau train (tắt mặc định) |

@@ -191,13 +191,21 @@ def rank_checkpoints(run_dir):
 
 def average_checkpoints(ckpt_paths, output_path):
     """
-    Average weights của nhiều checkpoint YOLO (Strategy 2 — tương đương
-    average_weights của nhánh classification, áp dụng cho ckpt Ultralytics).
+    Average weights của nhiều checkpoint YOLO — tương đương `average_weights`
+    của nhánh Strategy2_TinyImageNet, áp dụng cho ckpt Ultralytics.
 
-    Dùng EMA weights (phần Ultralytics thực sự deploy trong mỗi ckpt); tensor
-    float được average, tensor int (vd BN num_batches_tracked) lấy từ ckpt tốt
-    nhất. Ckpt output chỉ chứa model (bỏ optimizer) nên nhẹ, load lại bằng
-    YOLO(path) như ckpt thường.
+    Cùng nguyên tắc với classification:
+    - Average TẤT CẢ learnable parameter (float): weights, biases, γ/β của BN.
+    - KHÔNG average BN running statistics (`running_mean`, `running_var`,
+      `num_batches_tracked`) — đây là population stats, không phải learned;
+      average chúng làm BN lệch phân phối → giữ nguyên từ checkpoint ĐẦU (đã
+      được sort là ckpt có fitness cao nhất).
+    - Sau khi average, BN stats KHÔNG khớp với weights mới → phải chạy
+      update_bn_stats() để re-estimate trên train (xem hàm bên dưới).
+
+    Ckpt input dùng EMA weights (phần Ultralytics thực sự deploy). Ckpt output
+    chỉ chứa model (bỏ optimizer) nên nhẹ, load lại bằng YOLO(path) như ckpt
+    thường.
     """
     import torch
 
@@ -206,12 +214,17 @@ def average_checkpoints(ckpt_paths, output_path):
     modules = [(ck.get("ema") or ck["model"]).float() for ck in ckpts]
     state_dicts = [m.state_dict() for m in modules]
 
+    # Skip BN running stats — giống keys_to_keep của Strategy2_TinyImageNet
+    def is_bn_stat(key):
+        return any(marker in key for marker in ("running_mean", "running_var", "num_batches_tracked"))
+
     avg_state = {}
     for key, ref_tensor in state_dicts[0].items():
-        if ref_tensor.dtype.is_floating_point:
-            avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
-        else:
+        if is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
+            # Giữ nguyên từ checkpoint đầu (đã sort theo fitness giảm dần)
             avg_state[key] = ref_tensor.clone()
+        else:
+            avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
 
     merged_module = modules[0]
     merged_module.load_state_dict(avg_state)
@@ -228,6 +241,98 @@ def average_checkpoints(ckpt_paths, output_path):
         str(output_path),
     )
     return Path(output_path)
+
+
+def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
+    """
+    Re-estimate BN running statistics của model đã average — tương đương
+    update_bn() của nhánh Strategy2_TinyImageNet, thích ứng cho YOLO.
+
+    Vì sao: sau average_checkpoints() BN running_mean/running_var được giữ từ
+    ckpt tốt nhất (không average) nhưng weights của các layer trước BN đã đổi
+    → phân phối activation lệch với running stats cũ. Chạy forward pass trên
+    train (BN ở mode 'train', momentum=None → cumulative moving average) để
+    tính lại running stats khớp weights mới. Ghi đè lại `weights_path`.
+
+    Args:
+        weights_path: file .pt đã average (do `average_checkpoints` sinh ra).
+        data_yaml: path data yaml (holdout hoặc gốc) — dùng SPLIT TRAIN để
+                   ước lượng BN, không đụng val'/test.
+        num_batches: số batch forward (mặc định Config.BN_UPDATE_BATCHES).
+        device: None = auto GPU nếu có.
+
+    Returns:
+        weights_path (đã ghi đè với BN stats mới).
+    """
+    import torch
+    from torch.nn.modules.batchnorm import _BatchNorm
+    from ultralytics import YOLO
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data.build import build_dataloader, build_yolo_dataset
+    from ultralytics.data.utils import check_det_dataset
+
+    weights_path = Path(weights_path)
+    num_batches = int(num_batches or Config.BN_UPDATE_BATCHES)
+
+    yolo = YOLO(str(weights_path))
+    model = yolo.model
+    bn_modules = [m for m in model.modules() if isinstance(m, _BatchNorm)]
+    if not bn_modules:
+        print("      (Không tìm thấy BN layer nào, bỏ qua update_bn)")
+        return weights_path
+
+    device_obj = torch.device(
+        device
+        or (f"cuda:{Config.DEVICE}" if isinstance(Config.DEVICE, str) and Config.DEVICE.isdigit()
+            else "cuda" if torch.cuda.is_available() else "cpu")
+    )
+    model = model.float().to(device_obj)
+    stride = int(max(model.stride)) if hasattr(model, "stride") else 32
+
+    # Build train dataloader kiểu Ultralytics (đúng augmentation train)
+    data = check_det_dataset(str(data_yaml))
+    batch = int(Config.BATCH) if int(Config.BATCH) > 0 else 16
+    cfg = get_cfg(overrides={"imgsz": int(Config.IMGSZ), "task": "detect"})
+    dataset = build_yolo_dataset(
+        cfg, data["train"], batch, data, mode="train", rect=False, stride=stride
+    )
+    loader = build_dataloader(
+        dataset, batch, workers=int(Config.WORKERS), shuffle=True, rank=-1
+    )
+
+    # Reset BN running stats + đổi momentum=None (cumulative moving average)
+    saved_momentum = {}
+    for m in bn_modules:
+        saved_momentum[m] = m.momentum
+        m.reset_running_stats()
+        m.momentum = None
+
+    # Toàn model ở eval() để tắt dropout/random aug ở path forward, riêng BN
+    # bật train() để tích lũy running stats — pattern giống update_bn của
+    # nhánh classification.
+    was_training = model.training
+    model.eval()
+    for m in bn_modules:
+        m.train()
+
+    print(f"      Updating BN stats bằng {num_batches} batch train (device={device_obj})...")
+    with torch.no_grad():
+        for i, batch_data in enumerate(loader):
+            if i >= num_batches:
+                break
+            img = batch_data["img"].to(device_obj, non_blocking=True).float() / 255.0
+            _ = model(img)
+
+    for m, mom in saved_momentum.items():
+        m.momentum = mom
+    model.train(was_training)
+
+    # Ghi đè weights_path với BN stats mới (giữ nguyên cấu trúc ckpt)
+    ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
+    ckpt["model"] = model.half().cpu()
+    torch.save(ckpt, str(weights_path))
+    print(f"      ✓ BN stats updated: {weights_path.name}")
+    return weights_path
 
 
 def run_strategy_evaluation(run_dir, data=None, split=None):
@@ -274,6 +379,11 @@ def run_strategy_evaluation(run_dir, data=None, split=None):
                     continue
                 avg_path = run_dir / "weights" / f"strategy2_top{k}_avg.pt"
                 average_checkpoints([p for p, _, _ in ranked[:k]], avg_path)
+                # CRITICAL: BN running stats bị giữ nguyên khi average → phải
+                # re-estimate trên train trước khi val, y hệt update_bn của
+                # Strategy2_TinyImageNet.
+                if Config.USE_BN_UPDATE:
+                    update_bn_stats(avg_path, data)
                 results[f"Strategy 2 (Top-{k} avg)"] = evaluate_weights(
                     avg_path, data, split, header=f"Strategy 2 — Top-{k} average (split={split})"
                 )
