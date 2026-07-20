@@ -42,7 +42,7 @@ def add_common_args(parser):
     parser.add_argument("--batch", type=int, help="Override Config.BATCH (-1 = auto-batch).")
     parser.add_argument("--device", help="Device: 0 | 0,1 | cpu. Mặc định auto.")
     parser.add_argument("--workers", type=int, help="Override Config.WORKERS.")
-    parser.add_argument("--seed", type=int, help="Override Config.RANDOM_SEED.")
+    parser.add_argument("--seed", type=int, nargs="+", help="Override Config.RANDOM_SEED (chấp nhận 1 hoặc nhiều seed, ví dụ: --seed 42 100).")
     parser.add_argument("--optimizer", help="Override Config.OPTIMIZER (auto/SGD/AdamW/...).")
     parser.add_argument("--lr0", type=float, help="Override Config.LR0.")
     parser.add_argument("--lrf", type=float, help="Override Config.LRF.")

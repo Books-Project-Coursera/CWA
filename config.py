@@ -35,87 +35,37 @@ class Config:
                      #   sẽ chọn checkpoint trên chính tập test (leakage) — tránh!
 
     # ===================== Training Configuration =====================
-    EPOCHS = 50
+    EPOCHS = 100
     IMGSZ = 640
-    BATCH = -1       # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
+    BATCH = 128     # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
     WORKERS = 24
-    PATIENCE = 5    # Ultralytics early stopping (epoch không cải thiện fitness val)
+    PATIENCE = 10   # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
     CACHE = False     # False | "ram" | "disk" — cache dataset
     RESUME = False
     DETERMINISTIC = True  # Ultralytics đặt torch.deterministic + seed reproducible
 
-    # ===================== Optimizer & LR Schedule =====================
-    # Tương ứng nhóm "Optimizer / Scheduler" của Strategy2_TinyImageNet
-    # (OPTIMIZER, LR/WD, WARMUP_*, SCHEDULER=linear_warmup_cosine, ETA_MIN...).
-    # Ultralytics SGD-momentum với warmup + cos_lr là tương đương gần nhất.
-    OPTIMIZER = "auto"  # auto | SGD | Adam | AdamW | NAdam | RAdam | RMSProp
-    LR0 = 1e-3        # LR ban đầu
-    LRF = 0.01          # LR cuối = LR0 * LRF (Ultralytics dùng linear/cosine tới đây)
-    MOMENTUM = 0.937    # SGD momentum / Adam β1
-    WEIGHT_DECAY = 5e-4
-    WARMUP_EPOCHS = 5
-    WARMUP_MOMENTUM = 0.8  # momentum khởi động warmup (tăng dần tới MOMENTUM)
-    WARMUP_BIAS_LR = 0.1   # bias LR khi warmup (giảm dần về LR0)
-    COS_LR = True      # True = cosine LR (giống SCHEDULER='linear_warmup_cosine' của repo gốc)
+    # ===================== Optimizer & LR Schedule (Overridden Only) =====================
+    OPTIMIZER = "auto"  # Bộ tối ưu (auto, SGD, Adam, AdamW, RMSprop, ...)
+    LR0 = 5e-3       # LR ban đầu (mặc định Ultralytics là 0.01)
+    LRF = 0.01        # Hệ số LR cuối cùng (final learning rate factor = lr0 * lrf)
+    WARMUP_EPOCHS = 5  # Số epoch warmup (mặc định Ultralytics là 3.0)
+    COS_LR = True      # Dùng cosine learning rate decay (mặc định Ultralytics là False)
 
     # ===================== Loss Function =====================
     # Chọn cls loss cho detection — song song LOSS_FUNCTION của nhánh
     # Strategy2_TinyImageNet ('cross_entropy' | 'poly_focal').
     # - "bce"  : nn.BCEWithLogitsLoss(reduction="none") — mặc định Ultralytics
-    #            (v8DetectionLoss dùng BCE, không phải CE — vì detection cls
-    #            là multi-label per anchor, không phải single-label softmax).
     # - "focal": thay bằng FocalBCE (losses.py) — BCE * (1-p_t)^γ * α_factor,
     #            công thức Focal Loss chuẩn, có hook install_cls_loss.
-    LOSS_FUNCTION = "bce"
+    LOSS_FUNCTION = "focal"
     FOCAL_GAMMA = 1.5  # focusing param — tăng γ dồn học vào hard examples
     FOCAL_ALPHA = 0.25  # balancing param — 0 tắt
 
-    # ===================== Loss Gains =====================
-    # Trọng số 3 thành phần loss của Ultralytics YOLO (box regression + class
-    # + distribution focal loss). Không có tương ứng trực tiếp trong repo gốc
-    # (classification chỉ có 1 loss), nhưng đây là hyperparam then chốt của
-    # detection theo tuning guide.
-    BOX_GAIN = 7.5
-    CLS_GAIN = 0.5
-    DFL_GAIN = 1.5
-    LABEL_SMOOTHING = 0.1  # giống LABEL_SMOOTHING của repo gốc (chỉ khác 0 nếu cần)
-    DROPOUT = 0.0          # dropout ở detection head (tương đương DROPOUT_RATE repo gốc)
-    NBS = 64               # nominal batch size — Ultralytics scale WD theo BATCH/NBS
-    CLOSE_MOSAIC = 10      # tắt mosaic ở N epoch cuối (theo YOLOv8 tuning)
-
-    # ===================== Augmentation =====================
-    # Nhóm augmentation của Ultralytics — tương ứng "USE_MIXUP_CUTMIX,
-    # MIXUP_ALPHA, HORIZONTAL_FLIP_PROB, RANDOM_ERASING_*" của repo gốc, có
-   
-    HSV_H = 0.015
-    HSV_S = 0.7
-    HSV_V = 0.4
-    DEGREES = 0.0
-    TRANSLATE = 0.1
-    SCALE = 0.5
-    SHEAR = 0.0
-    PERSPECTIVE = 0.0
-    FLIPUD = 0.0
-    FLIPLR = 0.5
-    MOSAIC = 1.0
-    MIXUP = 0.1             # Bật nhẹ mixup cho detection — VOC có 20 classes
-    COPY_PASTE = 0.1        # Copy-paste hữu ích cho detection (thêm objects)
-    ERASING = 0.4
-    BGR = 0.0
-    CUTMIX = 0.0
-    # ===================== Precision & Runtime =====================
-    # Tương ứng "USE_AMP, AMP_DTYPE, MULTI_SCALE..." của repo gốc.
-    AMP = True         # Ultralytics auto-mixed precision (FP16/BF16 theo GPU)
-    MULTI_SCALE = 0.0  # >0 = random rescale ảnh mỗi batch (fraction ±); 0 = tắt
-    RECT = False       # rectangular training (nhóm ảnh cùng aspect ratio → nhanh hơn)
-    SINGLE_CLS = False # gộp mọi class thành 1 (chỉ để debug)
-    FREEZE = None      # freeze N layer đầu (backbone); None = không freeze
-
-    # Truyền thêm train-arg Ultralytics bất kỳ mà không cần sửa code, và ghi
-    # đè MỌI key ở trên nếu cần (https://docs.ultralytics.com/modes/train/)
-    EXTRA_TRAIN_ARGS = {}
+    # ===================== Augmentation (Overridden Only) =====================
+    MIXUP = 0.15           # Bật nhẹ mixup cho detection (mặc định Ultralytics là 0.0)
+    COPY_PASTE = 0.15        # Copy-paste hữu ích cho detection (mặc định Ultralytics là 0.0)
 
     # ===================== Strategy Configuration =====================
     # Strategy 1: best.pt — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn)
@@ -149,8 +99,9 @@ class Config:
     EXIST_OK = False
     EXCEL_OUTPUT = None  # None = <run_dir>/detection_results.xlsx
 
-    # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...)
-    RANDOM_SEED = 42
+    # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...).
+    # Hỗ trợ số nguyên đơn lẻ (ví dụ: 42) hoặc danh sách các seed (ví dụ: [42, 100, 2026]).
+    RANDOM_SEED = [1, 10, 42, 100, 500]
 
     # ===================== Edge AI Export (optional) =====================
     # Hook xuất model sau train bằng model.export() — TẮT MẶC ĐỊNH.
@@ -162,6 +113,7 @@ class Config:
     EXPORT_DYNAMIC = False
     EXPORT_SIMPLIFY = True
     EXPORT_DEVICE = None     # export TensorRT cần GPU → "0" nếu format engine
+    EXTRA_TRAIN_ARGS = {}
 
     VALID_EVAL_SPLITS = (None, "val", "test", "train")
 
@@ -194,17 +146,16 @@ class Config:
         if int(cls.WORKERS) < 0:
             raise ValueError("WORKERS must be non-negative")
 
-        # Sanity check các hyperparam mới
-        if not 0.0 <= float(cls.MOMENTUM) < 1.0:
-            raise ValueError("MOMENTUM must be in [0, 1)")
-        if not 0.0 <= float(cls.WEIGHT_DECAY) < 1.0:
-            raise ValueError("WEIGHT_DECAY must be in [0, 1)")
+        if not cls.OPTIMIZER:
+            raise ValueError("OPTIMIZER must not be empty")
+
         if float(cls.WARMUP_EPOCHS) < 0:
             raise ValueError("WARMUP_EPOCHS must be non-negative")
-        if not 0.0 <= float(cls.LABEL_SMOOTHING) < 1.0:
-            raise ValueError("LABEL_SMOOTHING must be in [0, 1)")
-        for prob in ("FLIPUD", "FLIPLR", "BGR", "MOSAIC", "MIXUP", "CUTMIX",
-                     "COPY_PASTE", "ERASING"):
+
+        if not 0.0 <= float(cls.LRF) <= 1.0:
+            raise ValueError("LRF must be in [0, 1]")
+
+        for prob in ("MIXUP", "COPY_PASTE"):
             if not 0.0 <= float(getattr(cls, prob)) <= 1.0:
                 raise ValueError(f"{prob} must be in [0, 1]")
 

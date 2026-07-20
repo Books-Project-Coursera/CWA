@@ -323,7 +323,7 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     # USE_AMP=True + CUDA). BN chỉ tích lũy mean/var nên không nhạy cảm với
     # precision, nhưng match train precision cho nhất quán và nhanh hơn trên
     # GPU. Không ảnh hưởng correctness khi Config.AMP=False.
-    if Config.AMP and device_obj.type == "cuda":
+    if getattr(Config, "AMP", True) and device_obj.type == "cuda":
         autocast_ctx = torch.autocast(
             device_type="cuda",
             dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
@@ -351,7 +351,7 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     return weights_path
 
 
-def run_strategy_evaluation(run_dir, data=None, split=None):
+def run_strategy_evaluation(run_dir, data=None, split=None, seed=None):
     """
     Đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split
     báo cáo (mặc định Config.EVAL_SPLIT='test' — VOC2007 test), in bảng so
@@ -421,7 +421,7 @@ def run_strategy_evaluation(run_dir, data=None, split=None):
     best_name = max(results, key=lambda n: extract_overall_metrics(results[n])["mAP@0.5:0.95"])
     print(f"\n🏆 Best strategy (mAP@0.5:0.95): {best_name}")
 
-    export_to_excel(run_dir, strategy_results=results, data=data, split=split)
+    export_to_excel(run_dir, strategy_results=results, data=data, split=split, seed=seed)
     return results
 
 
@@ -461,7 +461,7 @@ def _data_note(data):
     return VAL_TEST_WARNING
 
 
-def export_to_excel(run_dir, strategy_results=None, data=None, split=None, output_path=None):
+def export_to_excel(run_dir, strategy_results=None, data=None, split=None, output_path=None, seed=None):
     """
     Xuất Excel 2 sheet cho một run detection:
 
@@ -521,7 +521,8 @@ def export_to_excel(run_dir, strategy_results=None, data=None, split=None, outpu
         ("imgsz", Config.IMGSZ),
         ("batch", Config.BATCH),
         ("device", Config.DEVICE if Config.DEVICE is not None else "auto"),
-        ("seed", Config.RANDOM_SEED),
+        # Ưu tiên seed thực sự dùng cho run này (tham số seed), fallback Config
+        ("seed", seed if seed is not None else Config.RANDOM_SEED),
         ("cls_loss", Config.LOSS_FUNCTION + (
             f" (γ={Config.FOCAL_GAMMA}, α={Config.FOCAL_ALPHA})"
             if Config.LOSS_FUNCTION == "focal" else ""
@@ -536,7 +537,11 @@ def export_to_excel(run_dir, strategy_results=None, data=None, split=None, outpu
     ]
 
     if output_path is None:
-        output_path = Config.EXCEL_OUTPUT or os.path.join(run_dir, "detection_results.xlsx")
+        if seed is not None:
+            default_name = f"detection_results_seed{seed}.xlsx"
+        else:
+            default_name = "detection_results.xlsx"
+        output_path = Config.EXCEL_OUTPUT or os.path.join(run_dir, default_name)
     output_parent = os.path.dirname(output_path)
     if output_parent:
         os.makedirs(output_parent, exist_ok=True)
@@ -565,4 +570,97 @@ def export_to_excel(run_dir, strategy_results=None, data=None, split=None, outpu
         print(f"    - Sheet 'PerEpoch': {len(per_epoch_df)} epochs (từ results.csv)")
     else:
         print("    - Sheet 'PerEpoch': bỏ qua (không có results.csv)")
+    return output_path
+
+
+# ==================== Multi-seed summary export ====================
+
+def export_multi_seed_summary(all_runs_results, output_dir=None):
+    """
+    Export file Excel tổng hợp tất cả seed runs vào <output_dir>/multi_seed_summary.xlsx.
+
+    Sheets:
+    - "Summary"     : mỗi row = 1 seed × 1 strategy; có cột Seed + Run Folder rõ ràng.
+    - "Mean ± Std"  : mean/std của từng metric nhóm theo Strategy qua tất cả seeds.
+    - "Per-Class AP": AP từng class, nhóm theo Seed × Run Folder × Strategy.
+
+    Args:
+        all_runs_results: list[dict] từ train_detector() — mỗi phần tử gồm
+            {seed, run_dir, strategy_results, val_metrics, ...}.
+        output_dir: thư mục chứa file tổng hợp (mặc định = Config.PROJECT).
+
+    Returns:
+        Path file .xlsx đã ghi, hoặc None nếu không có kết quả.
+    """
+    output_dir = output_dir or Config.PROJECT
+    os.makedirs(str(output_dir), exist_ok=True)
+    output_path = os.path.join(str(output_dir), "multi_seed_summary.xlsx")
+
+    summary_rows = []   # 1 row per seed × strategy
+    per_class_rows = [] # 1 row per seed × strategy × class
+
+    for run in all_runs_results:
+        seed_val = run["seed"]
+        run_dir_str = run["run_dir"]
+        strategy_results = run.get("strategy_results") or {}
+        for strat_name, metrics in strategy_results.items():
+            if metrics is None:
+                continue
+            overall = extract_overall_metrics(metrics)
+            summary_rows.append({
+                "Seed": seed_val,
+                "Run Folder": run_dir_str,
+                "Strategy": strat_name,
+                **overall,
+            })
+            for row in extract_per_class_metrics(metrics):
+                per_class_rows.append({
+                    "Seed": seed_val,
+                    "Run Folder": run_dir_str,
+                    "Strategy": strat_name,
+                    **row,
+                })
+
+    if not summary_rows:
+        print("  ⚠ Không có kết quả nào để export multi-seed summary")
+        return None
+
+    summary_df = pd.DataFrame(summary_rows)
+    per_class_df = pd.DataFrame(per_class_rows)
+
+    # Mean ± Std grouped by Strategy (giữ thứ tự xuất hiện lần đầu)
+    metric_cols = ["mAP@0.5", "mAP@0.5:0.95", "mAP@0.75", "Precision", "Recall"]
+    if "Fitness" in summary_df.columns:
+        metric_cols.append("Fitness")
+    metric_cols = [c for c in metric_cols if c in summary_df.columns]
+
+    # Giữ thứ tự strategy theo thứ tự xuất hiện trong summary_df
+    seen_strats = []
+    for s in summary_df["Strategy"]:
+        if s not in seen_strats:
+            seen_strats.append(s)
+
+    mean_std_rows = []
+    for strat_name in seen_strats:
+        grp = summary_df[summary_df["Strategy"] == strat_name]
+        row = {"Strategy": strat_name, "N seeds": len(grp)}
+        for col in metric_cols:
+            row[f"{col} mean"] = round(float(grp[col].mean()), 6)
+            row[f"{col} std"]  = round(float(grp[col].std()),  6)
+        mean_std_rows.append(row)
+    mean_std_df = pd.DataFrame(mean_std_rows)
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        summary_df.to_excel(writer,   sheet_name="Summary",      index=False)
+        mean_std_df.to_excel(writer,  sheet_name="Mean ± Std",   index=False)
+        if not per_class_df.empty:
+            per_class_df.to_excel(writer, sheet_name="Per-Class AP", index=False)
+
+    seeds_done = [r["seed"] for r in all_runs_results]
+    print(f"\n  ✓ Multi-seed summary exported: {output_path}")
+    print(f"    Seeds           : {seeds_done}")
+    print(f"    Sheet 'Summary'     : {len(summary_rows)} rows ({len(seen_strats)} strategy × {len(seeds_done)} seeds)")
+    print(f"    Sheet 'Mean ± Std'  : {len(mean_std_rows)} strategy rows")
+    if not per_class_df.empty:
+        print(f"    Sheet 'Per-Class AP': {len(per_class_rows)} rows")
     return output_path

@@ -4,40 +4,38 @@ Ultralytics) và Focal loss cho phần classification.
 
 Match convention `losses.py` của nhánh Strategy2_TinyImageNet (nơi expose
 LOSS_FUNCTION = 'cross_entropy' | 'poly_focal').
-"""
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
+Sử dụng FocalLoss API từ ultralytics.utils.loss thay vì implement thủ công.
+"""
+from ultralytics.utils.loss import FocalLoss
+import torch.nn.functional as F
 from config import Config
 
 
-class FocalBCE(nn.Module):
+class FocalBCE(FocalLoss):
     """
     Focal BCE loss giữ shape output (bs, num_anchors, nc) — drop-in replacement
-    cho `nn.BCEWithLogitsLoss(reduction="none")` mà `v8DetectionLoss.__call__`
-    sử dụng (line: `self.bce(pred_scores, target_scores).sum() / target_scores_sum`).
+    cho ``nn.BCEWithLogitsLoss(reduction="none")`` mà ``v8DetectionLoss.__call__``
+    sử dụng (line: ``self.bce(pred_scores, target_scores).sum() / target_scores_sum``).
 
-    Công thức = BCE với reduction='none' × (1 - p_t)^γ × alpha_factor —
-    giống Ultralytics `FocalLoss` NHƯNG không có `.mean(1).sum()` cuối
-    (`FocalLoss` gốc trả scalar → không thể thay `self.bce` được).
+    Kế thừa từ ``ultralytics.utils.loss.FocalLoss`` nhưng override ``forward()``
+    để trả element-wise loss thay vì scalar (FocalLoss gốc trả
+    ``loss.mean(1).sum()`` → không thể thay ``self.bce`` được).
 
     Args:
         gamma: focusing parameter — tăng γ → dồn học vào hard examples.
         alpha: balancing parameter — 0 tắt (dùng α cân giữa fg/bg như paper).
     """
 
-    def __init__(self, gamma=1.5, alpha=0.25):
-        super().__init__()
-        self.gamma = float(gamma)
-        self.alpha = float(alpha)
-
     def forward(self, pred, label):
+        """Compute focal BCE loss, trả element-wise (cùng shape với BCE reduction='none')."""
+
         loss = F.binary_cross_entropy_with_logits(pred, label, reduction="none")
         pred_prob = pred.sigmoid()
         p_t = label * pred_prob + (1.0 - label) * (1.0 - pred_prob)
         loss = loss * (1.0 - p_t).pow(self.gamma)
-        if self.alpha > 0:
+        if (self.alpha > 0).any():
+            self.alpha = self.alpha.to(device=pred.device, dtype=pred.dtype)
             alpha_factor = label * self.alpha + (1.0 - label) * (1.0 - self.alpha)
             loss = loss * alpha_factor
         return loss  # (bs, num_anchors, nc) — cùng shape với BCE(reduction='none')

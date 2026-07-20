@@ -15,7 +15,7 @@ from pathlib import Path
 
 from config import Config
 from dataset import prepare_dataset
-from evaluate import RANKING_FILE, print_detection_metrics, run_strategy_evaluation
+from evaluate import RANKING_FILE, export_multi_seed_summary, print_detection_metrics, run_strategy_evaluation
 from losses import install_cls_loss
 
 
@@ -61,8 +61,7 @@ class TopKCheckpointManager:
 def build_train_args(data_yaml):
     """
     Map Config → kwargs của model.train().
-    Group hyperparam theo tuning guide của Ultralytics
-    (https://docs.ultralytics.com/guides/hyperparameter-tuning).
+    Chỉ truyền các tham số override, còn lại để mặc định của Ultralytics.
     EXTRA_TRAIN_ARGS được update SAU CÙNG nên có thể ghi đè mọi key chuẩn.
     """
     train_args = {
@@ -81,67 +80,26 @@ def build_train_args(data_yaml):
         "project": Config.PROJECT,
         "exist_ok": bool(Config.EXIST_OK),
 
-        # ---- Optimizer & LR schedule ----
+        # ---- Optimizer & LR schedule (Overridden) ----
         "optimizer": Config.OPTIMIZER,
         "lr0": float(Config.LR0),
         "lrf": float(Config.LRF),
-        "momentum": float(Config.MOMENTUM),
-        "weight_decay": float(Config.WEIGHT_DECAY),
         "warmup_epochs": float(Config.WARMUP_EPOCHS),
-        "warmup_momentum": float(Config.WARMUP_MOMENTUM),
-        "warmup_bias_lr": float(Config.WARMUP_BIAS_LR),
         "cos_lr": bool(Config.COS_LR),
 
-        # ---- Loss gains + regularization ----
-        "box": float(Config.BOX_GAIN),
-        "cls": float(Config.CLS_GAIN),
-        "dfl": float(Config.DFL_GAIN),
-        "dropout": float(Config.DROPOUT),
-        "nbs": int(Config.NBS),
-        "close_mosaic": int(Config.CLOSE_MOSAIC),
-
-        # ---- Augmentation ----
-        "hsv_h": float(Config.HSV_H),
-        "hsv_s": float(Config.HSV_S),
-        "hsv_v": float(Config.HSV_V),
-        "degrees": float(Config.DEGREES),
-        "translate": float(Config.TRANSLATE),
-        "scale": float(Config.SCALE),
-        "shear": float(Config.SHEAR),
-        "perspective": float(Config.PERSPECTIVE),
-        "flipud": float(Config.FLIPUD),
-        "fliplr": float(Config.FLIPLR),
-        "bgr": float(Config.BGR),
-        "mosaic": float(Config.MOSAIC),
+        # ---- Augmentation (Overridden) ----
         "mixup": float(Config.MIXUP),
-        "cutmix": float(Config.CUTMIX),
         "copy_paste": float(Config.COPY_PASTE),
-        "auto_augment": Config.AUTO_AUGMENT,
-        "erasing": float(Config.ERASING),
-
-        # ---- Precision & runtime ----
-        "amp": bool(Config.AMP),
-        "multi_scale": float(Config.MULTI_SCALE),
-        "rect": bool(Config.RECT),
-        "single_cls": bool(Config.SINGLE_CLS),
     }
-
-    # label_smoothing: Ultralytics 8.4+ có thể đã bỏ key này — chỉ truyền nếu
-    # còn hỗ trợ để không vỡ khi bản mới hơn strip đi
-    if float(Config.LABEL_SMOOTHING) > 0:
-        from ultralytics.cfg import DEFAULT_CFG_DICT
-        if "label_smoothing" in DEFAULT_CFG_DICT:
-            train_args["label_smoothing"] = float(Config.LABEL_SMOOTHING)
-
-    if Config.FREEZE is not None:
-        train_args["freeze"] = Config.FREEZE
 
     if Config.USE_STRATEGY2:
         # Lưu ckpt mỗi epoch để có nguồn chọn Top-K; TopKCheckpointManager
         # prune ngay nên disk không phình theo số epoch
         train_args["save_period"] = 1
+    else:
+        # Không dùng Strategy 2 → không cần lưu checkpoint
+        train_args["save"] = False
 
-    # DEVICE=None → để Ultralytics tự chọn, không truyền key
     if Config.DEVICE is not None:
         train_args["device"] = Config.DEVICE
     if Config.NAME:
@@ -150,67 +108,136 @@ def build_train_args(data_yaml):
     return train_args
 
 
+def print_multi_seed_summary(all_runs_results):
+    """In bảng tổng hợp kết quả của nhiều seeds chạy thử nghiệm độc lập."""
+    from evaluate import extract_overall_metrics
+
+    print("\n" + "=" * 80)
+    print(" MULTI-SEED RUNS SUMMARY")
+    print("=" * 80)
+    
+    # Gom metrics của các seed để hiển thị
+    strategies = list(all_runs_results[0]["strategy_results"].keys())
+    
+    header = f"  {'Seed':<6} |"
+    for strat in strategies:
+        header += f" {strat:<18} (mAP50 / mAP50-95) |"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+
+    for run in all_runs_results:
+        seed = run["seed"]
+        row_str = f"  {seed:<6} |"
+        for strat in strategies:
+            metrics = run["strategy_results"].get(strat)
+            if metrics is not None:
+                m = extract_overall_metrics(metrics)
+                row_str += f" {m['mAP@0.5']:>6.4f} / {m['mAP@0.5:0.95']:>10.4f}      |"
+            else:
+                row_str += f" {'N/A':<18} |"
+        print(row_str)
+
+    print("=" * 80)
+
+
 def train_detector():
     """
     Pipeline train hoàn chỉnh:
-    1. Chuẩn bị data (tách val' độc lập từ train nếu VAL_RATIO > 0)
-    2. model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
-    3. In metrics val cuối trên best.pt
-    4. Strategy evaluation (Strategy 1 vs Strategy 2 Top-K) trên EVAL_SPLIT
-       + export Excel 2 sheet
-    5. (Optional) export model cho Edge AI
-
-    Returns:
-        dict đường dẫn các artifact chính của run.
+    1. Chuẩn bị data (tách val' độc lập từ train theo VAL_RATIO, hỗ trợ seed dạng list/int)
+    2. Loop qua tất cả các seed được cấu hình trong Config.RANDOM_SEED
+    3. Huấn luyện model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
+    4. Báo cáo đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split test
+    5. Xuất Excel và Edge AI export nếu được bật
+    6. In bảng tổng kết đa seed
     """
     # Import trễ để validate config / --help không cần ultralytics
     from ultralytics import YOLO
+
+    # Lưu cấu hình gốc
+    orig_seeds = Config.RANDOM_SEED
+    orig_name = Config.NAME or "train"
+
+    # Chuẩn hóa seeds thành list
+    if isinstance(orig_seeds, (list, tuple)):
+        seeds = [int(s) for s in orig_seeds]
+    else:
+        seeds = [int(orig_seeds)]
 
     print("\n" + "=" * 70)
     print(" STRATEGY 2 - OBJECT DETECTION TRAINING (Ultralytics YOLO)")
     print("=" * 70)
     print(f"  Model: {Config.MODEL}")
     print(f"  Data : {Config.DATA} (VOC.yaml built-in sẽ tự download lần đầu)")
+    print(f"  Seeds: {seeds}")
+    print("=" * 70)
 
-    # Step 1: data với val' độc lập (điều kiện tiên quyết của Strategy 2)
-    data_yaml = prepare_dataset()
+    all_runs_results = []
 
-    # Step 2: train
-    model = YOLO(Config.MODEL)
-    # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce' — hook init_criterion
-    # để criterion tạo lazily lúc gọi model.loss() dùng FocalBCE. Phải chạy
-    # TRƯỚC model.train() vì trainer sẽ deep-copy model.
-    install_cls_loss(model)
-    if Config.USE_STRATEGY2:
-        manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
-        model.add_callback("on_model_save", manager.on_model_save)
-        print(f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} checkpoint theo fitness val'")
+    for idx, seed in enumerate(seeds):
+        print(f"\n>>>> [Seed {idx+1}/{len(seeds)}] Bắt đầu train với RANDOM_SEED = {seed} <<<<")
+        
+        # Ghi đè seed và name động cho run này
+        Config.RANDOM_SEED = seed
+        Config.NAME = f"{orig_name}_seed{seed}"
 
-    # model.train() trả về DetMetrics của lượt val CUỐI trên best.pt (split val')
-    metrics = model.train(**build_train_args(data_yaml))
+        # Step 1: data với val' độc lập (tách tương ứng theo seed hiện tại)
+        data_yaml = prepare_dataset()
 
-    run_dir = Path(model.trainer.save_dir)
-    best_weights = run_dir / "weights" / "best.pt"
-    print(f"\n  ✓ Training completed. Run dir: {run_dir}")
-    print(f"  ✓ Best weights: {best_weights}")
+        # Step 2: train
+        model = YOLO(Config.MODEL)
+        # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'
+        install_cls_loss(model)
+        
+        if Config.USE_STRATEGY2:
+            manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
+            model.add_callback("on_model_save", manager.on_model_save)
+            print(f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} checkpoint theo fitness val'")
 
-    # Step 3: metrics trên val' (holdout) — KHÔNG phải số liệu báo cáo cuối
-    if metrics is not None:
-        print_detection_metrics(metrics, header="FINAL VALIDATION on val' (best.pt)")
+        # model.train() trả về DetMetrics của lượt val CUỐI trên best.pt (split val')
+        metrics = model.train(**build_train_args(data_yaml))
 
-    # Step 4: báo cáo cuối trên EVAL_SPLIT (mặc định test = VOC2007 test)
-    # gồm Strategy 1 (best.pt) và Strategy 2 (Top-K average) + Excel
-    strategy_results = run_strategy_evaluation(run_dir, data=data_yaml)
+        run_dir = Path(model.trainer.save_dir)
+        best_weights = run_dir / "weights" / "best.pt"
+        print(f"\n  ✓ Training completed for seed {seed}. Run dir: {run_dir}")
+        print(f"  ✓ Best weights: {best_weights}")
 
-    # Step 5: Edge AI hook (tắt mặc định)
-    exported_model = export_model(best_weights) if Config.EXPORT_ENABLED else None
+        # Step 3: metrics trên val' (holdout) — KHÔNG phải số liệu báo cáo cuối
+        val_metrics = {}
+        if metrics is not None:
+            print_detection_metrics(metrics, header=f"FINAL VALIDATION on val' (best.pt) | Seed {seed}")
+            from evaluate import extract_overall_metrics
+            val_metrics = extract_overall_metrics(metrics)
 
-    return {
-        "run_dir": str(run_dir),
-        "best_weights": str(best_weights),
-        "strategies": list(strategy_results),
-        "exported_model": exported_model,
-    }
+        # Step 4: báo cáo cuối trên EVAL_SPLIT (mặc định test = VOC2007 test)
+        # gồm Strategy 1 (best.pt) và Strategy 2 (Top-K average) + Excel
+        strategy_results = run_strategy_evaluation(run_dir, data=data_yaml, seed=seed)
+
+        # Step 5: Edge AI hook (tắt mặc định)
+        exported_model = export_model(best_weights) if Config.EXPORT_ENABLED else None
+
+        all_runs_results.append({
+            "seed": seed,
+            "run_dir": str(run_dir),
+            "best_weights": str(best_weights),
+            "val_metrics": val_metrics,
+            "strategy_results": strategy_results,
+            "exported_model": exported_model,
+        })
+
+    # Khôi phục cấu hình gốc
+    Config.RANDOM_SEED = orig_seeds
+    Config.NAME = orig_name if orig_name != "train" else None
+
+    # In bảng tổng kết nếu chạy nhiều seed
+    if len(seeds) > 1:
+        print_multi_seed_summary(all_runs_results)
+
+    # Export file tổng hợp tất cả seeds vào <PROJECT>/multi_seed_summary.xlsx
+    # (chạy luôn dù chỉ 1 seed — dễ kiểm tra kết quả ngay)
+    export_multi_seed_summary(all_runs_results, Config.PROJECT)
+
+    return all_runs_results
+
 
 
 def export_model(weights):
