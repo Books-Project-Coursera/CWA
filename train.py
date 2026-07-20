@@ -11,6 +11,7 @@ quản lý trong run dir. Phần thêm vào cho Strategy 2:
   (+ best.pt/last.pt), không lưu tất cả epoch.
 """
 import json
+from datetime import datetime
 from pathlib import Path
 
 from config import Config
@@ -143,19 +144,21 @@ def print_multi_seed_summary(all_runs_results):
 def train_detector():
     """
     Pipeline train hoàn chỉnh:
-    1. Chuẩn bị data (tách val' độc lập từ train theo VAL_RATIO, hỗ trợ seed dạng list/int)
-    2. Loop qua tất cả các seed được cấu hình trong Config.RANDOM_SEED
-    3. Huấn luyện model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
-    4. Báo cáo đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split test
-    5. Xuất Excel và Edge AI export nếu được bật
-    6. In bảng tổng kết đa seed
+    1. Tạo thư mục experiment group duy nhất (timestamp + tên model) cho lần chạy này
+    2. Chuẩn bị data (tách val' độc lập từ train theo VAL_RATIO, hỗ trợ seed dạng list/int)
+    3. Loop qua tất cả các seed → mỗi seed = 1 subfolder riêng bên trong experiment group
+    4. Huấn luyện model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
+    5. Báo cáo đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split test
+    6. Xuất Excel và Edge AI export nếu được bật
+    7. Lưu snapshot config (experiment_config.json) + bảng tổng kết đa seed vào experiment group
     """
     # Import trễ để validate config / --help không cần ultralytics
     from ultralytics import YOLO
 
-    # Lưu cấu hình gốc
-    orig_seeds = Config.RANDOM_SEED
-    orig_name = Config.NAME or "train"
+    # ── Lưu cấu hình gốc ──────────────────────────────────────────────────────
+    orig_seeds   = Config.RANDOM_SEED
+    orig_project = Config.PROJECT          # thư mục root gốc (results/detection)
+    orig_name    = Config.NAME             # None hoặc custom name người dùng đặt
 
     # Chuẩn hóa seeds thành list
     if isinstance(orig_seeds, (list, tuple)):
@@ -163,22 +166,66 @@ def train_detector():
     else:
         seeds = [int(orig_seeds)]
 
+    # ── Tạo thư mục experiment group (DUY NHẤT cho lần bấm chạy này) ──────────
+    # Định dạng: exp_YYYYMMDD_HHMMSS_<model_stem>
+    # Ví dụ:     exp_20260720_214200_yolov8s
+    # → Mọi seed của thí nghiệm này được gom vào đây, không bao giờ trùng với
+    #   lần chạy khác dù dùng cùng model / cùng seed.
+    model_stem = Path(str(Config.MODEL)).stem          # "yolov8s" từ "yolov8s.pt"
+    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name  = orig_name if orig_name else "exp"     # tôn trọng --name nếu người dùng đặt
+    exp_group  = f"{base_name}_{timestamp}_{model_stem}"
+    exp_dir    = Path(orig_project) / exp_group
+    exp_dir.mkdir(parents=True, exist_ok=True)
+
+    # Redirect PROJECT → bên trong experiment group;
+    # mỗi seed sẽ tạo subfolder seed_<N> trong đây
+    Config.PROJECT = str(exp_dir)
+
     print("\n" + "=" * 70)
     print(" STRATEGY 2 - OBJECT DETECTION TRAINING (Ultralytics YOLO)")
     print("=" * 70)
-    print(f"  Model: {Config.MODEL}")
-    print(f"  Data : {Config.DATA} (VOC.yaml built-in sẽ tự download lần đầu)")
-    print(f"  Seeds: {seeds}")
+    print(f"  Model      : {Config.MODEL}")
+    print(f"  Data       : {Config.DATA} (VOC.yaml built-in sẽ tự download lần đầu)")
+    print(f"  Seeds      : {seeds}")
+    print(f"  Experiment : {exp_dir}")
     print("=" * 70)
+
+    # ── Lưu snapshot config tại thời điểm chạy ────────────────────────────────
+    config_snapshot = {
+        "experiment_group" : exp_group,
+        "timestamp"        : timestamp,
+        "model"            : Config.MODEL,
+        "data"             : Config.DATA,
+        "val_ratio"        : Config.VAL_RATIO,
+        "epochs"           : Config.EPOCHS,
+        "imgsz"            : Config.IMGSZ,
+        "batch"            : Config.BATCH,
+        "seeds"            : seeds,
+        "optimizer"        : Config.OPTIMIZER,
+        "lr0"              : Config.LR0,
+        "lrf"              : Config.LRF,
+        "warmup_epochs"    : Config.WARMUP_EPOCHS,
+        "cos_lr"           : Config.COS_LR,
+        "loss_function"    : Config.LOSS_FUNCTION,
+        "focal_gamma"      : Config.FOCAL_GAMMA,
+        "focal_alpha"      : Config.FOCAL_ALPHA,
+        "use_strategy2"    : Config.USE_STRATEGY2,
+        "top_k_values"     : Config.TOP_K_VALUES,
+        "eval_split"       : Config.EVAL_SPLIT,
+    }
+    config_path = exp_dir / "experiment_config.json"
+    config_path.write_text(json.dumps(config_snapshot, indent=2, ensure_ascii=False))
+    print(f"  ✓ Config snapshot saved → {config_path.name}")
 
     all_runs_results = []
 
     for idx, seed in enumerate(seeds):
         print(f"\n>>>> [Seed {idx+1}/{len(seeds)}] Bắt đầu train với RANDOM_SEED = {seed} <<<<")
-        
-        # Ghi đè seed và name động cho run này
+
+        # Ghi đè seed, đặt tên subfolder = seed_<N>
         Config.RANDOM_SEED = seed
-        Config.NAME = f"{orig_name}_seed{seed}"
+        Config.NAME        = f"seed_{seed}"
 
         # Step 1: data với val' độc lập (tách tương ứng theo seed hiện tại)
         data_yaml = prepare_dataset()
@@ -187,7 +234,7 @@ def train_detector():
         model = YOLO(Config.MODEL)
         # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'
         install_cls_loss(model)
-        
+
         if Config.USE_STRATEGY2:
             manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
             model.add_callback("on_model_save", manager.on_model_save)
@@ -196,7 +243,7 @@ def train_detector():
         # model.train() trả về DetMetrics của lượt val CUỐI trên best.pt (split val')
         metrics = model.train(**build_train_args(data_yaml))
 
-        run_dir = Path(model.trainer.save_dir)
+        run_dir      = Path(model.trainer.save_dir)
         best_weights = run_dir / "weights" / "best.pt"
         print(f"\n  ✓ Training completed for seed {seed}. Run dir: {run_dir}")
         print(f"  ✓ Best weights: {best_weights}")
@@ -216,25 +263,31 @@ def train_detector():
         exported_model = export_model(best_weights) if Config.EXPORT_ENABLED else None
 
         all_runs_results.append({
-            "seed": seed,
-            "run_dir": str(run_dir),
-            "best_weights": str(best_weights),
-            "val_metrics": val_metrics,
+            "seed"           : seed,
+            "run_dir"        : str(run_dir),
+            "best_weights"   : str(best_weights),
+            "val_metrics"    : val_metrics,
             "strategy_results": strategy_results,
-            "exported_model": exported_model,
+            "exported_model" : exported_model,
         })
 
-    # Khôi phục cấu hình gốc
+    # ── Khôi phục cấu hình gốc ────────────────────────────────────────────────
     Config.RANDOM_SEED = orig_seeds
-    Config.NAME = orig_name if orig_name != "train" else None
+    Config.PROJECT     = orig_project
+    Config.NAME        = orig_name
 
     # In bảng tổng kết nếu chạy nhiều seed
     if len(seeds) > 1:
         print_multi_seed_summary(all_runs_results)
 
-    # Export file tổng hợp tất cả seeds vào <PROJECT>/multi_seed_summary.xlsx
-    # (chạy luôn dù chỉ 1 seed — dễ kiểm tra kết quả ngay)
-    export_multi_seed_summary(all_runs_results, Config.PROJECT)
+    # Export multi-seed summary vào THƯ MỤC EXPERIMENT GROUP (không phải project root)
+    # → mỗi lần bấm chạy sẽ có 1 file tổng hợp riêng, không bị ghi đè
+    export_multi_seed_summary(all_runs_results, str(exp_dir))
+
+    print("\n" + "=" * 70)
+    print(f"  ✓ EXPERIMENT COMPLETE")
+    print(f"  ✓ All results saved to: {exp_dir}")
+    print("=" * 70)
 
     return all_runs_results
 
