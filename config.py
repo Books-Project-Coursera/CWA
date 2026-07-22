@@ -47,7 +47,7 @@ class Config:
     DETERMINISTIC = True  # Ultralytics đặt torch.deterministic + seed reproducible
 
     # ===================== Optimizer & LR Schedule (Overridden Only) =====================
-    OPTIMIZER = "auto"  # Bộ tối ưu (auto, SGD, Adam, AdamW, RMSprop, ...)
+    OPTIMIZER = "SGD"  # Bộ tối ưu (auto, SGD, Adam, AdamW, RMSprop, ...)
     LR0 = 5e-3       # LR ban đầu (mặc định Ultralytics là 0.01)
     LRF = 0.01        # Hệ số LR cuối cùng (final learning rate factor = lr0 * lrf)
     WARMUP_EPOCHS = 5  # Số epoch warmup (mặc định Ultralytics là 3.0)
