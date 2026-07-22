@@ -7,8 +7,11 @@ quản lý trong run dir. Phần thêm vào cho Strategy 2:
 
 - save_period=1 để Ultralytics lưu checkpoint mỗi epoch, NHƯNG
 - TopKCheckpointManager (callback on_model_save) prune NGAY checkpoint ngoài
-  Top-K theo fitness trên val' → disk chỉ giữ đúng K checkpoint cần thiết
+  Top-K theo VAL_LOSS trên val' → disk chỉ giữ đúng K checkpoint cần thiết
   (+ best.pt/last.pt), không lưu tất cả epoch.
+  
+NOTE: Dùng val_loss (thay vì fitness) để ranking checkpoint, giống như early
+stopping của Ultralytics cũng dựa trên val_loss.
 """
 import json
 from datetime import datetime
@@ -23,33 +26,53 @@ from losses import install_cls_loss
 class TopKCheckpointManager:
     """
     Callback 'on_model_save' của Ultralytics: sau mỗi lần trainer lưu
-    checkpoint epoch (save_period=1), ghi nhận fitness trên val' của epoch đó
-    và xóa ngay checkpoint tệ nhất nếu vượt quá KEEP_TOP_K_CHECKPOINTS.
+    checkpoint epoch (save_period=1), ghi nhận val_loss trên val' của epoch đó
+    và xóa ngay checkpoint tệ nhất (val_loss cao) nếu vượt quá KEEP_TOP_K_CHECKPOINTS.
 
     Ranking được ghi ra <run_dir>/weights/strategy2_checkpoints.json để
     evaluate.rank_checkpoints() dùng lại khi average Top-K (Strategy 2).
     Không đụng tới best.pt / last.pt của Ultralytics.
+    
+    NOTE: Dùng val_loss (nhỏ = tốt) thay vì fitness (cao = tốt), giống early
+    stopping của Ultralytics.
     """
 
     def __init__(self, keep_top_k):
         self.keep_top_k = int(keep_top_k)
-        self.records = {}  # filename -> {"epoch": int, "fitness": float}
+        self.records = {}  # filename -> {"epoch": int, "val_loss": float}
 
     def on_model_save(self, trainer):
         weights_dir = Path(trainer.save_dir) / "weights"
-        # trainer.fitness = fitness epoch hiện tại trên val' (set trong validate())
-        fitness = float(trainer.fitness) if trainer.fitness is not None else float("-inf")
+        
+        # Lấy val_loss từ results.csv (được Ultralytics update mỗi epoch)
+        results_csv = Path(trainer.save_dir) / "results.csv"
+        val_loss = float("inf")  # Default = infinity nếu không tìm thấy
+        
+        if results_csv.exists():
+            try:
+                import csv
+                with open(results_csv, 'r') as f:
+                    reader = list(csv.DictReader(f))
+                    if reader:
+                        last_row = reader[-1]  # Dòng cuối = epoch hiện tại
+                        # Ultralytics ghi cột "val/loss" hoặc tương tự
+                        if "val/loss" in last_row:
+                            val_loss = float(last_row["val/loss"])
+                        elif "val_loss" in last_row:
+                            val_loss = float(last_row["val_loss"])
+            except Exception as e:
+                print(f"    ⚠ Lỗi khi đọc val_loss từ results.csv: {e}")
 
         # Checkpoint epoch mới xuất hiện (epoch*.pt chưa ghi nhận) thuộc epoch này
         for ckpt in weights_dir.glob("epoch*.pt"):
             if ckpt.name not in self.records:
-                self.records[ckpt.name] = {"epoch": int(trainer.epoch), "fitness": fitness}
+                self.records[ckpt.name] = {"epoch": int(trainer.epoch), "val_loss": val_loss}
 
-        # Prune: chỉ giữ Top-K theo fitness (tie-break: giữ epoch mới hơn)
+        # Prune: chỉ giữ Top-K theo val_loss (nhỏ nhất = tốt nhất; tie-break: giữ epoch mới hơn)
         while len(self.records) > self.keep_top_k:
-            worst = min(
+            worst = max(
                 self.records,
-                key=lambda name: (self.records[name]["fitness"], self.records[name]["epoch"]),
+                key=lambda name: (self.records[name]["val_loss"], -self.records[name]["epoch"]),
             )
             worst_path = weights_dir / worst
             if worst_path.exists():
@@ -238,7 +261,7 @@ def train_detector():
         if Config.USE_STRATEGY2:
             manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
             model.add_callback("on_model_save", manager.on_model_save)
-            print(f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} checkpoint theo fitness val'")
+            print(f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} checkpoint theo val_loss nhỏ nhất")
 
         # model.train() trả về DetMetrics của lượt val CUỐI trên best.pt (split val')
         metrics = model.train(**build_train_args(data_yaml))

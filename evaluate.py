@@ -184,14 +184,14 @@ def evaluate_weights(weights, data, split=None, header=None):
 
 def rank_checkpoints(run_dir):
     """
-    Rank các checkpoint epoch còn trên disk theo fitness trên val' (giảm dần).
+    Rank các checkpoint epoch còn trên disk theo val_loss trên val' (tăng dần).
+    Checkpoint có val_loss nhỏ nhất = tốt nhất, giống early stopping của Ultralytics.
 
     Nguồn chính: strategy2_checkpoints.json (TopKCheckpointManager ghi lúc train).
-    Fallback: tự tính fitness = 0.1*mAP50 + 0.9*mAP50-95 từ results.csv
-    (khi run dir được copy từ máy khác mà thiếu file json).
+    Fallback: đọc val/loss từ results.csv (khi run dir được copy từ máy khác mà thiếu file json).
 
     Returns:
-        list[(Path, fitness, epoch)] sorted theo fitness giảm dần.
+        list[(Path, val_loss, epoch)] sorted theo val_loss tăng dần (nhỏ nhất đứng đầu).
     """
     weights_dir = Path(run_dir) / "weights"
     ranking_path = weights_dir / RANKING_FILE
@@ -202,29 +202,39 @@ def rank_checkpoints(run_dir):
         for fname, info in data.items():
             path = weights_dir / fname
             if path.exists():
-                records.append((path, float(info["fitness"]), int(info["epoch"])))
+                records.append((path, float(info["val_loss"]), int(info["epoch"])))
     else:
         try:
             df = read_results_csv(run_dir)
         except FileNotFoundError:
             return []
-        fitness_by_epoch = {}
-        if "metrics/mAP50(B)" in df.columns and "metrics/mAP50-95(B)" in df.columns:
+        val_loss_by_epoch = {}
+        # Ultralytics lưu val loss dưới cột "val/loss" hoặc tương tự
+        val_loss_col = None
+        for col in df.columns:
+            if "val" in col.lower() and "loss" in col.lower():
+                val_loss_col = col
+                break
+        
+        if val_loss_col:
             for _, row in df.iterrows():
-                fitness_by_epoch[int(row["epoch"])] = (
-                    0.1 * float(row["metrics/mAP50(B)"]) + 0.9 * float(row["metrics/mAP50-95(B)"])
-                )
+                try:
+                    val_loss_by_epoch[int(row["epoch"])] = float(row[val_loss_col])
+                except (ValueError, KeyError):
+                    pass
+        
         for path in weights_dir.glob("epoch*.pt"):
             digits = re.sub(r"\D", "", path.stem)
             if not digits:
                 continue
             file_epoch = int(digits)
             # Tên file epoch{N}.pt đánh số 0-based, cột epoch results.csv 1-based
-            fitness = fitness_by_epoch.get(file_epoch + 1, fitness_by_epoch.get(file_epoch))
-            if fitness is not None:
-                records.append((path, float(fitness), file_epoch))
+            val_loss = val_loss_by_epoch.get(file_epoch + 1, val_loss_by_epoch.get(file_epoch))
+            if val_loss is not None:
+                records.append((path, float(val_loss), file_epoch))
 
-    records.sort(key=lambda r: (-r[1], -r[2]))
+    # Sort theo val_loss TĂNG DẦN (nhỏ nhất = tốt nhất)
+    records.sort(key=lambda r: (r[1], -r[2]))
     return records
 
 
@@ -238,7 +248,7 @@ def average_checkpoints(ckpt_paths, output_path):
     - KHÔNG average BN running statistics (`running_mean`, `running_var`,
       `num_batches_tracked`) — đây là population stats, không phải learned;
       average chúng làm BN lệch phân phối → giữ nguyên từ checkpoint ĐẦU (đã
-      được sort là ckpt có fitness cao nhất).
+      được sort là ckpt có val_loss nhỏ nhất, do đó tốt nhất).
     - Sau khi average, BN stats KHÔNG khớp với weights mới → phải chạy
       update_bn_stats() để re-estimate trên train (xem hàm bên dưới).
 

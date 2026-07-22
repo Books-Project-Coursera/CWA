@@ -66,9 +66,9 @@ class Config:
     COPY_PASTE = 0.1       # copy-paste hữu ích cho segmentation (đặc biệt parts)
 
     # ===================== Strategy Configuration =====================
-    # Strategy 1: best.pt — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn)
-    # Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
-    #             (giống nhánh Strategy2_TinyImageNet; fitness = 0.1*mAP50 + 0.9*mAP50-95)
+    # Strategy 1: best.pt — checkpoint có val_loss nhỏ nhất trên val' (Ultralytics tự chọn)
+    # Strategy 2: average weights của Top-K checkpoint tốt nhất (val_loss nhỏ nhất) trên val'
+    #             (giống nhánh Strategy2_TinyImageNet; ranking dựa trên val_loss, giống early stopping)
     USE_STRATEGY2 = True
     TOP_K_VALUES = [2, 3, 4, 5]
     # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
