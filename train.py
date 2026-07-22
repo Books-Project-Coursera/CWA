@@ -1,5 +1,5 @@
 """
-Train Ultralytics YOLO cho object detection (Pascal VOC).
+Train Ultralytics YOLO cho instance segmentation (Carparts).
 
 Toàn bộ training loop giao cho Ultralytics (model.train): LR schedule,
 augmentation, early stopping, best.pt/last.pt, results.csv đều do Ultralytics
@@ -143,9 +143,9 @@ def print_multi_seed_summary(all_runs_results):
 
 def train_detector():
     """
-    Pipeline train hoàn chỉnh:
+    Pipeline train hoàn chỉnh cho instance segmentation:
     1. Tạo thư mục experiment group duy nhất (timestamp + tên model) cho lần chạy này
-    2. Chuẩn bị data (tách val' độc lập từ train theo VAL_RATIO, hỗ trợ seed dạng list/int)
+    2. Chuẩn bị data (tách val' nếu cần theo VAL_RATIO, hỗ trợ seed dạng list/int)
     3. Loop qua tất cả các seed → mỗi seed = 1 subfolder riêng bên trong experiment group
     4. Huấn luyện model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
     5. Báo cáo đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split test
@@ -183,10 +183,10 @@ def train_detector():
     Config.PROJECT = str(exp_dir)
 
     print("\n" + "=" * 70)
-    print(" STRATEGY 2 - OBJECT DETECTION TRAINING (Ultralytics YOLO)")
+    print(" STRATEGY 2 - INSTANCE SEGMENTATION TRAINING (Ultralytics YOLO-seg)")
     print("=" * 70)
     print(f"  Model      : {Config.MODEL}")
-    print(f"  Data       : {Config.DATA} (VOC.yaml built-in sẽ tự download lần đầu)")
+    print(f"  Data       : {Config.DATA}")
     print(f"  Seeds      : {seeds}")
     print(f"  Experiment : {exp_dir}")
     print("=" * 70)

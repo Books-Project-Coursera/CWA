@@ -1,19 +1,16 @@
 """
-Chuẩn bị dataset VOC với VALIDATION SET ĐỘC LẬP tách từ train.
+Chuẩn bị dataset cho Instance Segmentation với VALIDATION SET ĐỘC LẬP.
 
-Vấn đề: VOC.yaml gốc của Ultralytics có val ≡ test (cùng là VOC2007 test,
-4952 ảnh) → không có val độc lập, không dùng được Strategy 2 đúng nghĩa
-(chọn/average checkpoint trên val rồi báo cáo trên test).
+Với dataset custom (ví dụ Carparts-seg) đã có val độc lập:
+  - set Config.VAL_RATIO = 0 để dùng nguyên data.yaml của bạn
+  - Pipeline sẽ không tách gì, chỉ return data.yaml như là
+  
+Với dataset như VOC (val ≡ test):
+  - set Config.VAL_RATIO > 0 để tách val' từ train làm validation riêng
+  - Tương tự detection, holdout split được lưu để idempotent
 
-Giải pháp: sau khi Ultralytics tải/định vị VOC (check_det_dataset), tách
-VAL_RATIO ảnh từ pool train (trainval 2007+2012, 16551 ảnh) làm val' riêng:
-  - Ghi 2 file list ảnh: holdout_train_*.txt / holdout_val_*.txt tại dataset
-    root (Ultralytics hỗ trợ split dạng txt list, label tự suy từ images→labels)
-  - Sinh data yaml mới: train=train', val=val', test=VOC2007 test (giữ nguyên)
-  - Idempotent theo (seed, ratio): chạy lại không tách lại, dùng file có sẵn
-
-Với data custom đã có val độc lập: set Config.VAL_RATIO = 0 để dùng nguyên
-data.yaml của bạn (pipeline sẽ không tách gì cả).
+Module này hỗ trợ cả detection (VOC) và segmentation (Carparts).
+Tự động detect task type từ dataset structure.
 """
 import os
 import random
@@ -115,9 +112,11 @@ def _write_holdout_split(root, train_images, test_entry, names, val_ratio, seed)
 def prepare_dataset():
     """
     Trả về path data yaml dùng cho train/eval:
-    - VAL_RATIO > 0: tải/định vị dataset qua Ultralytics rồi sinh holdout yaml
+    - VAL_RATIO > 0: tải/định vị dataset rồi sinh holdout yaml
       (val' độc lập tách từ train, test giữ nguyên).
-    - VAL_RATIO = 0: trả nguyên Config.DATA (cảnh báo nếu là VOC.yaml gốc).
+    - VAL_RATIO = 0: trả nguyên Config.DATA (nếu dataset đã có val độc lập).
+    
+    Auto-detect task type (detection/segmentation) từ dataset structure.
     """
     if not Config.VAL_RATIO:
         if str(Config.DATA).endswith("VOC.yaml"):
@@ -125,20 +124,27 @@ def prepare_dataset():
                 "⚠ WARNING: VAL_RATIO=0 với VOC.yaml gốc → val ≡ test (VOC2007). "
                 "Metrics 'val' trong lúc train đo trên chính tập test!"
             )
+        else:
+            print(f"✓ VAL_RATIO=0: dùng nguyên {Config.DATA} (dataset đã có val độc lập)")
         return Config.DATA
 
-    # check_det_dataset: resolve + TỰ DOWNLOAD dataset nếu chưa có (VOC ~2.8GB)
+    # Auto-detect task type từ model config
     from ultralytics.data.utils import check_det_dataset
-
+    
     print(f"\n[Dataset] Chuẩn bị {Config.DATA} với val holdout {Config.VAL_RATIO:.0%} từ train...")
-    data = check_det_dataset(str(Config.DATA))
+    try:
+        data = check_det_dataset(str(Config.DATA))
+    except Exception as e:
+        print(f"  ⚠ Lỗi khi load detection dataset: {e}")
+        print(f"  → Trả lại Config.DATA như là")
+        return Config.DATA
+    
     root = Path(data["path"])
 
     train_images = _collect_images(data["train"])
     print(f"  Pool train gốc: {len(train_images)} ảnh")
 
-    # Giữ nguyên split test của data.yaml gốc (VOC: images/test2007).
-    # Nếu data.yaml không khai báo test → dùng val gốc làm test (và cảnh báo).
+    # Giữ nguyên split test của data.yaml gốc
     test_entry = data.get("test") or data.get("val")
     if not data.get("test"):
         print("  ⚠ data.yaml gốc không có split 'test' → dùng split 'val' gốc làm test")
@@ -155,7 +161,7 @@ def prepare_dataset():
             test_entry=test_entry,
             names=data["names"],
             val_ratio=float(Config.VAL_RATIO),
-            seed=int(Config.RANDOM_SEED),
+            seed=int(Config.RANDOM_SEED) if isinstance(Config.RANDOM_SEED, int) else int(Config.RANDOM_SEED[0]),
         )
     )
 

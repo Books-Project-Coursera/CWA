@@ -1,11 +1,11 @@
 """
-Evaluation cho Strategy 2 - Object Detection (Ultralytics YOLO + Pascal VOC).
+Evaluation cho Strategy 2 - Instance Segmentation (Ultralytics YOLO + Carparts).
 
-- Metrics đọc TRỰC TIẾP từ DetMetrics của Ultralytics (results.box.*:
-  map50, map, mp, mr, per-class AP, fitness) — không tự tính lại mAP.
+- Metrics đọc TRỰC TIẾP từ SegmentationMetrics của Ultralytics (results.mask.*:
+  map50, map, mp, mr, per-class AP, fitness) — không tự tính lại mask AP.
 - Strategy 1: best.pt (checkpoint fitness cao nhất trên val', Ultralytics tự chọn).
 - Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
-  (giống average_weights của nhánh classification, áp dụng cho ckpt YOLO).
+  (giống average_weights của nhánh classification, áp dụng cho ckpt YOLO-seg).
 - Export Excel 2 sheet: "Summary" (run info + overall + per-class theo strategy)
   và "PerEpoch" (parse results.csv do Ultralytics tự sinh trong run dir).
 """
@@ -25,28 +25,46 @@ RANKING_FILE = "strategy2_checkpoints.json"
 
 INDEPENDENT_VAL_NOTE = (
     "Validation set (val') ĐỘC LẬP được tách từ train theo VAL_RATIO — chỉ dùng để "
-    "chọn best.pt / rank Top-K checkpoint. Test = VOC2007 test (4952 ảnh), giữ nguyên "
+    "chọn best.pt / rank Top-K checkpoint. Test set (hold-out), giữ nguyên "
     "làm hold-out, chỉ dùng cho báo cáo cuối."
 )
 VAL_TEST_WARNING = (
-    "VAL_RATIO=0: dùng nguyên data.yaml gốc. Với VOC.yaml của Ultralytics, split 'val' "
-    "và 'test' TRÙNG NHAU (đều là VOC2007 test) — không có val độc lập, checkpoint được "
-    "chọn trên chính tập test (nguy cơ leakage khi đọc số liệu)."
+    "VAL_RATIO=0: dùng nguyên data.yaml gốc. Nếu dataset không có val độc lập "
+    "(val ≡ test), checkpoint được chọn trên chính tập test (nguy cơ leakage)."
 )
 
 
-# ==================== Metrics extraction (từ DetMetrics) ====================
+# ==================== Metrics extraction (từ SegmentationMetrics / DetMetrics) ====================
 
 def extract_overall_metrics(metrics):
-    """Trả về dict metrics overall từ DetMetrics (metrics.box.*)."""
-    box = metrics.box
-    overall = {
-        "Precision": float(box.mp),
-        "Recall": float(box.mr),
-        "mAP@0.5": float(box.map50),
-        "mAP@0.75": float(box.map75),
-        "mAP@0.5:0.95": float(box.map),
-    }
+    """
+    Trả về dict metrics overall từ SegmentationMetrics hoặc DetMetrics.
+    - Segmentation: extract từ metrics.mask.*
+    - Detection: extract từ metrics.box.*
+    """
+    # Try segmentation metrics first
+    if hasattr(metrics, 'mask') and metrics.mask is not None:
+        mask = metrics.mask
+        overall = {
+            "Precision": float(mask.mp),
+            "Recall": float(mask.mr),
+            "mAP@0.5": float(mask.map50),
+            "mAP@0.75": float(mask.map75),
+            "mAP@0.5:0.95": float(mask.map),
+        }
+    # Fallback to detection metrics (box)
+    elif hasattr(metrics, 'box') and metrics.box is not None:
+        box = metrics.box
+        overall = {
+            "Precision": float(box.mp),
+            "Recall": float(box.mr),
+            "mAP@0.5": float(box.map50),
+            "mAP@0.75": float(box.map75),
+            "mAP@0.5:0.95": float(box.map),
+        }
+    else:
+        overall = {"Precision": 0, "Recall": 0, "mAP@0.5": 0, "mAP@0.75": 0, "mAP@0.5:0.95": 0}
+    
     # fitness = 0.1*mAP50 + 0.9*mAP50-95 (định nghĩa của Ultralytics)
     fitness = getattr(metrics, "fitness", None)
     if fitness is not None:
@@ -56,28 +74,49 @@ def extract_overall_metrics(metrics):
 
 def extract_per_class_metrics(metrics):
     """
-    List dict per-class (P, R, AP@0.5, AP@0.5:0.95) từ DetMetrics.
-    box.ap_class_index = các class-id thực sự xuất hiện trong tập eval;
-    box.class_result(i) trả (p, r, ap50, ap) cho phần tử thứ i.
+    List dict per-class (P, R, AP@0.5, AP@0.5:0.95) từ SegmentationMetrics hoặc DetMetrics.
+    - Segmentation: extract từ metrics.mask
+    - Detection: extract từ metrics.box
     """
-    box = metrics.box
-    names = getattr(metrics, "names", {}) or {}
-    rows = []
-    for i, class_idx in enumerate(getattr(box, "ap_class_index", [])):
-        class_idx = int(class_idx)
-        p, r, ap50, ap = box.class_result(i)
-        rows.append({
-            "Class ID": class_idx,
-            "Class": str(names.get(class_idx, class_idx)),
-            "Precision": float(p),
-            "Recall": float(r),
-            "AP@0.5": float(ap50),
-            "AP@0.5:0.95": float(ap),
-        })
-    return rows
+    # Try segmentation metrics first
+    if hasattr(metrics, 'mask') and metrics.mask is not None:
+        mask = metrics.mask
+        names = getattr(metrics, "names", {}) or {}
+        rows = []
+        for i, class_idx in enumerate(getattr(mask, "ap_class_index", [])):
+            class_idx = int(class_idx)
+            p, r, ap50, ap = mask.class_result(i)
+            rows.append({
+                "Class ID": class_idx,
+                "Class": str(names.get(class_idx, class_idx)),
+                "Precision": float(p),
+                "Recall": float(r),
+                "AP@0.5": float(ap50),
+                "AP@0.5:0.95": float(ap),
+            })
+        return rows
+    # Fallback to detection metrics (box)
+    elif hasattr(metrics, 'box') and metrics.box is not None:
+        box = metrics.box
+        names = getattr(metrics, "names", {}) or {}
+        rows = []
+        for i, class_idx in enumerate(getattr(box, "ap_class_index", [])):
+            class_idx = int(class_idx)
+            p, r, ap50, ap = box.class_result(i)
+            rows.append({
+                "Class ID": class_idx,
+                "Class": str(names.get(class_idx, class_idx)),
+                "Precision": float(p),
+                "Recall": float(r),
+                "AP@0.5": float(ap50),
+                "AP@0.5:0.95": float(ap),
+            })
+        return rows
+    else:
+        return []
 
 
-def print_detection_metrics(metrics, header="DETECTION EVALUATION RESULTS"):
+def print_detection_metrics(metrics, header="SEGMENTATION EVALUATION RESULTS"):
     """In metrics detection ra console (format banner giống repo gốc)."""
     overall = extract_overall_metrics(metrics)
     per_class = extract_per_class_metrics(metrics)
