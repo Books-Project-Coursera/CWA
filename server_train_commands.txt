@@ -1,0 +1,7 @@
+# Chạy file này từ thư mục Capstone_KD trên server:
+# bash server_train_commands.txt
+#
+# Đổi run01 thành tên mới cho mỗi lần chạy. Pipeline cố ý báo lỗi nếu tên
+# experiment đã tồn tại để không trộn kết quả của hai thí nghiệm.
+
+python main.py train --exp_name carparts_yolov8s_raw_topk_run01

@@ -20,17 +20,15 @@ class Config:
     MODEL = "yolov8s-seg.pt"  # <-- ĐẶT MODEL CỦA BẠN Ở ĐÂY, VD: "yolov8n-seg.pt"
 
     # ===================== Dataset Configuration =====================
-    # "carparts-seg.yaml" = Carparts Segmentation built-in của Ultralytics
+    # Dùng YAML được pin ngay trong project để không vô tình lấy YAML cũ
+    # đóng gói trong ultralytics==8.3.152.
     # TỰ ĐỘNG DOWNLOAD lần đầu (~133 MB)
     # (https://docs.ultralytics.com/datasets/segment/carparts-seg)
-    # Data đã tải sẵn / data custom: trỏ tới file data.yaml của bạn.
+    # Data custom: thay đường dẫn này bằng file data.yaml tương ứng.
     #
-    # ✓ carparts-seg.yaml: train (3156), val (401), test (276) ảnh
+    # ✓ Carparts hiện tại: train (3156), val (401), test (276) ảnh
     # ✓ Đã có validation set độc lập → không cần tách val' từ train
-    #
-    # Nếu dùng VOC cho detection: set VAL_RATIO > 0 để tách holdout val'
-    # Nếu dùng dataset custom đã có val độc lập: set VAL_RATIO = 0
-    DATA = "carparts-seg.yaml"
+    DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "carparts-seg.yaml")
     VAL_RATIO = 0  # Carparts đã có val độc lập → không cần tách
                    # = 0 → dùng nguyên data.yaml gốc (train, val, test rõ ràng)
 
@@ -54,21 +52,21 @@ class Config:
     COS_LR = True      # Dùng cosine learning rate decay (mặc định Ultralytics là False)
 
     # ===================== Loss Function =====================
-    # Focal loss là cải tiến cho detection classification loss (BCE).
-    # Instance segmentation dùng mask loss (không focal) → config này IGNORED.
-    # Giữ lại structure code để compatibility, nhưng không ảnh hưởng training.
-    LOSS_FUNCTION = "bce"  # Segmentation: không dùng focal loss
-    FOCAL_GAMMA = 1.5      # (Ignored for segmentation)
-    FOCAL_ALPHA = 0.25     # (Ignored for segmentation)
+    # Segmentation loss gồm box + mask + classification + DFL. Tùy chọn focal
+    # chỉ thay BCE ở nhánh classification; không thay mask loss.
+    LOSS_FUNCTION = "bce"
+    FOCAL_GAMMA = 1.5
+    FOCAL_ALPHA = 0.25
 
     # ===================== Augmentation (Overridden Only) =====================
     MIXUP = 0.0            # mixup không tương thích well với instance segmentation
     COPY_PASTE = 0.1       # copy-paste hữu ích cho segmentation (đặc biệt parts)
 
     # ===================== Strategy Configuration =====================
-    # Strategy 1: best.pt — checkpoint có val_loss nhỏ nhất trên val' (Ultralytics tự chọn)
-    # Strategy 2: average weights của Top-K checkpoint tốt nhất (val_loss nhỏ nhất) trên val'
-    #             (giống nhánh Strategy2_TinyImageNet; ranking dựa trên val_loss, giống early stopping)
+    # Strategy 1: best.pt — RAW checkpoint có fitness cao nhất trên val'
+    # Strategy 2: uniform element-wise average RAW weights của Top-K checkpoint
+    #             có raw-model fitness cao nhất. train.py tắt EMA để toàn bộ
+    #             validation, early stopping và checkpoint selection nhất quán.
     USE_STRATEGY2 = True
     TOP_K_VALUES = [2, 3, 4, 5]
     # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
@@ -93,9 +91,15 @@ class Config:
 
     # ===================== Output Configuration =====================
     PROJECT = os.path.join("results", "segmentation")  # thư mục output gốc (thay đổi từ detection)
-    NAME = None          # None = Ultralytics tự đánh số (train, train2, ...)
+    # Truyền qua CLI: --exp-name carparts_yolov8s_raw_topk
+    # Khi có EXP_NAME, pipeline dùng đúng tên này và KHÔNG ghép timestamp/model.
+    EXP_NAME = None
+    NAME = None          # backward-compatible khi không truyền EXP_NAME
     EXIST_OK = False
     EXCEL_OUTPUT = None  # None = <run_dir>/segmentation_results.xlsx
+    # Checkpoint chỉ là file tạm: dùng để rank/average/eval rồi xóa sau mỗi seed.
+    # CSV, plot, config snapshot và Excel metrics vẫn được giữ.
+    DELETE_CHECKPOINTS_AFTER_RUN = True
 
     # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...).
     # Hỗ trợ số nguyên đơn lẻ (ví dụ: 42) hoặc danh sách các seed (ví dụ: [42, 100, 2026]).
@@ -121,12 +125,20 @@ class Config:
         if require_model and not cls.MODEL:
             raise ValueError(
                 "Chưa set model. Đặt Config.MODEL trong config.py "
-                "(ví dụ: 'yolov8n.pt', 'yolo11n.pt', 'yolov5nu.pt', .pt/.yaml custom) "
+                "(ví dụ: 'yolov8s-seg.pt', 'yolo11s-seg.pt', .pt/.yaml segmentation custom) "
                 "hoặc truyền --model khi chạy CLI."
             )
 
         if not cls.DATA:
-            raise ValueError("DATA must not be empty (VOC.yaml hoặc path tới data.yaml custom)")
+            raise ValueError("DATA must not be empty (carparts-seg.yaml hoặc data.yaml custom)")
+
+        if cls.EXP_NAME:
+            exp_name = str(cls.EXP_NAME).strip()
+            if exp_name in (".", "..") or any(separator in exp_name for separator in ("/", "\\")):
+                raise ValueError(
+                    "EXP_NAME phải là một tên thư mục đơn, không chứa '/' hoặc '\\'. "
+                    "Ví dụ: carparts_yolov8s_raw_topk."
+                )
 
         if not 0.0 <= float(cls.VAL_RATIO) < 1.0:
             raise ValueError("VAL_RATIO must be in [0, 1)")
@@ -160,13 +172,13 @@ class Config:
         if str(cls.LOSS_FUNCTION).lower() not in ("bce", "focal"):
             raise ValueError(
                 f"LOSS_FUNCTION={cls.LOSS_FUNCTION!r} không hỗ trợ. "
-                "Chọn: 'bce' (Ultralytics default) hoặc 'focal' (detection only)."
+                "Chọn: 'bce' (Ultralytics default) hoặc 'focal' cho nhánh classification."
             )
         if float(cls.FOCAL_GAMMA) < 0:
             raise ValueError("FOCAL_GAMMA must be non-negative")
         if not 0.0 <= float(cls.FOCAL_ALPHA) <= 1.0:
             raise ValueError("FOCAL_ALPHA must be in [0, 1]")
-        # Note: Focal loss chỉ áp dụng cho detection, segmentation bỏ qua
+        # Focal chỉ thay classification BCE; box/mask/DFL loss giữ nguyên.
 
         if cls.EVAL_SPLIT not in cls.VALID_EVAL_SPLITS:
             raise ValueError(f"EVAL_SPLIT must be one of {cls.VALID_EVAL_SPLITS}")
@@ -181,8 +193,9 @@ class Config:
                 )
             if float(cls.VAL_RATIO) == 0.0:
                 print(
-                    "⚠ WARNING: USE_STRATEGY2=True nhưng VAL_RATIO=0 → không có val "
-                    "độc lập, checkpoint sẽ được chọn trên chính tập test (leakage)!"
+                    "ℹ VAL_RATIO=0: dùng split val gốc để chọn checkpoint. "
+                    "Hãy bảo đảm data.yaml có val độc lập với test "
+                    "(carparts-seg.yaml mặc định đáp ứng điều này)."
                 )
 
         if cls.EXPORT_ENABLED and not cls.EXPORT_FORMAT:
@@ -193,5 +206,10 @@ class Config:
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
         print(f"  Task  : Instance Segmentation")
+        print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
         print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
+        print(
+            "  Checkpoints: "
+            + ("temporary → delete after evaluation" if cls.DELETE_CHECKPOINTS_AFTER_RUN else "keep")
+        )
         print(f"  Eval split: {cls.EVAL_SPLIT or 'mặc định theo data.yaml'}")

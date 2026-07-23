@@ -1,41 +1,55 @@
 """
-Main entrypoint — Strategy 2 Object Detection (Ultralytics YOLO + Pascal VOC).
+Main entrypoint — Strategy 2 Instance Segmentation (Ultralytics YOLO-seg).
 
 Nhánh này CHỈ dùng model YOLO. Mọi config chỉnh trong config.py; các giá trị
 hay dùng override được qua CLI (pattern như repo gốc).
 
-    # Train (model lấy từ Config.MODEL, hoặc override --model)
-    python main.py train --model yolov8n.pt --device 0 --name yolov8n_voc
+    # Train (model lấy từ Config.MODEL, đặt tên experiment rõ ràng trên server)
+    python main.py train --exp_name carparts_yolov8s_raw_topk_run01
 
     # Đánh giá lại Strategy 1 + Strategy 2 trên một run đã train
-    python main.py strategies --run-dir results/detection/yolov8n_voc
+    python main.py strategies --run-dir results/segmentation/<experiment>/seed_42
 
     # Eval một file weights bất kỳ (in mAP/P/R/per-class AP + Excel)
-    python main.py eval --weights results/detection/yolov8n_voc/weights/best.pt --split test
+    python main.py eval --weights <run>/weights/best.pt --split test
 
     # Export Excel từ run dir (offline, chỉ cần results.csv)
-    python main.py export --run-dir results/detection/yolov8n_voc
+    python main.py export --run-dir <run>
 
     # Edge AI: xuất weights sang ONNX/TensorRT
-    python main.py export-model --weights results/detection/yolov8n_voc/weights/best.pt
+    python main.py export-model --weights <run>/weights/best.pt
 
-Chi tiết + note về data split (val' tách từ train, test = VOC2007): README.md
+Chi tiết về fitness, EMA, averaging và data split: README.md
 """
 import argparse
+import sys
 
 from config import Config
 
 EVAL_SPLIT_CHOICES = ["val", "test", "train"]
 
 
+def configure_console_encoding():
+    """Cho phép help/log tiếng Việt chạy ổn định trên Windows console."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                # Một số IDE/notebook bọc stream và không cho reconfigure.
+                pass
+
+
 def add_common_args(parser):
     """Args chung cho mọi subcommand — mọi giá trị đều override Config."""
     parser.add_argument(
         "--model",
-        help="Model YOLO: yolov8n.pt, yolo11n.pt, yolov5nu.pt, .pt/.yaml custom... "
+        help="Model YOLO-seg: yolov8s-seg.pt, yolo11s-seg.pt, .pt/.yaml segmentation custom... "
              "Override Config.MODEL.",
     )
-    parser.add_argument("--data", help="VOC.yaml (auto-download) hoặc path data.yaml custom.")
+    parser.add_argument("--data", help="carparts-seg.yaml hoặc path data.yaml segmentation custom.")
     parser.add_argument("--val-ratio", type=float, help="Tỉ lệ tách val' từ train (0 = không tách).")
     parser.add_argument("--epochs", type=int, help="Override Config.EPOCHS.")
     parser.add_argument("--imgsz", type=int, help="Override Config.IMGSZ.")
@@ -55,17 +69,26 @@ def add_common_args(parser):
     parser.add_argument("--focal-gamma", type=float, help="Override Config.FOCAL_GAMMA.")
     parser.add_argument("--focal-alpha", type=float, help="Override Config.FOCAL_ALPHA.")
     parser.add_argument("--project", help="Override Config.PROJECT (thư mục output gốc).")
-    parser.add_argument("--name", help="Override Config.NAME (tên run).")
+    parser.add_argument(
+        "--exp-name",
+        "--exp_name",
+        dest="exp_name",
+        help="Tên chính xác của thư mục experiment trên server, không tự ghép timestamp.",
+    )
+    parser.add_argument(
+        "--name",
+        help="Prefix legacy cho tên tự động khi không truyền --exp-name.",
+    )
     parser.add_argument(
         "--split",
         choices=EVAL_SPLIT_CHOICES,
-        help="Split cho báo cáo cuối (Config.EVAL_SPLIT). Mặc định 'test' = VOC2007 test.",
+        help="Split cho báo cáo cuối (Config.EVAL_SPLIT). Mặc định 'test'.",
     )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Strategy 2 - Object Detection pipeline (Ultralytics YOLO + Pascal VOC).",
+        description="Strategy 2 - Instance Segmentation pipeline (Ultralytics YOLO-seg).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -138,6 +161,7 @@ def apply_cli_overrides(args):
         ("FOCAL_GAMMA", getattr(args, "focal_gamma", None)),
         ("FOCAL_ALPHA", getattr(args, "focal_alpha", None)),
         ("PROJECT", getattr(args, "project", None)),
+        ("EXP_NAME", getattr(args, "exp_name", None)),
         ("NAME", getattr(args, "name", None)),
         ("EVAL_SPLIT", getattr(args, "split", None)),
         ("EXCEL_OUTPUT", getattr(args, "excel_output", None)),
@@ -210,4 +234,5 @@ def main():
 
 
 if __name__ == "__main__":
+    configure_console_encoding()
     main()

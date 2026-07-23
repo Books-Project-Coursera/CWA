@@ -1,9 +1,9 @@
 """
-Loss functions cho YOLO detection — cho phép swap giữa BCE (mặc định của
-Ultralytics) và Focal loss cho phần classification.
+Loss functions cho YOLO — cho phép swap giữa BCE (mặc định của Ultralytics)
+và Focal loss cho phần classification.
 
-⚠️ Segmentation KHÔNG dùng focal loss — chỉ detection classification.
-Module này tự động detect task type và skip focal loss cho segmentation.
+``v8SegmentationLoss`` kế thừa classification BCE của detection loss, nên focal
+có thể thay đúng nhánh classification mà không thay box/mask/DFL loss.
 
 Match convention `losses.py` của nhánh Strategy2_TinyImageNet (nơi expose
 LOSS_FUNCTION = 'cross_entropy' | 'poly_focal').
@@ -49,24 +49,16 @@ def install_cls_loss(yolo_model):
     Override init_criterion() của DetectionModel để dùng loss theo
     Config.LOSS_FUNCTION. Gọi sau `model = YOLO(...)` và TRƯỚC `model.train()`.
 
-    ⚠️ Segmentation KHÔNG dùng focal loss — auto-detect task type + skip.
-
     - "bce" : không đụng gì (mặc định của Ultralytics).
     - "focal": thay `criterion.bce` bằng `FocalBCE(FOCAL_GAMMA, FOCAL_ALPHA)`
-              (CHỈ áp dụng cho detection, NOT segmentation).
+               cho nhánh classification của detection/segmentation.
 
     Cơ chế: `BaseModel.loss(batch, preds)` gọi `self.init_criterion()` lazily
     khi criterion chưa tồn tại → override method này sẽ áp dụng cho mọi lượt
     train và val, mà không đụng vào class Ultralytics (safe cho upgrade).
     """
-    # Auto-detect task type từ model structure
-    task = getattr(yolo_model.model, 'task', None) or getattr(yolo_model, 'task', None)
-    
-    # Segmentation: không apply focal loss
-    if task == 'segment' or str(Config.MODEL).endswith('-seg.pt'):
-        print("  [Loss] Segmentation model detected — skipping focal loss (detection only)")
-        return
-    
+    task = getattr(yolo_model.model, "task", None) or getattr(yolo_model, "task", None)
+
     choice = str(Config.LOSS_FUNCTION).lower()
     if choice == "bce":
         return
@@ -85,6 +77,6 @@ def install_cls_loss(yolo_model):
 
     yolo_model.model.init_criterion = patched_init_criterion
     print(
-        f"  [Loss] Cls loss: FocalBCE (gamma={Config.FOCAL_GAMMA}, "
+        f"  [Loss] {task or 'YOLO'} classification: FocalBCE (gamma={Config.FOCAL_GAMMA}, "
         f"alpha={Config.FOCAL_ALPHA}) thay cho BCE mặc định"
     )

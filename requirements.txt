@@ -1,6 +1,7 @@
-# Strategy 2 - Object Detection (YOLO-only branch)
+# Strategy 2 - Instance Segmentation (YOLO-seg)
 # ultralytics tự kéo theo torch, torchvision, numpy, matplotlib, PyYAML...
-ultralytics>=8.2.0
+# Khóa version vì pipeline dùng callback/checkpoint/SegmentMetrics nội bộ.
+ultralytics==8.3.152
 pandas>=2.0.0
 openpyxl>=3.1.0
 PyYAML>=6.0
