@@ -26,12 +26,43 @@ from evaluate import RANKING_FILE, export_multi_seed_summary, print_detection_me
 from losses import install_cls_loss
 
 
+def unwrap_ultralytics_model(model):
+    """
+    Lấy base model tương thích cả Ultralytics cũ và mới.
+
+    - Bản mới dùng ``unwrap_model`` (hỗ trợ torch.compile + DP/DDP).
+    - ultralytics==8.3.152 dùng tên cũ ``de_parallel``.
+    - Fallback cuối giữ đúng logic unwrap chính thức để code không phụ thuộc
+      cứng vào tên helper nội bộ của Ultralytics.
+    """
+    try:
+        from ultralytics.utils.torch_utils import unwrap_model
+    except ImportError:
+        try:
+            from ultralytics.utils.torch_utils import de_parallel
+        except ImportError:
+            from torch import nn
+
+            while True:
+                if hasattr(model, "_orig_mod") and isinstance(model._orig_mod, nn.Module):
+                    model = model._orig_mod
+                elif hasattr(model, "module") and isinstance(model.module, nn.Module):
+                    model = model.module
+                else:
+                    return model
+        else:
+            return de_parallel(model)
+    else:
+        return unwrap_model(model)
+
+
 class TopKCheckpointManager:
     """
     Quản lý raw-model checkpoint cho Strategy 2.
 
-    ``on_train_start`` tắt ModelEMA và trỏ validation sang raw ``trainer.model``.
-    Nhờ đó fitness, early stopping và best.pt đều được quyết định bằng raw model.
+    ``on_train_start`` tắt EMA smoothing. ``on_train_epoch_end`` copy 1:1 raw
+    state sang module validation riêng, nhờ đó fitness, early stopping và
+    best.pt dùng raw weights mà không chạy inference trên training module.
 
     ``on_model_save`` lưu raw FP32 model của epoch hiện tại, ghi nhận fitness
     trên val và xóa checkpoint tệ nhất nếu vượt KEEP_TOP_K_CHECKPOINTS.
@@ -47,17 +78,52 @@ class TopKCheckpointManager:
 
     @staticmethod
     def on_train_start(trainer):
-        """Tắt EMA để validation/fitness/early stopping đều chạy trên raw model."""
-        from ultralytics.utils.torch_utils import de_parallel
+        """
+        Tắt EMA smoothing nhưng giữ model validation là một module riêng.
 
+        Không được trỏ ``ema.ema`` trực tiếp vào ``trainer.model``: validator
+        chạy dưới torch.inference_mode() và YOLO head có thể cache inference
+        tensors vào module, khiến backward của epoch sau bị RuntimeError.
+        """
         if getattr(trainer, "ema", None) is None:
             raise RuntimeError("Ultralytics trainer chưa khởi tạo ModelEMA.")
 
-        # ModelEMA.update() trở thành no-op. Giữ thuộc tính ema.ema trỏ tới raw
-        # module vì validator/save_model của Ultralytics luôn truy cập field này.
+        # ModelEMA.update() trở thành no-op. ema.ema vẫn là deepcopy riêng được
+        # Ultralytics tạo lúc setup; ta chỉ đồng bộ raw state_dict trước mỗi val.
         trainer.ema.enabled = False
-        trainer.ema.ema = de_parallel(trainer.model)
-        print("  Strategy 2: EMA disabled — validation, fitness và checkpoints dùng RAW weights")
+        TopKCheckpointManager.sync_raw_validation_model(trainer)
+        print(
+            "  Strategy 2: EMA smoothing disabled — validation dùng bản sao "
+            "đồng bộ chính xác RAW weights"
+        )
+
+    @staticmethod
+    def sync_raw_validation_model(trainer):
+        """
+        Copy chính xác raw weights/buffers sang model validation riêng.
+
+        Đây là phép copy 1:1 tại cùng epoch, không phải exponential moving
+        average và không tạo learnable parameter mới.
+        """
+        import torch
+
+        raw_model = unwrap_ultralytics_model(trainer.model)
+        validation_model = unwrap_ultralytics_model(trainer.ema.ema)
+
+        # Phòng trường hợp một phiên bản/custom trainer đã alias hai object.
+        if validation_model is raw_model:
+            validation_model = deepcopy(raw_model).eval()
+            validation_model.requires_grad_(False)
+            trainer.ema.ema = validation_model
+
+        with torch.no_grad():
+            validation_model.load_state_dict(raw_model.state_dict(), strict=True)
+        validation_model.eval()
+
+    @staticmethod
+    def on_train_epoch_end(trainer):
+        """Đồng bộ raw snapshot sau optimizer step cuối, ngay trước validation."""
+        TopKCheckpointManager.sync_raw_validation_model(trainer)
 
     def on_model_save(self, trainer):
         weights_dir = Path(trainer.save_dir) / "weights"
@@ -105,9 +171,8 @@ class TopKCheckpointManager:
         # cho post-training averaging, không dùng resume.
         import torch
         import ultralytics
-        from ultralytics.utils.torch_utils import de_parallel
 
-        raw_model = deepcopy(de_parallel(trainer.model)).float().cpu()
+        raw_model = deepcopy(unwrap_ultralytics_model(trainer.model)).float().cpu()
         raw_ckpt = {
             "epoch": int(trainer.epoch),
             "best_fitness": float(getattr(trainer, "best_fitness", fitness)),
@@ -382,6 +447,7 @@ def train_detector():
         if Config.USE_STRATEGY2:
             manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
             model.add_callback("on_train_start", manager.on_train_start)
+            model.add_callback("on_train_epoch_end", manager.on_train_epoch_end)
             model.add_callback("on_model_save", manager.on_model_save)
             print(
                 f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} RAW checkpoint "

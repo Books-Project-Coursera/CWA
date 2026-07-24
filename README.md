@@ -56,14 +56,17 @@ checkpoint. Pipeline này chủ động tắt EMA khi bắt đầu train để p
 raw checkpoint averaging trong paper:
 
 1. Optimizer cập nhật raw `trainer.model`.
-2. Validation và fitness được tính trực tiếp trên raw model.
+2. Cuối mỗi epoch, raw `state_dict` được copy 1:1 sang một module validation
+   riêng; validation và fitness dùng đúng snapshot raw đó.
 3. Early stopping và `best.pt` dùng raw-model fitness.
 4. Mỗi `epochN.pt` lưu raw FP32 model trong field `model`, với `ema=None`.
 5. Sau training, chọn Top-K raw checkpoints và uniform-average raw parameters
    ở FP32; averaged checkpoint tạm cũng dùng FP32.
 6. Sau khi đã lấy đủ metrics/Excel, tất cả checkpoint tạm được xóa.
 
-Vì vậy không có EMA smoothing trước phép Top-K averaging.
+Module validation riêng chỉ để cô lập `torch.inference_mode()` khỏi training
+model; nó không thực hiện EMA smoothing. Vì vậy không có EMA smoothing trước
+phép Top-K averaging.
 
 ## Checkpoint và BatchNorm
 
