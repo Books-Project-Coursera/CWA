@@ -68,9 +68,10 @@ class Config:
     COPY_PASTE = 0.15        # Copy-paste hữu ích cho detection (mặc định Ultralytics là 0.0)
 
     # ===================== Strategy Configuration =====================
-    # Strategy 1: best.pt — checkpoint có fitness cao nhất trên val' (Ultralytics tự chọn)
-    # Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
-    #             (giống nhánh Strategy2_TinyImageNet; fitness = 0.1*mAP50 + 0.9*mAP50-95)
+    # Strategy 1: best.pt — RAW checkpoint có fitness cao nhất trên val'
+    # Strategy 2: uniform element-wise average tất cả RAW learnable parameters
+    #             của Top-K checkpoint theo raw-model fitness validation.
+    #             EMA smoothing được tắt trong train.py để ranking nhất quán.
     USE_STRATEGY2 = True
     TOP_K_VALUES = [2, 3, 4, 5]
     # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
@@ -95,9 +96,14 @@ class Config:
 
     # ===================== Output Configuration =====================
     PROJECT = os.path.join("results", "detection")  # thư mục output gốc
-    NAME = None          # None = Ultralytics tự đánh số (train, train2, ...)
+    # Truyền qua CLI: --exp-name voc_yolov8s_raw_topk_run01
+    # Có EXP_NAME thì pipeline dùng đúng tên này, không ghép timestamp/model.
+    EXP_NAME = None
+    NAME = None          # prefix legacy khi không truyền EXP_NAME
     EXIST_OK = False
     EXCEL_OUTPUT = None  # None = <run_dir>/detection_results.xlsx
+    # Checkpoint chỉ là file tạm để rank/average/eval; CSV/Excel/plots được giữ.
+    DELETE_CHECKPOINTS_AFTER_RUN = True
 
     # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...).
     # Hỗ trợ số nguyên đơn lẻ (ví dụ: 42) hoặc danh sách các seed (ví dụ: [42, 100, 2026]).
@@ -129,6 +135,14 @@ class Config:
 
         if not cls.DATA:
             raise ValueError("DATA must not be empty (VOC.yaml hoặc path tới data.yaml custom)")
+
+        if cls.EXP_NAME:
+            exp_name = str(cls.EXP_NAME).strip()
+            if exp_name in (".", "..") or any(separator in exp_name for separator in ("/", "\\")):
+                raise ValueError(
+                    "EXP_NAME phải là một tên thư mục đơn, không chứa '/' hoặc '\\'. "
+                    "Ví dụ: voc_yolov8s_raw_topk_run01."
+                )
 
         if not 0.0 <= float(cls.VAL_RATIO) < 1.0:
             raise ValueError("VAL_RATIO must be in [0, 1)")
@@ -180,7 +194,7 @@ class Config:
                     "KEEP_TOP_K_CHECKPOINTS must be >= max(TOP_K_VALUES) "
                     "để đủ checkpoint cho mọi giá trị K"
                 )
-            if float(cls.VAL_RATIO) == 0.0:
+            if float(cls.VAL_RATIO) == 0.0 and str(cls.DATA).endswith("VOC.yaml"):
                 print(
                     "⚠ WARNING: USE_STRATEGY2=True nhưng VAL_RATIO=0 → không có val "
                     "độc lập, checkpoint sẽ được chọn trên chính tập test (leakage)!"
@@ -193,7 +207,13 @@ class Config:
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        print(f"  Task  : Object Detection")
+        print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
         print(f"  Loss  : {cls.LOSS_FUNCTION}"
               + (f" (γ={cls.FOCAL_GAMMA}, α={cls.FOCAL_ALPHA})" if cls.LOSS_FUNCTION == 'focal' else ""))
         print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
+        print(
+            "  Checkpoints: "
+            + ("temporary → delete after evaluation" if cls.DELETE_CHECKPOINTS_AFTER_RUN else "keep")
+        )
         print(f"  Eval split: {cls.EVAL_SPLIT or 'mặc định theo data.yaml'}")

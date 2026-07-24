@@ -10,6 +10,7 @@ Evaluation cho Strategy 2 - Object Detection (Ultralytics YOLO + Pascal VOC).
   và "PerEpoch" (parse results.csv do Ultralytics tự sinh trong run dir).
 """
 import json
+import math
 import os
 import re
 from datetime import datetime
@@ -134,6 +135,11 @@ def evaluate_weights(weights, data, split=None, header=None):
         )
 
     model = YOLO(str(weights))
+    if getattr(model, "task", None) != "detect":
+        raise ValueError(
+            f"Pipeline này chỉ hỗ trợ object detection, nhưng {weights!s} "
+            f"có task={getattr(model, 'task', None)!r}."
+        )
     metrics = model.val(**build_val_args(data, split))
     print_detection_metrics(
         metrics, header=header or f"EVALUATION (split={split or 'default'}) — {Path(str(weights)).name}"
@@ -145,7 +151,7 @@ def evaluate_weights(weights, data, split=None, header=None):
 
 def rank_checkpoints(run_dir):
     """
-    Rank các checkpoint epoch còn trên disk theo fitness trên val' (giảm dần).
+    Rank các raw checkpoint epoch theo fitness trên val' (giảm dần).
 
     Nguồn chính: strategy2_checkpoints.json (TopKCheckpointManager ghi lúc train).
     Fallback: tự tính fitness = 0.1*mAP50 + 0.9*mAP50-95 từ results.csv
@@ -159,10 +165,15 @@ def rank_checkpoints(run_dir):
     records = []
 
     if ranking_path.exists():
-        data = json.loads(ranking_path.read_text())
+        data = json.loads(ranking_path.read_text(encoding="utf-8"))
         for fname, info in data.items():
             path = weights_dir / fname
             if path.exists():
+                if "fitness" not in info or info.get("weight_source") != "raw":
+                    raise ValueError(
+                        f"{ranking_path} không chứa raw-weight ranking hiện tại. "
+                        "Cần train lại run này với code raw averaging."
+                    )
                 records.append((path, float(info["fitness"]), int(info["epoch"])))
     else:
         try:
@@ -172,9 +183,12 @@ def rank_checkpoints(run_dir):
         fitness_by_epoch = {}
         if "metrics/mAP50(B)" in df.columns and "metrics/mAP50-95(B)" in df.columns:
             for _, row in df.iterrows():
-                fitness_by_epoch[int(row["epoch"])] = (
-                    0.1 * float(row["metrics/mAP50(B)"]) + 0.9 * float(row["metrics/mAP50-95(B)"])
+                fitness = (
+                    0.1 * float(row["metrics/mAP50(B)"])
+                    + 0.9 * float(row["metrics/mAP50-95(B)"])
                 )
+                if math.isfinite(fitness):
+                    fitness_by_epoch[int(row["epoch"])] = fitness
         for path in weights_dir.glob("epoch*.pt"):
             digits = re.sub(r"\D", "", path.stem)
             if not digits:
@@ -185,34 +199,41 @@ def rank_checkpoints(run_dir):
             if fitness is not None:
                 records.append((path, float(fitness), file_epoch))
 
-    records.sort(key=lambda r: (-r[1], -r[2]))
+    # Fitness cao nhất đứng đầu; nếu hòa thì ưu tiên epoch mới hơn.
+    records.sort(key=lambda r: (r[1], r[2]), reverse=True)
     return records
 
 
 def average_checkpoints(ckpt_paths, output_path):
     """
-    Average weights của nhiều checkpoint YOLO — tương đương `average_weights`
-    của nhánh Strategy2_TinyImageNet, áp dụng cho ckpt Ultralytics.
+    Uniform element-wise average RAW learnable parameters của checkpoint YOLO.
 
-    Cùng nguyên tắc với classification:
     - Average TẤT CẢ learnable parameter (float): weights, biases, γ/β của BN.
-    - KHÔNG average BN running statistics (`running_mean`, `running_var`,
-      `num_batches_tracked`) — đây là population stats, không phải learned;
-      average chúng làm BN lệch phân phối → giữ nguyên từ checkpoint ĐẦU (đã
-      được sort là ckpt có fitness cao nhất).
+    - KHÔNG average buffers/state không learnable (BN running stats, counter,
+      anchors/stride/cache...). Giữ chúng từ checkpoint tốt nhất.
     - Sau khi average, BN stats KHÔNG khớp với weights mới → phải chạy
       update_bn_stats() để re-estimate trên train (xem hàm bên dưới).
 
-    Ckpt input dùng EMA weights (phần Ultralytics thực sự deploy). Ckpt output
-    chỉ chứa model (bỏ optimizer) nên nhẹ, load lại bằng YOLO(path) như ckpt
-    thường.
+    Input chỉ nhận checkpoint có ``weight_source='raw'``. Output giữ FP32,
+    không chứa EMA/optimizer, và load lại bằng YOLO(path) như checkpoint thường.
     """
     import torch
 
     ckpts = [torch.load(str(p), map_location="cpu", weights_only=False) for p in ckpt_paths]
-    # YOLO(path) load (ckpt['ema'] or ckpt['model']) → average đúng phần EMA
-    modules = [(ck.get("ema") or ck["model"]).float() for ck in ckpts]
+    invalid = [
+        str(path)
+        for path, ckpt in zip(ckpt_paths, ckpts)
+        if ckpt.get("weight_source") != "raw" or ckpt.get("model") is None
+    ]
+    if invalid:
+        raise ValueError(
+            "Strategy 2 raw averaging chỉ nhận raw checkpoints do code hiện tại tạo. "
+            f"Checkpoint không hợp lệ: {invalid}"
+        )
+
+    modules = [ckpt["model"].float() for ckpt in ckpts]
     state_dicts = [m.state_dict() for m in modules]
+    parameter_keys = set(dict(modules[0].named_parameters()))
 
     # Skip BN running stats — giống keys_to_keep của Strategy2_TinyImageNet
     def is_bn_stat(key):
@@ -224,7 +245,7 @@ def average_checkpoints(ckpt_paths, output_path):
     else:
         avg_state = {}
         for key, ref_tensor in state_dicts[0].items():
-            if is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
+            if key not in parameter_keys or is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
                 # Giữ nguyên từ checkpoint đầu (đã sort theo fitness giảm dần)
                 avg_state[key] = ref_tensor.clone()
             else:
@@ -235,12 +256,14 @@ def average_checkpoints(ckpt_paths, output_path):
 
     torch.save(
         {
-            "model": merged_module.half(),
+            # FP32 giảm sai số làm tròn so với FP16 khi cộng/chia K tensors.
+            "model": merged_module.float(),
             "ema": None,
             "optimizer": None,
             "epoch": -1,
             "train_args": ckpts[0].get("train_args", {}),
             "date": datetime.now().isoformat(timespec="seconds"),
+            "weight_source": "raw_topk_average",
         },
         str(output_path),
     )
@@ -296,7 +319,15 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     # Build train dataloader kiểu Ultralytics (đúng augmentation train)
     data = check_det_dataset(str(data_yaml))
     batch = int(Config.BATCH) if int(Config.BATCH) > 0 else 16
-    cfg = get_cfg(overrides={"imgsz": int(Config.IMGSZ), "task": "detect"})
+    bn_overrides = {
+        "imgsz": int(Config.IMGSZ),
+        "task": "detect",
+        "mixup": float(Config.MIXUP),
+        "copy_paste": float(Config.COPY_PASTE),
+    }
+    bn_overrides.update(Config.EXTRA_TRAIN_ARGS or {})
+    bn_overrides["task"] = "detect"
+    cfg = get_cfg(overrides=bn_overrides)
     dataset = build_yolo_dataset(
         cfg, data["train"], batch, data, mode="train", rect=False, stride=stride
     )
@@ -343,9 +374,9 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
         m.momentum = mom
     model.train(was_training)
 
-    # Ghi đè weights_path với BN stats mới (giữ nguyên cấu trúc ckpt)
+    # Chỉ thay BN running statistics; learnable parameters average vẫn là FP32.
     ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
-    ckpt["model"] = model.half().cpu()
+    ckpt["model"] = model.float().cpu()
     torch.save(ckpt, str(weights_path))
     print(f"      ✓ BN stats updated: {weights_path.name}")
     return weights_path
@@ -394,15 +425,22 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None):
                     print(f"  ⚠ Top-{k}: chỉ có {len(ranked)} checkpoint — bỏ qua")
                     continue
                 avg_path = run_dir / "weights" / f"strategy2_top{k}_avg.pt"
-                average_checkpoints([p for p, _, _ in ranked[:k]], avg_path)
-                # CRITICAL: BN running stats bị giữ nguyên khi average → phải
-                # re-estimate trên train trước khi val, y hệt update_bn của
-                # Strategy2_TinyImageNet.
-                if Config.USE_BN_UPDATE:
-                    update_bn_stats(avg_path, data)
-                results[f"Strategy 2 (Top-{k} avg)"] = evaluate_weights(
-                    avg_path, data, split, header=f"Strategy 2 — Top-{k} average (split={split})"
-                )
+                try:
+                    average_checkpoints([p for p, _, _ in ranked[:k]], avg_path)
+                    # Re-estimate buffers BN trên train, tuyệt đối không dùng test.
+                    if Config.USE_BN_UPDATE:
+                        update_bn_stats(avg_path, data)
+                    results[f"Strategy 2 (Top-{k} avg)"] = evaluate_weights(
+                        avg_path,
+                        data,
+                        split,
+                        header=f"Strategy 2 — Top-{k} average (split={split})",
+                    )
+                finally:
+                    # Average checkpoint chỉ cần tồn tại trong lúc model.val().
+                    if Config.DELETE_CHECKPOINTS_AFTER_RUN and avg_path.exists():
+                        avg_path.unlink()
+                        print(f"      ✓ Đã xóa averaged checkpoint tạm: {avg_path.name}")
 
     if not results:
         print("  ✗ Không có strategy nào được đánh giá")
@@ -418,8 +456,10 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None):
             f"  {name:<26} mAP50: {m['mAP@0.5']:.4f} | mAP50-95: {m['mAP@0.5:0.95']:.4f} | "
             f"P: {m['Precision']:.4f} | R: {m['Recall']:.4f}"
         )
-    best_name = max(results, key=lambda n: extract_overall_metrics(results[n])["mAP@0.5:0.95"])
-    print(f"\n🏆 Best strategy (mAP@0.5:0.95): {best_name}")
+    print(
+        "\n  Các K phía trên đã được định trước trong Config.TOP_K_VALUES. "
+        "Split báo cáo không được dùng để chọn best K."
+    )
 
     export_to_excel(run_dir, strategy_results=results, data=data, split=split, seed=seed)
     return results
@@ -529,6 +569,13 @@ def export_to_excel(run_dir, strategy_results=None, data=None, split=None, outpu
         )),
         ("eval_split", split or Config.EVAL_SPLIT or "mặc định theo data.yaml"),
         ("strategy2", f"Top-K {Config.TOP_K_VALUES}" if Config.USE_STRATEGY2 else "OFF"),
+        ("checkpoint_weight_source", "raw (EMA disabled)" if Config.USE_STRATEGY2 else "Ultralytics default"),
+        (
+            "checkpoint_retention",
+            "temporary; deleted after evaluation"
+            if Config.DELETE_CHECKPOINTS_AFTER_RUN
+            else "kept",
+        ),
         ("run_dir", run_dir),
         ("summary_source", summary_source),
         ("export_date", datetime.now().isoformat(timespec="seconds")),

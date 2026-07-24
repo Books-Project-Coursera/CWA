@@ -5,7 +5,7 @@ Nhánh này CHỈ dùng model YOLO. Mọi config chỉnh trong config.py; các g
 hay dùng override được qua CLI (pattern như repo gốc).
 
     # Train (model lấy từ Config.MODEL, hoặc override --model)
-    python main.py train --model yolov8n.pt --device 0 --name yolov8n_voc
+    python main.py train --model yolov8s.pt --device 0 --exp_name voc_yolov8s_raw_topk_run01
 
     # Đánh giá lại Strategy 1 + Strategy 2 trên một run đã train
     python main.py strategies --run-dir results/detection/yolov8n_voc
@@ -22,10 +22,23 @@ hay dùng override được qua CLI (pattern như repo gốc).
 Chi tiết + note về data split (val' tách từ train, test = VOC2007): README.md
 """
 import argparse
+import sys
 
 from config import Config
 
 EVAL_SPLIT_CHOICES = ["val", "test", "train"]
+
+
+def configure_console_encoding():
+    """Cho phép help/log tiếng Việt chạy ổn định trên Windows console."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (OSError, ValueError):
+                pass
 
 
 def add_common_args(parser):
@@ -55,7 +68,16 @@ def add_common_args(parser):
     parser.add_argument("--focal-gamma", type=float, help="Override Config.FOCAL_GAMMA.")
     parser.add_argument("--focal-alpha", type=float, help="Override Config.FOCAL_ALPHA.")
     parser.add_argument("--project", help="Override Config.PROJECT (thư mục output gốc).")
-    parser.add_argument("--name", help="Override Config.NAME (tên run).")
+    parser.add_argument(
+        "--exp-name",
+        "--exp_name",
+        dest="exp_name",
+        help="Tên chính xác của thư mục experiment trên server, không tự ghép timestamp.",
+    )
+    parser.add_argument(
+        "--name",
+        help="Prefix legacy cho tên tự động khi không truyền --exp-name.",
+    )
     parser.add_argument(
         "--split",
         choices=EVAL_SPLIT_CHOICES,
@@ -138,6 +160,7 @@ def apply_cli_overrides(args):
         ("FOCAL_GAMMA", getattr(args, "focal_gamma", None)),
         ("FOCAL_ALPHA", getattr(args, "focal_alpha", None)),
         ("PROJECT", getattr(args, "project", None)),
+        ("EXP_NAME", getattr(args, "exp_name", None)),
         ("NAME", getattr(args, "name", None)),
         ("EVAL_SPLIT", getattr(args, "split", None)),
         ("EXCEL_OUTPUT", getattr(args, "excel_output", None)),
@@ -210,4 +233,5 @@ def main():
 
 
 if __name__ == "__main__":
+    configure_console_encoding()
     main()

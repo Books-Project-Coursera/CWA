@@ -1,0 +1,3 @@
+# Chạy từ thư mục Capstone_KD trên server.
+# Đổi run01 thành run02/run03 cho lần chạy mới; tên đã tồn tại sẽ bị từ chối.
+python main.py train --exp_name voc_yolov8s_raw_topk_run01

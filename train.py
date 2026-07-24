@@ -9,8 +9,14 @@ quản lý trong run dir. Phần thêm vào cho Strategy 2:
 - TopKCheckpointManager (callback on_model_save) prune NGAY checkpoint ngoài
   Top-K theo fitness trên val' → disk chỉ giữ đúng K checkpoint cần thiết
   (+ best.pt/last.pt), không lưu tất cả epoch.
+
+Fitness được lấy trực tiếp từ ``trainer.fitness`` — đúng cùng đại lượng mà
+Ultralytics dùng cho best.pt và early stopping. EMA được tắt để validation,
+fitness, best.pt và các checkpoint epoch đều dùng raw model weights.
 """
 import json
+import math
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -20,11 +26,46 @@ from evaluate import RANKING_FILE, export_multi_seed_summary, print_detection_me
 from losses import install_cls_loss
 
 
+def unwrap_ultralytics_model(model):
+    """
+    Lấy base model tương thích cả Ultralytics cũ và mới.
+
+    - Bản mới dùng ``unwrap_model`` (hỗ trợ torch.compile + DP/DDP).
+    - ultralytics==8.3.152 dùng tên cũ ``de_parallel``.
+    - Fallback cuối giữ đúng logic unwrap chính thức để code không phụ thuộc
+      cứng vào tên helper nội bộ của Ultralytics.
+    """
+    try:
+        from ultralytics.utils.torch_utils import unwrap_model
+    except ImportError:
+        try:
+            from ultralytics.utils.torch_utils import de_parallel
+        except ImportError:
+            from torch import nn
+
+            while True:
+                if hasattr(model, "_orig_mod") and isinstance(model._orig_mod, nn.Module):
+                    model = model._orig_mod
+                elif hasattr(model, "module") and isinstance(model.module, nn.Module):
+                    model = model.module
+                else:
+                    return model
+        else:
+            return de_parallel(model)
+    else:
+        return unwrap_model(model)
+
+
 class TopKCheckpointManager:
     """
-    Callback 'on_model_save' của Ultralytics: sau mỗi lần trainer lưu
-    checkpoint epoch (save_period=1), ghi nhận fitness trên val' của epoch đó
-    và xóa ngay checkpoint tệ nhất nếu vượt quá KEEP_TOP_K_CHECKPOINTS.
+    Quản lý raw-model checkpoint cho Strategy 2.
+
+    ``on_train_start`` tắt EMA smoothing. ``on_train_epoch_end`` copy 1:1 raw
+    state sang module validation riêng, nhờ đó fitness, early stopping và
+    best.pt dùng raw weights mà không chạy inference trên training module.
+
+    ``on_model_save`` lưu raw FP32 model của epoch hiện tại, ghi nhận fitness
+    trên val và xóa checkpoint tệ nhất nếu vượt KEEP_TOP_K_CHECKPOINTS.
 
     Ranking được ghi ra <run_dir>/weights/strategy2_checkpoints.json để
     evaluate.rank_checkpoints() dùng lại khi average Top-K (Strategy 2).
@@ -33,19 +74,129 @@ class TopKCheckpointManager:
 
     def __init__(self, keep_top_k):
         self.keep_top_k = int(keep_top_k)
-        self.records = {}  # filename -> {"epoch": int, "fitness": float}
+        self.records = {}  # filename -> {"epoch": int, "fitness": float, "weight_source": "raw"}
+
+    @staticmethod
+    def on_train_start(trainer):
+        """
+        Tắt EMA smoothing nhưng giữ model validation là một module riêng.
+
+        Không được trỏ ``ema.ema`` trực tiếp vào ``trainer.model``: validator
+        chạy dưới torch.inference_mode() và YOLO head có thể cache inference
+        tensors vào module, khiến backward của epoch sau bị RuntimeError.
+        """
+        if getattr(trainer, "ema", None) is None:
+            raise RuntimeError("Ultralytics trainer chưa khởi tạo ModelEMA.")
+
+        # ModelEMA.update() trở thành no-op. ema.ema vẫn là deepcopy riêng được
+        # Ultralytics tạo lúc setup; ta chỉ đồng bộ raw state_dict trước mỗi val.
+        trainer.ema.enabled = False
+        TopKCheckpointManager.sync_raw_validation_model(trainer)
+        print(
+            "  Strategy 2: EMA smoothing disabled — validation dùng bản sao "
+            "đồng bộ chính xác RAW weights"
+        )
+
+    @staticmethod
+    def sync_raw_validation_model(trainer):
+        """
+        Copy chính xác raw weights/buffers sang model validation riêng.
+
+        Đây là phép copy 1:1 tại cùng epoch, không phải exponential moving
+        average và không tạo learnable parameter mới.
+        """
+        import torch
+
+        raw_model = unwrap_ultralytics_model(trainer.model)
+        validation_model = unwrap_ultralytics_model(trainer.ema.ema)
+
+        # Phòng trường hợp một phiên bản/custom trainer đã alias hai object.
+        if validation_model is raw_model:
+            validation_model = deepcopy(raw_model).eval()
+            validation_model.requires_grad_(False)
+            trainer.ema.ema = validation_model
+
+        with torch.no_grad():
+            validation_model.load_state_dict(raw_model.state_dict(), strict=True)
+        validation_model.eval()
+
+    @staticmethod
+    def on_train_epoch_end(trainer):
+        """Đồng bộ raw snapshot sau optimizer step cuối, ngay trước validation."""
+        TopKCheckpointManager.sync_raw_validation_model(trainer)
 
     def on_model_save(self, trainer):
         weights_dir = Path(trainer.save_dir) / "weights"
-        # trainer.fitness = fitness epoch hiện tại trên val' (set trong validate())
-        fitness = float(trainer.fitness) if trainer.fitness is not None else float("-inf")
+        ranking_path = weights_dir / RANKING_FILE
 
-        # Checkpoint epoch mới xuất hiện (epoch*.pt chưa ghi nhận) thuộc epoch này
-        for ckpt in weights_dir.glob("epoch*.pt"):
-            if ckpt.name not in self.records:
-                self.records[ckpt.name] = {"epoch": int(trainer.epoch), "fitness": fitness}
+        # Resume-safe: chỉ nhận ranking raw mới; run cũ dùng EMA/val_loss phải
+        # train lại vì checkpoint phù hợp có thể đã bị prune.
+        if not self.records and ranking_path.exists():
+            saved = json.loads(ranking_path.read_text(encoding="utf-8"))
+            if any(
+                "fitness" not in info or info.get("weight_source") != "raw"
+                for info in saved.values()
+            ):
+                raise RuntimeError(
+                    f"{ranking_path} không phải ranking raw-weight hiện tại. "
+                    "Hãy dùng run mới để tạo Top-K raw checkpoints."
+                )
+            self.records = {
+                name: {
+                    "epoch": int(info["epoch"]),
+                    "fitness": float(info["fitness"]),
+                    "weight_source": "raw",
+                }
+                for name, info in saved.items()
+                if (weights_dir / name).exists()
+            }
 
-        # Prune: chỉ giữ Top-K theo fitness (tie-break: giữ epoch mới hơn)
+        # Ultralytics đã validate trước callback này; trainer.fitness chính là
+        # criterion dùng cho best.pt và EarlyStopping.
+        fitness = getattr(trainer, "fitness", None)
+        try:
+            fitness = float(fitness)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Ultralytics không cung cấp trainer.fitness hợp lệ.") from exc
+        if not math.isfinite(fitness):
+            raise RuntimeError(f"trainer.fitness không hữu hạn tại epoch {trainer.epoch}: {fitness}")
+
+        # save_period=1 tạo đúng epoch{trainer.epoch}.pt trước on_model_save.
+        ckpt = weights_dir / f"epoch{int(trainer.epoch)}.pt"
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Checkpoint vừa lưu không tồn tại: {ckpt}")
+
+        # Ghi đè epoch checkpoint mặc định (field 'ema') bằng raw FP32 model
+        # rõ ràng trong field 'model'. Không lưu optimizer vì file này chỉ dùng
+        # cho post-training averaging, không dùng resume.
+        import torch
+        import ultralytics
+
+        raw_model = deepcopy(unwrap_ultralytics_model(trainer.model)).float().cpu()
+        raw_ckpt = {
+            "epoch": int(trainer.epoch),
+            "best_fitness": float(getattr(trainer, "best_fitness", fitness)),
+            "model": raw_model,
+            "ema": None,
+            "updates": 0,
+            "optimizer": None,
+            "train_args": vars(trainer.args),
+            "train_metrics": {**getattr(trainer, "metrics", {}), "fitness": fitness},
+            "date": datetime.now().isoformat(timespec="seconds"),
+            "version": ultralytics.__version__,
+            "weight_source": "raw",
+        }
+        temp_ckpt = ckpt.with_suffix(".tmp")
+        torch.save(raw_ckpt, temp_ckpt)
+        temp_ckpt.replace(ckpt)
+
+        self.records[ckpt.name] = {
+            "epoch": int(trainer.epoch),
+            "fitness": fitness,
+            "weight_source": "raw",
+        }
+
+        # Prune: fitness thấp nhất tệ nhất; nếu hòa thì loại epoch cũ hơn.
         while len(self.records) > self.keep_top_k:
             worst = min(
                 self.records,
@@ -56,7 +207,39 @@ class TopKCheckpointManager:
                 worst_path.unlink()
             del self.records[worst]
 
-        (weights_dir / RANKING_FILE).write_text(json.dumps(self.records, indent=2))
+        ranking_path.write_text(
+            json.dumps(self.records, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+
+def delete_checkpoint_artifacts(run_dir):
+    """
+    Xóa toàn bộ checkpoint tạm trong ``<run_dir>/weights``.
+
+    Chỉ chạy sau khi đã average, evaluation, Excel và export tùy chọn. Các kết
+    quả không phải checkpoint như results.csv, plots, args.yaml và Excel được
+    giữ nguyên.
+    """
+    weights_dir = Path(run_dir) / "weights"
+    if not weights_dir.exists():
+        return 0
+
+    files = [path for path in weights_dir.rglob("*") if path.is_file()]
+    total_bytes = sum(path.stat().st_size for path in files)
+    for path in files:
+        path.unlink()
+
+    directories = [path for path in weights_dir.rglob("*") if path.is_dir()]
+    for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
+        directory.rmdir()
+    weights_dir.rmdir()
+
+    print(
+        f"  ✓ Đã xóa {len(files)} checkpoint/file ranking tạm "
+        f"({total_bytes / (1024 ** 2):.1f} MB): {weights_dir}"
+    )
+    return len(files)
 
 
 def build_train_args(data_yaml):
@@ -106,6 +289,13 @@ def build_train_args(data_yaml):
     if Config.NAME:
         train_args["name"] = Config.NAME
     train_args.update(Config.EXTRA_TRAIN_ARGS or {})
+
+    # Strategy 2 bắt buộc validate và lưu ở mọi epoch để mỗi raw epochN.pt có
+    # fitness validation tương ứng. Không cho EXTRA_TRAIN_ARGS phá invariant.
+    if Config.USE_STRATEGY2:
+        train_args["val"] = True
+        train_args["save"] = True
+        train_args["save_period"] = 1
     return train_args
 
 
@@ -144,13 +334,13 @@ def print_multi_seed_summary(all_runs_results):
 def train_detector():
     """
     Pipeline train hoàn chỉnh:
-    1. Tạo thư mục experiment group duy nhất (timestamp + tên model) cho lần chạy này
+    1. Tạo experiment group theo --exp-name; fallback timestamp nếu không truyền
     2. Chuẩn bị data (tách val' độc lập từ train theo VAL_RATIO, hỗ trợ seed dạng list/int)
     3. Loop qua tất cả các seed → mỗi seed = 1 subfolder riêng bên trong experiment group
     4. Huấn luyện model.train() với TopKCheckpointManager (nếu USE_STRATEGY2)
     5. Báo cáo đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split test
     6. Xuất Excel và Edge AI export nếu được bật
-    7. Lưu snapshot config (experiment_config.json) + bảng tổng kết đa seed vào experiment group
+    7. Xóa checkpoint tạm; chỉ giữ metrics/CSV/Excel/config/plots
     """
     # Import trễ để validate config / --help không cần ultralytics
     from ultralytics import YOLO
@@ -158,6 +348,7 @@ def train_detector():
     # ── Lưu cấu hình gốc ──────────────────────────────────────────────────────
     orig_seeds   = Config.RANDOM_SEED
     orig_project = Config.PROJECT          # thư mục root gốc (results/detection)
+    orig_exp_name = Config.EXP_NAME
     orig_name    = Config.NAME             # None hoặc custom name người dùng đặt
 
     # Chuẩn hóa seeds thành list
@@ -166,16 +357,22 @@ def train_detector():
     else:
         seeds = [int(orig_seeds)]
 
-    # ── Tạo thư mục experiment group (DUY NHẤT cho lần bấm chạy này) ──────────
-    # Định dạng: exp_YYYYMMDD_HHMMSS_<model_stem>
-    # Ví dụ:     exp_20260720_214200_yolov8s
-    # → Mọi seed của thí nghiệm này được gom vào đây, không bao giờ trùng với
-    #   lần chạy khác dù dùng cùng model / cùng seed.
+    # Có --exp-name: dùng đúng tên được truyền, dễ quản lý trên server.
+    # Không có: fallback timestamp + model để tương thích cách chạy cũ.
     model_stem = Path(str(Config.MODEL)).stem          # "yolov8s" từ "yolov8s.pt"
     timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    base_name  = orig_name if orig_name else "exp"     # tôn trọng --name nếu người dùng đặt
-    exp_group  = f"{base_name}_{timestamp}_{model_stem}"
+    if orig_exp_name:
+        exp_group = str(orig_exp_name).strip()
+    else:
+        base_name = orig_name if orig_name else "exp"
+        exp_group = f"{base_name}_{timestamp}_{model_stem}"
     exp_dir    = Path(orig_project) / exp_group
+
+    if orig_exp_name and exp_dir.exists() and any(exp_dir.iterdir()):
+        raise FileExistsError(
+            f"Experiment đã tồn tại và không rỗng: {exp_dir}\n"
+            "Hãy chọn --exp-name khác để kết quả các lần chạy không bị trộn."
+        )
     exp_dir.mkdir(parents=True, exist_ok=True)
 
     # Redirect PROJECT → bên trong experiment group;
@@ -194,6 +391,7 @@ def train_detector():
     # ── Lưu snapshot config tại thời điểm chạy ────────────────────────────────
     config_snapshot = {
         "experiment_group" : exp_group,
+        "explicit_exp_name": orig_exp_name,
         "timestamp"        : timestamp,
         "model"            : Config.MODEL,
         "data"             : Config.DATA,
@@ -213,6 +411,8 @@ def train_detector():
         "use_strategy2"    : Config.USE_STRATEGY2,
         "top_k_values"     : Config.TOP_K_VALUES,
         "eval_split"       : Config.EVAL_SPLIT,
+        "checkpoint_weight_source": "raw" if Config.USE_STRATEGY2 else "ultralytics_default",
+        "delete_checkpoints_after_run": Config.DELETE_CHECKPOINTS_AFTER_RUN,
     }
     config_path = exp_dir / "experiment_config.json"
     config_path.write_text(json.dumps(config_snapshot, indent=2, ensure_ascii=False))
@@ -232,48 +432,75 @@ def train_detector():
 
         # Step 2: train
         model = YOLO(Config.MODEL)
+        if getattr(model, "task", None) != "detect":
+            raise ValueError(
+                "Pipeline này chỉ hỗ trợ object detection. "
+                f"Model {Config.MODEL!r} có task={getattr(model, 'task', None)!r}; "
+                "hãy dùng weights/config detection (ví dụ yolov8s.pt)."
+            )
         # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'
         install_cls_loss(model)
 
         if Config.USE_STRATEGY2:
             manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
+            model.add_callback("on_train_start", manager.on_train_start)
+            model.add_callback("on_train_epoch_end", manager.on_train_epoch_end)
             model.add_callback("on_model_save", manager.on_model_save)
-            print(f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} checkpoint theo fitness val'")
+            print(
+                f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} RAW checkpoint "
+                "theo raw-model fitness validation cao nhất"
+            )
 
-        # model.train() trả về DetMetrics của lượt val CUỐI trên best.pt (split val')
-        metrics = model.train(**build_train_args(data_yaml))
+        run_dir = None
+        try:
+            # Validation cuối và toàn bộ checkpoint selection dùng raw weights.
+            metrics = model.train(**build_train_args(data_yaml))
 
-        run_dir      = Path(model.trainer.save_dir)
-        best_weights = run_dir / "weights" / "best.pt"
-        print(f"\n  ✓ Training completed for seed {seed}. Run dir: {run_dir}")
-        print(f"  ✓ Best weights: {best_weights}")
+            run_dir      = Path(model.trainer.save_dir)
+            best_weights = run_dir / "weights" / "best.pt"
+            print(f"\n  ✓ Training completed for seed {seed}. Run dir: {run_dir}")
+            print(f"  ✓ Best weights tạm thời: {best_weights}")
 
-        # Step 3: metrics trên val' (holdout) — KHÔNG phải số liệu báo cáo cuối
-        val_metrics = {}
-        if metrics is not None:
-            print_detection_metrics(metrics, header=f"FINAL VALIDATION on val' (best.pt) | Seed {seed}")
-            from evaluate import extract_overall_metrics
-            val_metrics = extract_overall_metrics(metrics)
+            # Metrics val dùng để kiểm tra/chọn checkpoint, không phải test report.
+            val_metrics = {}
+            if metrics is not None:
+                print_detection_metrics(
+                    metrics,
+                    header=f"FINAL VALIDATION on val' (best.pt) | Seed {seed}",
+                )
+                from evaluate import extract_overall_metrics
+                val_metrics = extract_overall_metrics(metrics)
 
-        # Step 4: báo cáo cuối trên EVAL_SPLIT (mặc định test = VOC2007 test)
-        # gồm Strategy 1 (best.pt) và Strategy 2 (Top-K average) + Excel
-        strategy_results = run_strategy_evaluation(run_dir, data=data_yaml, seed=seed)
+            # Test chỉ báo cáo hiệu năng cho các K đã định trước; không dùng chọn K.
+            strategy_results = run_strategy_evaluation(run_dir, data=data_yaml, seed=seed)
 
-        # Step 5: Edge AI hook (tắt mặc định)
-        exported_model = export_model(best_weights) if Config.EXPORT_ENABLED else None
+            # Export phải chạy trước cleanup vì best.pt cũng là checkpoint tạm.
+            exported_model = export_model(best_weights) if Config.EXPORT_ENABLED else None
 
-        all_runs_results.append({
-            "seed"           : seed,
-            "run_dir"        : str(run_dir),
-            "best_weights"   : str(best_weights),
-            "val_metrics"    : val_metrics,
-            "strategy_results": strategy_results,
-            "exported_model" : exported_model,
-        })
+            all_runs_results.append({
+                "seed"              : seed,
+                "run_dir"           : str(run_dir),
+                "best_weights"      : None,
+                "checkpoint_policy" : "temporary_then_deleted",
+                "val_metrics"       : val_metrics,
+                "strategy_results"  : strategy_results,
+                "exported_model"    : exported_model,
+            })
+        finally:
+            # Kể cả evaluation/export lỗi, không để checkpoint tạm nằm lại.
+            if Config.DELETE_CHECKPOINTS_AFTER_RUN:
+                cleanup_dir = run_dir
+                if cleanup_dir is None:
+                    trainer = getattr(model, "trainer", None)
+                    save_dir = getattr(trainer, "save_dir", None)
+                    cleanup_dir = Path(save_dir) if save_dir else None
+                if cleanup_dir is not None:
+                    delete_checkpoint_artifacts(cleanup_dir)
 
     # ── Khôi phục cấu hình gốc ────────────────────────────────────────────────
     Config.RANDOM_SEED = orig_seeds
     Config.PROJECT     = orig_project
+    Config.EXP_NAME    = orig_exp_name
     Config.NAME        = orig_name
 
     # In bảng tổng kết nếu chạy nhiều seed
