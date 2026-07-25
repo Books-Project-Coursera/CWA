@@ -116,7 +116,14 @@ class TopKCheckpointManager:
             validation_model.requires_grad_(False)
             trainer.ema.ema = validation_model
 
-        with torch.no_grad():
+        # Validator của Ultralytics chạy trong ``torch.inference_mode()`` và
+        # một số phiên bản PyTorch/YOLO có thể thay BN running_mean/running_var
+        # của validation shadow bằng inference tensors. Ở epoch kế tiếp,
+        # ``no_grad()`` vẫn không được phép copy_ vào các tensor đó (PyTorch
+        # 2.5 báo "Inplace update to inference tensor outside InferenceMode").
+        # Đồng bộ ngay trong inference_mode vừa an toàn cho shadow chỉ dùng
+        # validation, vừa giữ training model raw hoàn toàn tách biệt.
+        with torch.inference_mode():
             validation_model.load_state_dict(raw_model.state_dict(), strict=True)
         validation_model.eval()
 
