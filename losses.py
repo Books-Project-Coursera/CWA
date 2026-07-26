@@ -44,18 +44,38 @@ class FocalBCE(FocalLoss):
         return loss  # (bs, num_anchors, nc) — cùng shape với BCE(reduction='none')
 
 
+def _patch_module_criterion(module):
+    """Bọc ``init_criterion`` của một BaseModel để thay BCE bằng FocalBCE."""
+    original_init_criterion = module.init_criterion
+
+    def patched_init_criterion():
+        criterion = original_init_criterion()  # v8SegmentationLoss(self)
+        criterion.bce = FocalBCE(Config.FOCAL_GAMMA, Config.FOCAL_ALPHA)
+        return criterion
+
+    module.init_criterion = patched_init_criterion
+    # criterion có thể đã được tạo lazily trước đó → ép tạo lại ở lần loss() sau.
+    if getattr(module, "criterion", None) is not None:
+        module.criterion = None
+
+
 def install_cls_loss(yolo_model):
     """
-    Override init_criterion() của DetectionModel để dùng loss theo
-    Config.LOSS_FUNCTION. Gọi sau `model = YOLO(...)` và TRƯỚC `model.train()`.
+    Dùng loss theo Config.LOSS_FUNCTION cho nhánh classification.
 
     - "bce" : không đụng gì (mặc định của Ultralytics).
-    - "focal": thay `criterion.bce` bằng `FocalBCE(FOCAL_GAMMA, FOCAL_ALPHA)`
-               cho nhánh classification của detection/segmentation.
+    - "focal": thay `criterion.bce` bằng `FocalBCE(FOCAL_GAMMA, FOCAL_ALPHA)`.
 
-    Cơ chế: `BaseModel.loss(batch, preds)` gọi `self.init_criterion()` lazily
-    khi criterion chưa tồn tại → override method này sẽ áp dụng cho mọi lượt
-    train và val, mà không đụng vào class Ultralytics (safe cho upgrade).
+    Gọi sau `model = YOLO(...)` và TRƯỚC `model.train()`.
+
+    QUAN TRỌNG — vì sao phải dùng callback:
+    ``Model.train()`` của Ultralytics KHÔNG train trên object model hiện tại;
+    nó tạo model mới bằng ``trainer.get_model(weights=..., cfg=self.model.yaml)``
+    rồi gán ``self.trainer.model``. Nếu chỉ patch ``yolo_model.model`` tại đây
+    thì bản vá bị vứt bỏ ngay khi train bắt đầu và focal loss âm thầm không có
+    tác dụng. Do đó patch được đăng ký thêm ở callback ``on_train_start``, lúc
+    ``trainer.model`` đã là model thật sự được train và criterion vẫn chưa được
+    khởi tạo (``BaseModel.loss`` tạo criterion lazily ở batch đầu tiên).
     """
     task = getattr(yolo_model.model, "task", None) or getattr(yolo_model, "task", None)
 
@@ -68,14 +88,17 @@ def install_cls_loss(yolo_model):
             "Chọn: 'bce' (Ultralytics default) hoặc 'focal'."
         )
 
-    original_init_criterion = yolo_model.model.init_criterion
+    # Patch model hiện tại (phục vụ model.val() / predict trực tiếp)...
+    _patch_module_criterion(yolo_model.model)
 
-    def patched_init_criterion():
-        criterion = original_init_criterion()  # v8DetectionLoss(self)
-        criterion.bce = FocalBCE(Config.FOCAL_GAMMA, Config.FOCAL_ALPHA)
-        return criterion
+    # ...và model thật sự do trainer dựng lại khi model.train() chạy.
+    def _on_train_start(trainer):
+        from train import unwrap_ultralytics_model
 
-    yolo_model.model.init_criterion = patched_init_criterion
+        _patch_module_criterion(unwrap_ultralytics_model(trainer.model))
+        print(f"  [Loss] FocalBCE đã được gắn vào trainer.model (task={task or 'YOLO'})")
+
+    yolo_model.add_callback("on_train_start", _on_train_start)
     print(
         f"  [Loss] {task or 'YOLO'} classification: FocalBCE (gamma={Config.FOCAL_GAMMA}, "
         f"alpha={Config.FOCAL_ALPHA}) thay cho BCE mặc định"

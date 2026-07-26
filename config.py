@@ -74,6 +74,12 @@ class Config:
     # ngoài Top-K — không lưu tất cả epoch (xem train.py)
     KEEP_TOP_K_CHECKPOINTS = 5  # nên = max(TOP_K_VALUES)
 
+    # Baseline K=1: eval TRỰC TIẾP raw FP32 checkpoint hạng 1 (không average).
+    # Cần thiết cho paper vì best.pt của Ultralytics bị strip_optimizer ép về
+    # FP16, trong khi Strategy 2 average ở FP32 → K=1 raw là điểm so sánh
+    # cùng precision, đồng thời là điểm đầu của đường cong mAP theo K.
+    EVAL_TOP1_BASELINE = True
+
     # BatchNorm update sau khi average — bắt chước update_bn() của repo gốc:
     # sau average, running_mean/running_var giữ nguyên từ ckpt tốt nhất (không
     # average vì đây là population stats) nhưng weights đổi → phải chạy
@@ -81,6 +87,14 @@ class Config:
     # nếu không mAP của Strategy 2 sẽ tụt do BN lệch phân phối.
     USE_BN_UPDATE = True
     BN_UPDATE_BATCHES = 100  # giống num_batches=100 của repo gốc
+    # Ultralytics tắt mosaic/mixup/cutmix/copy_paste trong `close_mosaic` epoch
+    # cuối (mặc định 10). BN phải được ước lượng lại trên ĐÚNG phân phối ảnh của
+    # giai đoạn mà Top-K checkpoint được train ra.
+    #   "auto" (khuyến nghị) = bám theo epoch của checkpoint hạng 1
+    #   True  = luôn tắt mosaic/mixup/cutmix/copy_paste khi update BN
+    #   False = luôn dùng full train augmentation
+    BN_UPDATE_CLOSE_MOSAIC = "auto"
+    AMP = True  # autocast khi forward update BN (chỉ có tác dụng trên CUDA)
 
     # ===================== Evaluation Configuration =====================
     # Split dùng cho báo cáo cuối (Strategy 1 vs Strategy 2):
@@ -96,10 +110,21 @@ class Config:
     EXP_NAME = None
     NAME = None          # backward-compatible khi không truyền EXP_NAME
     EXIST_OK = False
-    EXCEL_OUTPUT = None  # None = <run_dir>/segmentation_results.xlsx
+    EXCEL_OUTPUT = None  # None = tên mặc định trong run dir (chỉ dùng cho CLI eval/export)
     # Checkpoint chỉ là file tạm: dùng để rank/average/eval rồi xóa sau mỗi seed.
     # CSV, plot, config snapshot và Excel metrics vẫn được giữ.
     DELETE_CHECKPOINTS_AFTER_RUN = True
+
+    # --- Dọn dẹp artefact để thư mục kết quả chỉ còn Excel + chart ---
+    # Ultralytics dump ảnh mẫu (train_batch*.jpg, val_batch*.jpg, labels*.jpg)
+    # nặng hàng chục MB và không phải "chart" → mặc định xóa.
+    KEEP_SAMPLE_IMAGES = False
+    # Giữ plot của TỪNG lần model.val() theo strategy (PR/F1/confusion matrix
+    # riêng cho best.pt, Top-2 avg, ...). Mặc định tắt cho gọn; các chart tổng
+    # hợp trong summary/charts đã đủ để theo dõi.
+    SAVE_EVAL_PLOTS = False
+    # Sinh chart tổng hợp (mean±std theo strategy, đường cong mAP theo K, ...)
+    MAKE_CHARTS = True
 
     # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...).
     # Hỗ trợ số nguyên đơn lẻ (ví dụ: 42) hoặc danh sách các seed (ví dụ: [42, 100, 2026]).
@@ -191,6 +216,12 @@ class Config:
                     "KEEP_TOP_K_CHECKPOINTS must be >= max(TOP_K_VALUES) "
                     "để đủ checkpoint cho mọi giá trị K"
                 )
+            if cls.USE_BN_UPDATE:
+                if int(cls.BN_UPDATE_BATCHES) <= 0:
+                    raise ValueError("BN_UPDATE_BATCHES must be positive when USE_BN_UPDATE=True")
+                if not isinstance(cls.BN_UPDATE_CLOSE_MOSAIC, bool) and \
+                        str(cls.BN_UPDATE_CLOSE_MOSAIC).lower() != "auto":
+                    raise ValueError("BN_UPDATE_CLOSE_MOSAIC must be True, False or 'auto'")
             if float(cls.VAL_RATIO) == 0.0:
                 print(
                     "ℹ VAL_RATIO=0: dùng split val gốc để chọn checkpoint. "
@@ -207,7 +238,18 @@ class Config:
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
         print(f"  Task  : Instance Segmentation")
         print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
-        print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
+        if cls.USE_STRATEGY2:
+            print(f"  Strategy 2: ON — Top-K {cls.TOP_K_VALUES} "
+                  "(uniform element-wise average của raw weights, KHÔNG EMA)")
+            print(f"  Top-1 raw baseline (K=1): {'ON' if cls.EVAL_TOP1_BASELINE else 'OFF'}")
+        else:
+            print("  Strategy 2: OFF")
+        print(
+            "  BN update : "
+            + (f"ON — {cls.BN_UPDATE_BATCHES} batch train, no-grad forward, "
+               f"close_mosaic={cls.BN_UPDATE_CLOSE_MOSAIC}"
+               if cls.USE_BN_UPDATE else "OFF")
+        )
         print(
             "  Checkpoints: "
             + ("temporary → delete after evaluation" if cls.DELETE_CHECKPOINTS_AFTER_RUN else "keep")

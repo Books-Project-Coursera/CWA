@@ -5,10 +5,14 @@ Nhánh này CHỈ dùng model YOLO. Mọi config chỉnh trong config.py; các g
 hay dùng override được qua CLI (pattern như repo gốc).
 
     # Train (model lấy từ Config.MODEL, đặt tên experiment rõ ràng trên server)
-    python main.py train --exp_name carparts_yolov8s_raw_topk_run01
+    python main.py train --exp-name yolov8s_exp1
+    #   → results/segmentation/yolov8s_exp1/
+    #       README.md, experiment_config.json,
+    #       summary/{yolov8s_exp1_summary.xlsx, charts/},
+    #       seeds/seed_<N>/{seed_<N>_results.xlsx, charts/, logs/}
 
     # Đánh giá lại Strategy 1 + Strategy 2 trên một run đã train
-    python main.py strategies --run-dir results/segmentation/<experiment>/seed_42
+    python main.py strategies --run-dir results/segmentation/<experiment>/seeds/seed_42
 
     # Eval một file weights bất kỳ (in mAP/P/R/per-class AP + Excel)
     python main.py eval --weights <run>/weights/best.pt --split test

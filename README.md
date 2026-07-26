@@ -21,12 +21,17 @@ Mặc định dùng `carparts-seg.yaml` của Ultralytics:
 Pipeline dùng `carparts-seg.yaml` được pin ngay trong project thay vì YAML cũ
 đóng gói trong `ultralytics==8.3.152`.
 
-## Hai strategy
+## Các strategy được báo cáo
 
 | Strategy | Mô tả |
 |---|---|
-| Strategy 1 | `best.pt` tạm — raw checkpoint có raw-model fitness validation cao nhất |
-| Strategy 2 | Uniform element-wise average raw weights của Top-K raw checkpoint |
+| `Strategy 1 (best.pt)` | `best.pt` tạm — raw checkpoint có raw-model fitness validation cao nhất (FP16 do `strip_optimizer` của Ultralytics) |
+| `Top-1 (best raw ckpt)` | Chính checkpoint đó nhưng **raw FP32, không average, không đụng BN** — baseline K=1 cùng precision với Strategy 2. Bật/tắt bằng `EVAL_TOP1_BASELINE` |
+| `Strategy 2 (Top-K avg)` | Uniform element-wise average raw weights của Top-K raw checkpoint + BN recalibration |
+
+`Top-1` tồn tại để tách bạch hai nguồn chênh lệch: precision của checkpoint
+(FP16 vs FP32) và tác dụng thật của averaging. Nó cũng là điểm K = 1 của đường
+cong mAP theo K trong `summary/charts/03_topk_curve_mAP50-95.png`.
 
 Ultralytics segmentation fitness được dùng thống nhất cho `best.pt`, early
 stopping và Top-K:
@@ -76,16 +81,43 @@ Khi `USE_STRATEGY2=True`:
 - Callback tắt EMA và lấy raw-model `trainer.fitness`.
 - Chỉ giữ `KEEP_TOP_K_CHECKPOINTS` checkpoint có fitness cao nhất.
 - Ranking được ghi vào `weights/strategy2_checkpoints.json`.
-- Raw FP32 model parameters được uniform-average.
-- BN `running_mean`, `running_var`, `num_batches_tracked` không được average.
-- Sau averaging, `update_bn_stats()` re-estimate BN statistics bằng ảnh train
-  với task segmentation trước khi đánh giá.
+- Raw FP32 **learnable parameters** (conv/linear weight, bias, γ/β của BN) được
+  uniform-average; các checkpoint phải cùng kiến trúc, nếu không `average_checkpoints`
+  raise ngay.
+- BN `running_mean`, `running_var`, `num_batches_tracked` **không** được average
+  (đây là population statistics, không phải tham số học được) — chúng giữ nguyên
+  từ checkpoint hạng 1 rồi bị `update_bn_stats()` reset và ước lượng lại.
 - Mỗi `strategy2_topK_avg.pt` được xóa ngay sau `model.val()`.
 - Cuối mỗi seed, toàn bộ thư mục `weights/` (`best.pt`, `last.pt`, raw
   `epochN.pt`, ranking JSON còn lại) được xóa trong khối `finally`.
 
 Run cũ dùng EMA hoặc JSON xếp hạng cũ sẽ bị từ chối; cần train lại vì raw
 checkpoints tương ứng không tồn tại trong run cũ.
+
+### BN recalibration (`update_bn_stats`)
+
+Sau averaging, weights của các layer trước BN đã đổi nhưng `running_mean` /
+`running_var` vẫn là của checkpoint cũ → phân phối activation lệch. Quy trình
+khớp đúng `torch.optim.swa_utils.update_bn`:
+
+1. `reset_running_stats()` cho mọi `_BatchNorm`, đặt `momentum = None`
+   (cumulative moving average, không phải EMA).
+2. Toàn model `eval()`, riêng các BN module `train()` để tích lũy thống kê.
+3. Lặp `BN_UPDATE_BATCHES` batch của **split train** trong `torch.no_grad()` —
+   **không** backward, **không** optimizer step, chỉ forward.
+4. Trả `momentum` về giá trị cũ, ghi đè checkpoint (chỉ BN buffers thay đổi;
+   learnable parameters giữ nguyên FP32 vừa average).
+
+`BN_UPDATE_CLOSE_MOSAIC` quyết định augmentation của dataloader dùng để ước
+lượng BN. Ultralytics tắt mosaic/mixup/cutmix/copy_paste trong `close_mosaic`
+epoch cuối (mặc định 10); nếu ước lượng BN trên ảnh mosaic trong khi checkpoint
+được train ở giai đoạn không mosaic thì BN stats sẽ lệch. Mặc định `"auto"` bám
+theo epoch của checkpoint hạng 1: nằm trong `close_mosaic` epoch cuối → tắt
+mosaic; early stopping sớm hơn → dùng full augmentation.
+
+Dataloader BN được giải phóng tường minh sau khi dùng: `build_dataloader` của
+Ultralytics trả `InfiniteDataLoader` giữ worker process sống, nếu không `del`
+thì mỗi giá trị K và mỗi seed lại cộng thêm `WORKERS` process.
 
 ## Cài đặt
 
@@ -106,7 +138,7 @@ CLI:
 python main.py train --exp_name carparts_yolov8s_raw_topk_run01
 
 # Đánh giá lại Strategy 1 và Strategy 2 của một run
-python main.py strategies --run-dir results/segmentation/<experiment>/seed_42
+python main.py strategies --run-dir results/segmentation/<experiment>/seeds/seed_42
 
 # Đánh giá một weights segmentation
 python main.py eval --weights <run>/weights/best.pt --split test
@@ -134,30 +166,67 @@ tồn tại và không rỗng sẽ bị từ chối để tránh trộn hai thí
 
 ## Output
 
+`python main.py train --exp-name yolov8s_exp1` tạo đúng một thư mục mang tên
+experiment, bên trong chỉ có Excel, chart và log — **không có checkpoint `.pt`**:
+
 ```text
-results/segmentation/<exp_name>/
-├── experiment_config.json
-├── multi_seed_summary.xlsx
-└── seed_<N>/
-    ├── results.csv
-    └── segmentation_results_seed<N>.xlsx
+results/segmentation/yolov8s_exp1/
+├── README.md                          # bảng mean ± std đọc nhanh, không cần mở Excel
+├── experiment_config.json             # snapshot toàn bộ config lúc chạy
+├── summary/
+│   ├── yolov8s_exp1_summary.xlsx      # kết quả tổng hợp 5 seed
+│   └── charts/
+│       ├── 01_mAP50-95_by_strategy.png   # bar mean ± std theo strategy
+│       ├── 02_mAP50_by_strategy.png
+│       ├── 03_topk_curve_mAP50-95.png    # mAP theo K + đường baseline
+│       ├── 04_per_seed_mAP50-95.png      # mỗi seed một đường
+│       ├── 05_delta_vs_baseline.png      # Δ ghép cặp theo seed + tỉ lệ thắng
+│       └── 06_per_class_delta.png        # Δ AP từng class
+└── seeds/
+    ├── seed_1/
+    │   ├── seed_1_results.xlsx        # Summary | PerEpoch | Checkpoints
+    │   ├── charts/
+    │   │   ├── training_curves.png        # results.png của Ultralytics
+    │   │   ├── checkpoint_selection.png   # fitness/epoch + đánh dấu Top-K
+    │   │   ├── confusion_matrix*.png
+    │   │   └── Box*_curve.png, Mask*_curve.png
+    │   └── logs/{results.csv, args.yaml}
+    ├── seed_10/ ...
+    └── seed_500/
 ```
 
-Mặc định không còn `weights/` sau khi một seed hoàn tất:
-`DELETE_CHECKPOINTS_AFTER_RUN=True`. Checkpoint chỉ tồn tại tạm thời trong lúc
-rank, averaging, BN update, evaluation và export tùy chọn. Vì vậy muốn giữ hoặc
-deploy model `.pt`, cần chủ động đổi policy này trước khi train; mặc định hiện
-tại ưu tiên không lưu checkpoint theo yêu cầu thí nghiệm.
+### `summary/<exp_name>_summary.xlsx`
 
-Excel gồm:
+| Sheet | Nội dung |
+|---|---|
+| `MeanStd` | **mean ± std của toàn bộ seed cho từng strategy** — bảng chính để đưa vào paper (`std` là sample std, `ddof=1`) |
+| `DeltaVsBaseline` | Δ **ghép cặp theo seed** so với Strategy 1 + số seed mà strategy đó thắng |
+| `PerSeed` | mỗi row = 1 seed × 1 strategy |
+| `PerClass_MeanStd` | mean ± std AP theo class × strategy |
+| `PerClass_PerSeed` | AP per class thô |
+| `Checkpoints` | epoch nào được chọn vào Top-K ở từng seed và fitness tương ứng |
+| `RunInfo` | cấu hình experiment, tiêu chí chọn checkpoint, seed lỗi (nếu có) |
 
-- `Summary`: mask Precision, Recall, mAP50, mAP75, mAP50-95, combined
-  box+mask fitness và mask AP per class.
-- `PerEpoch`: toàn bộ cột train/validation do Ultralytics ghi trong
-  `results.csv`, gồm cả box và mask metrics.
+### `seeds/seed_<N>/seed_<N>_results.xlsx`
 
-Khi chỉ export offline từ `results.csv`, bảng overall sử dụng các cột mask
-`metrics/*(M)`.
+- `Summary`: run info + overall metrics theo strategy (kèm cột `Δ ... vs S1`) +
+  mask AP per class theo strategy.
+- `PerEpoch`: toàn bộ cột train/validation trong `results.csv` (box và mask).
+- `Checkpoints`: ranking Top-K theo fitness val'.
+
+Mặc định không còn `weights/` sau khi một seed hoàn tất
+(`DELETE_CHECKPOINTS_AFTER_RUN=True`). Checkpoint chỉ tồn tại tạm thời trong lúc
+rank, averaging, BN update, evaluation và export tùy chọn. Muốn giữ hoặc deploy
+model `.pt` thì phải đổi policy này trước khi train.
+
+Ảnh mẫu Ultralytics dump ra (`train_batch*.jpg`, `val_batch*.jpg`, `labels*.jpg`)
+bị xóa mặc định (`KEEP_SAMPLE_IMAGES=False`) vì chúng nặng và không phải chart.
+Plot của từng lần `model.val()` theo strategy tắt mặc định
+(`SAVE_EVAL_PLOTS=False`); khi bật, chúng nằm trong `seeds/seed_<N>/eval_plots/`
+chứ không rơi vào `runs/segment/valN` như mặc định của Ultralytics.
+
+Một seed lỗi không làm hỏng cả experiment: pipeline ghi lại lỗi, chạy tiếp các
+seed còn lại và liệt kê seed thất bại trong `README.md` + sheet `RunInfo`.
 
 ## Config quan trọng
 
@@ -167,9 +236,13 @@ Khi chỉ export offline từ `results.csv`, bảng overall sử dụng các c�
 | Training | `EPOCHS`, `IMGSZ`, `BATCH`, `DEVICE`, `PATIENCE`, `RANDOM_SEED` |
 | Optimizer/LR | `OPTIMIZER`, `LR0`, `LRF`, `WARMUP_EPOCHS`, `COS_LR` |
 | Augmentation | `MIXUP`, `COPY_PASTE`, `EXTRA_TRAIN_ARGS` |
-| Strategy 2 | `TOP_K_VALUES`, `KEEP_TOP_K_CHECKPOINTS`, `USE_BN_UPDATE`, `BN_UPDATE_BATCHES` |
+| Strategy 2 | `TOP_K_VALUES`, `KEEP_TOP_K_CHECKPOINTS`, `EVAL_TOP1_BASELINE` |
+| BN recalibration | `USE_BN_UPDATE`, `BN_UPDATE_BATCHES`, `BN_UPDATE_CLOSE_MOSAIC`, `AMP` |
 | Evaluation | `EVAL_SPLIT`, `CONF`, `IOU` |
-| Output | `PROJECT`, `EXP_NAME`, `DELETE_CHECKPOINTS_AFTER_RUN` |
+| Output | `PROJECT`, `EXP_NAME`, `DELETE_CHECKPOINTS_AFTER_RUN`, `KEEP_SAMPLE_IMAGES`, `SAVE_EVAL_PLOTS`, `MAKE_CHARTS` |
 
 `PATIENCE` đếm số epoch không có fitness cải thiện nghiêm ngặt; early stopping
 không dựa trên validation loss.
+
+`RANDOM_SEED` nhận list (mặc định `[1, 10, 42, 100, 500]`); mỗi seed là một run
+độc lập trong `seeds/seed_<N>/` và tất cả được gộp vào `summary/`.
