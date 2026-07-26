@@ -36,7 +36,7 @@ from evaluate import (
     print_multi_seed_table,
     run_strategy_evaluation,
 )
-from losses import install_cls_loss
+from losses import assert_cls_loss_installed, install_cls_loss
 from reporting import tidy_run_dir
 
 
@@ -208,6 +208,10 @@ class TopKCheckpointManager:
         import ultralytics
 
         raw_model = deepcopy(unwrap_ultralytics_model(trainer.model)).float().cpu()
+        # Bỏ criterion khỏi checkpoint (giống strip_optimizer của Ultralytics):
+        # nó chỉ dùng lúc train, lại giữ tham chiếu ngược về model và kéo theo
+        # class custom (FocalBCE) vào file pickle.
+        raw_model.criterion = None
         raw_ckpt = {
             "epoch": int(trainer.epoch),
             "best_fitness": float(getattr(trainer, "best_fitness", fitness)),
@@ -313,7 +317,10 @@ def build_train_args(data_yaml):
         # prune ngay nên disk không phình theo số epoch
         train_args["save_period"] = 1
     else:
-        # Không dùng Strategy 2 → không cần lưu checkpoint mỗi epoch
+        # Không dùng Strategy 2 → không cần epoch checkpoint, nhưng VẪN phải
+        # save=True: với save=False Ultralytics chỉ gọi save_model() ở epoch
+        # cuối nên best.pt có thể không bao giờ được ghi, và Strategy 1 mất
+        # weights để đánh giá.
         train_args["save"] = True
 
     if Config.DEVICE is not None:
@@ -357,8 +364,11 @@ def _train_one_seed(seed, exp_dir):
             f"Model {Config.MODEL!r} có task={getattr(model, 'task', None)!r}; "
             "hãy dùng weights/config detection (ví dụ yolov8s.pt)."
         )
-    # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'
+    # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'.
+    # install_cls_loss đăng ký callback vì trainer dựng DetectionModel MỚI;
+    # assert_cls_loss_installed kiểm chứng loss thực tế trước khi train chạy.
     install_cls_loss(model)
+    model.add_callback("on_train_start", assert_cls_loss_installed)
 
     if Config.USE_STRATEGY2:
         manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)

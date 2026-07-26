@@ -103,6 +103,30 @@ Detection fitness trong Ultralytics 8.3.152 là:
 `trainer.fitness` chính là criterion được dùng để rank checkpoint và điều
 khiển early stopping.
 
+## Classification loss (`LOSS_FUNCTION`)
+
+`'bce'` giữ nguyên mặc định Ultralytics; `'focal'` thay `criterion.bce` bằng
+`FocalBCE` (BCE × `(1-p_t)^γ` × α-factor, giữ shape element-wise).
+
+Lưu ý về cách cài: **không** patch được `yolo_model.model` trước khi train.
+`Model.train()` dựng một `DetectionModel` HOÀN TOÀN MỚI:
+
+```python
+self.trainer.model = self.trainer.get_model(weights=..., cfg=self.model.yaml)
+```
+
+nên mọi thứ gắn lên module cũ đều bị vứt đi và training âm thầm chạy bằng BCE.
+Vì vậy loss được gán ở callback `on_train_start` (lúc model đã ở đúng device —
+`v8DetectionLoss` chụp device khi khởi tạo), cho **cả** `trainer.model` lẫn
+`trainer.ema.ema` để cột `val/cls_loss` trong `results.csv` cùng thang đo với
+`train/cls_loss`. Loss được gán vào `model.criterion` chứ không phải
+monkeypatch `init_criterion`, vì gắn bound method lên instance làm hỏng pickle
+của checkpoint.
+
+`assert_cls_loss_installed` chạy ngay sau đó và **raise** nếu loss thực tế
+không phải `FocalBCE` — một bản Ultralytics tương lai làm hỏng cơ chế này sẽ bị
+phát hiện ngay thay vì hỏng âm thầm cả experiment.
+
 ## Checkpoint lifecycle
 
 Checkpoint chỉ là artifact tạm:

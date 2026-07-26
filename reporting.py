@@ -484,9 +484,10 @@ def export_seed_excel(
 
 def _build_summary_frames(all_runs_results):
     """
-    Từ list kết quả các seed → (per_seed_df, per_class_df, ranking_df, order).
+    Từ list kết quả các seed → (per_seed_df, per_class_df, ranking_df, order, shorts).
 
-    `order` giữ đúng thứ tự strategy xuất hiện lần đầu để bảng và chart nhất quán.
+    `order` giữ đúng thứ tự strategy xuất hiện lần đầu để bảng và chart nhất
+    quán; `shorts` map tên đầy đủ → nhãn ngắn dùng trên trục chart.
     """
     per_seed_rows, per_class_rows, ranking_rows = [], [], []
     order, shorts = [], {}

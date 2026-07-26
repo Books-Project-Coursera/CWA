@@ -90,6 +90,16 @@ def add_common_args(parser):
         choices=EVAL_SPLIT_CHOICES,
         help="Split cho báo cáo cuối (Config.EVAL_SPLIT). Mặc định 'test' = VOC2007 test.",
     )
+    # Các cờ Strategy 2 dùng chung cho cả `train` lẫn `strategies`
+    parser.add_argument(
+        "--top-k", type=int, nargs="+", dest="top_k_values",
+        help="Override Config.TOP_K_VALUES, ví dụ: --top-k 2 3 5.",
+    )
+    parser.add_argument(
+        "--no-bn-update", action="store_true",
+        help="Tắt BN recalibration sau khi average (không khuyến nghị).",
+    )
+    parser.add_argument("--bn-batches", type=int, help="Override Config.BN_UPDATE_BATCHES.")
 
 
 def parse_args():
@@ -108,17 +118,6 @@ def parse_args():
     p_train.add_argument(
         "--no-strategy2", action="store_true",
         help="Tắt Strategy 2 (không lưu/average Top-K checkpoint).",
-    )
-    p_train.add_argument(
-        "--top-k", type=int, nargs="+", dest="top_k_values",
-        help="Override Config.TOP_K_VALUES, ví dụ: --top-k 2 3 5.",
-    )
-    p_train.add_argument(
-        "--no-bn-update", action="store_true",
-        help="Tắt BN recalibration sau khi average (không khuyến nghị).",
-    )
-    p_train.add_argument(
-        "--bn-batches", type=int, help="Override Config.BN_UPDATE_BATCHES.",
     )
     p_train.add_argument(
         "--keep-checkpoints", action="store_true",
