@@ -37,7 +37,12 @@ class Config:
     IMGSZ = 640
     BATCH = 128     # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
-    WORKERS = 24
+    # Số dataloader worker. LƯU Ý: Ultralytics dùng `workers * 2` cho val
+    # dataloader lúc train (models/yolo/detect/train.py) → set 16 thì val chạy
+    # 32 worker và dễ bị "DataLoader worker killed" / hết /dev/shm.
+    # CAP_VAL_WORKERS=True buộc val loader dùng đúng WORKERS, không nhân đôi.
+    WORKERS = 16
+    CAP_VAL_WORKERS = True
     PATIENCE = 10   # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
     CACHE = False     # False | "ram" | "disk" — cache dataset
@@ -45,6 +50,10 @@ class Config:
     DETERMINISTIC = True  # Ultralytics đặt torch.deterministic + seed reproducible
 
     # ===================== Optimizer & LR Schedule (Overridden Only) =====================
+    # CHỈ override những giá trị bên dưới. `momentum` (0.937), `weight_decay`
+    # (5e-4, được Ultralytics scale theo batch), `warmup_momentum` (0.8),
+    # `warmup_bias_lr` (0.1), `nbs` (64) GIỮ NGUYÊN mặc định của Ultralytics —
+    # build_train_args() không truyền chúng nên trainer tự dùng default.
     OPTIMIZER = "SGD"  # Bộ tối ưu (auto, SGD, Adam, AdamW, RMSprop, ...)
     LR0 = 5e-3       # LR ban đầu (mặc định Ultralytics là 0.01)
     LRF = 0.01        # Hệ số LR cuối cùng (final learning rate factor = lr0 * lrf)
@@ -52,8 +61,10 @@ class Config:
     COS_LR = True      # Dùng cosine learning rate decay (mặc định Ultralytics là False)
 
     # ===================== Loss Function =====================
-    # Segmentation loss gồm box + mask + classification + DFL. Tùy chọn focal
-    # chỉ thay BCE ở nhánh classification; không thay mask loss.
+    # Segmentation loss gồm box + mask + classification + DFL.
+    # "bce" = LOSS MẶC ĐỊNH CỦA ULTRALYTICS (v8SegmentationLoss nguyên bản) —
+    # dùng cái này cho task segmentation. "focal" chỉ thay BCE ở nhánh
+    # classification, không thay box/mask/DFL loss.
     LOSS_FUNCTION = "bce"
     FOCAL_GAMMA = 1.5
     FOCAL_ALPHA = 0.25
@@ -94,7 +105,10 @@ class Config:
     #   True  = luôn tắt mosaic/mixup/cutmix/copy_paste khi update BN
     #   False = luôn dùng full train augmentation
     BN_UPDATE_CLOSE_MOSAIC = "auto"
-    AMP = True  # autocast khi forward update BN (chỉ có tác dụng trên CUDA)
+    # Mixed precision: dùng cho CẢ training (Ultralytics `amp`) lẫn forward pass
+    # của BN update. Trên H100 autocast tự chọn bfloat16 (không cần GradScaler
+    # tuning) — để True.
+    AMP = True
 
     # ===================== Evaluation Configuration =====================
     # Split dùng cho báo cáo cuối (Strategy 1 vs Strategy 2):

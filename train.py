@@ -268,6 +268,43 @@ class TopKCheckpointManager:
         )
 
 
+def cap_val_dataloader_workers(trainer):
+    """
+    Buộc val dataloader lúc train dùng ĐÚNG ``Config.WORKERS``.
+
+    ``ultralytics/models/yolo/detect/train.py`` có:
+
+        workers = self.args.workers if mode == "train" else self.args.workers * 2
+
+    → set ``workers=16`` thì val loader mở 32 worker, dễ gây
+    "DataLoader worker (pid ...) is killed by signal" hoặc hết ``/dev/shm``.
+    Callback này chỉ tạm chia đôi ``args.workers`` đúng lúc dựng val loader để
+    phép nhân 2 của Ultralytics trả về đúng con số đã cấu hình; train loader
+    không bị đụng tới.
+
+    Đăng ký ở ``on_pretrain_routine_start`` vì ``_setup_train`` dựng cả hai
+    dataloader ngay sau callback này.
+    """
+    if not Config.CAP_VAL_WORKERS:
+        return
+
+    original_get_dataloader = trainer.get_dataloader
+
+    def get_dataloader(dataset_path, batch_size=16, rank=0, mode="train"):
+        if mode == "train":
+            return original_get_dataloader(dataset_path, batch_size, rank, mode)
+        requested = int(trainer.args.workers)
+        trainer.args.workers = requested // 2  # Ultralytics sẽ nhân 2 trở lại
+        try:
+            return original_get_dataloader(dataset_path, batch_size, rank, mode)
+        finally:
+            trainer.args.workers = requested
+
+    trainer.get_dataloader = get_dataloader
+    print(f"  Dataloader: val workers bị giới hạn về {int(trainer.args.workers)} "
+          "(mặc định Ultralytics là workers × 2)")
+
+
 def delete_checkpoint_artifacts(run_dir):
     """
     Xóa toàn bộ checkpoint tạm trong ``<run_dir>/weights``.
@@ -360,6 +397,7 @@ def build_train_args(data_yaml):
         "cache": Config.CACHE,
         "resume": bool(Config.RESUME),
         "deterministic": bool(Config.DETERMINISTIC),
+        "amp": bool(Config.AMP),
         "project": Config.PROJECT,
         "exist_ok": bool(Config.EXIST_OK),
 
@@ -596,6 +634,9 @@ def train_detector():
         "lrf": Config.LRF,
         "warmup_epochs": Config.WARMUP_EPOCHS,
         "cos_lr": Config.COS_LR,
+        "workers": Config.WORKERS,
+        "cap_val_workers": Config.CAP_VAL_WORKERS,
+        "amp": Config.AMP,
         "loss_function": Config.LOSS_FUNCTION,
         "focal_gamma": Config.FOCAL_GAMMA,
         "focal_alpha": Config.FOCAL_ALPHA,
@@ -639,7 +680,9 @@ def train_detector():
                         "hãy dùng weights/config segmentation (ví dụ yolov8s-seg.pt)."
                     )
                 # Swap cls loss NẾU Config.LOSS_FUNCTION != 'bce'
+                # ('bce' = giữ nguyên v8SegmentationLoss mặc định của Ultralytics)
                 install_cls_loss(model)
+                model.add_callback("on_pretrain_routine_start", cap_val_dataloader_workers)
 
                 if Config.USE_STRATEGY2:
                     manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)

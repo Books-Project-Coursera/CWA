@@ -4,6 +4,30 @@ Pipeline này chỉ dùng model YOLO segmentation (`-seg`) qua Ultralytics API.
 Mọi cấu hình chính nằm trong `config.py`; `main.py` cung cấp CLI để train,
 đánh giá Strategy 1/2, xuất Excel và export model.
 
+Xem [`FLOW.md`](FLOW.md) để nắm luồng chạy từ đầu đến cuối.
+
+## Những gì giữ nguyên mặc định của Ultralytics
+
+- **Loss**: `v8SegmentationLoss` nguyên bản (box + mask + cls BCE + DFL).
+  `LOSS_FUNCTION = "bce"`. Tùy chọn `"focal"` chỉ để ablation.
+- **SGD**: `momentum = 0.937`, `weight_decay = 5e-4` (Ultralytics tự scale theo
+  batch), `warmup_momentum = 0.8`, `warmup_bias_lr = 0.1`, `nbs = 64`.
+  `build_train_args()` không truyền các key này nên trainer dùng default.
+- Chỉ override: `optimizer`, `lr0`, `lrf`, `warmup_epochs`, `cos_lr`, `mixup`,
+  `copy_paste`.
+
+## Dataloader workers
+
+Ultralytics dùng `workers × 2` cho val dataloader lúc train
+(`models/yolo/detect/train.py`), nên đặt `WORKERS = 16` thì val chạy 32 worker
+và hay bị `DataLoader worker (pid ...) is killed by signal` hoặc hết `/dev/shm`.
+`CAP_VAL_WORKERS = True` (mặc định) buộc val loader dùng đúng `WORKERS`.
+
+## AMP
+
+`AMP = True` áp dụng cho cả training (`amp` của Ultralytics) và forward pass của
+BN recalibration. Trên H100 autocast tự chọn `bfloat16`.
+
 ## Data split
 
 Mặc định dùng `carparts-seg.yaml` của Ultralytics:
