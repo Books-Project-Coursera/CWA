@@ -126,6 +126,38 @@ class TopKCheckpointManager:
         )
 
     @staticmethod
+    def _replace_inference_tensors(module):
+        """
+        Thay mọi param/buffer là "inference tensor" bằng bản clone bình thường.
+
+        Validator của Ultralytics chạy trong ``torch.inference_mode()`` và gọi
+        ``model.half()`` ở đó → các tensor mới sinh ra bị đánh dấu inference.
+        Sau khi thoát inference_mode, mọi ghi in-place lên chúng (chính là thứ
+        ``load_state_dict`` làm qua ``param.copy_()``) sẽ raise:
+        "Inplace update to inference tensor outside InferenceMode is not
+        allowed." Clone là cách thoát nhãn đó (xem pytorch/rfcs#17).
+
+        Trả về số tensor đã thay để caller có thể log/kiểm tra.
+        """
+        import torch
+        from torch import nn
+
+        replaced = 0
+        for submodule in module.modules():
+            for name, param in list(submodule.named_parameters(recurse=False)):
+                if param is not None and torch.is_inference(param.data):
+                    new_param = nn.Parameter(
+                        param.data.clone(), requires_grad=param.requires_grad
+                    )
+                    setattr(submodule, name, new_param)
+                    replaced += 1
+            for name, buf in list(submodule.named_buffers(recurse=False)):
+                if buf is not None and torch.is_inference(buf):
+                    submodule._buffers[name] = buf.clone()
+                    replaced += 1
+        return replaced
+
+    @staticmethod
     def sync_raw_validation_model(trainer):
         """
         Copy chính xác raw weights/buffers sang model validation riêng.
@@ -143,6 +175,11 @@ class TopKCheckpointManager:
             validation_model = deepcopy(raw_model).eval()
             validation_model.requires_grad_(False)
             trainer.ema.ema = validation_model
+
+        # Vòng val trước có thể đã để lại inference tensor trong module này
+        # (model.half() gọi bên trong inference_mode). Phải gỡ nhãn đó trước khi
+        # load_state_dict, nếu không copy_() sẽ raise RuntimeError.
+        TopKCheckpointManager._replace_inference_tensors(validation_model)
 
         with torch.no_grad():
             # Validator của Ultralytics gọi model.half() khi val trong lúc train,
