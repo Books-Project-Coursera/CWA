@@ -5,7 +5,14 @@ Nhánh này CHỈ dùng model YOLO. Mọi config chỉnh trong config.py; các g
 hay dùng override được qua CLI (pattern như repo gốc).
 
     # Train (model lấy từ Config.MODEL, hoặc override --model)
-    python main.py train --model yolov8s.pt --device 0 --exp_name voc_yolov8s_raw_topk_run01
+    python main.py train --exp-name yolov8s_exp1
+
+    Kết quả nằm gọn trong results/detection/yolov8s_exp1/:
+        SUMMARY.xlsx            mean ± std của cả 5 seed × mọi strategy
+        charts/                 5 chart tổng hợp
+        seeds/seed_<N>/         Excel + charts của từng seed
+        experiment_config.json
+    Không giữ lại checkpoint .pt nào.
 
     # Đánh giá lại Strategy 1 + Strategy 2 trên một run đã train
     python main.py strategies --run-dir results/detection/yolov8n_voc
@@ -103,6 +110,24 @@ def parse_args():
         help="Tắt Strategy 2 (không lưu/average Top-K checkpoint).",
     )
     p_train.add_argument(
+        "--top-k", type=int, nargs="+", dest="top_k_values",
+        help="Override Config.TOP_K_VALUES, ví dụ: --top-k 2 3 5.",
+    )
+    p_train.add_argument(
+        "--no-bn-update", action="store_true",
+        help="Tắt BN recalibration sau khi average (không khuyến nghị).",
+    )
+    p_train.add_argument(
+        "--bn-batches", type=int, help="Override Config.BN_UPDATE_BATCHES.",
+    )
+    p_train.add_argument(
+        "--keep-checkpoints", action="store_true",
+        help="Giữ lại checkpoint .pt và không dọn run dir (mặc định là xóa).",
+    )
+    p_train.add_argument(
+        "--no-charts", action="store_true", help="Không vẽ chart tổng hợp cuối experiment.",
+    )
+    p_train.add_argument(
         "--export-after-train", action="store_true",
         help="Bật Config.EXPORT_ENABLED: xuất model (ONNX/... theo config) sau train.",
     )
@@ -165,6 +190,8 @@ def apply_cli_overrides(args):
         ("EVAL_SPLIT", getattr(args, "split", None)),
         ("EXCEL_OUTPUT", getattr(args, "excel_output", None)),
         ("EXPORT_FORMAT", getattr(args, "export_format", None)),
+        ("TOP_K_VALUES", getattr(args, "top_k_values", None)),
+        ("BN_UPDATE_BATCHES", getattr(args, "bn_batches", None)),
     ]
     for attr, value in overrides:
         if value is not None:
@@ -172,6 +199,13 @@ def apply_cli_overrides(args):
 
     if getattr(args, "no_strategy2", False):
         Config.USE_STRATEGY2 = False
+    if getattr(args, "no_bn_update", False):
+        Config.USE_BN_UPDATE = False
+    if getattr(args, "keep_checkpoints", False):
+        Config.DELETE_CHECKPOINTS_AFTER_RUN = False
+        Config.TIDY_RUN_DIR = False
+    if getattr(args, "no_charts", False):
+        Config.MAKE_CHARTS = False
     if getattr(args, "export_after_train", False):
         Config.EXPORT_ENABLED = True
     if getattr(args, "half", False):

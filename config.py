@@ -64,8 +64,14 @@ class Config:
     FOCAL_ALPHA = 0.25  # balancing param — 0 tắt
 
     # ===================== Augmentation (Overridden Only) =====================
-    MIXUP = 0.15           # Bật nhẹ mixup cho detection (mặc định Ultralytics là 0.0)
-    COPY_PASTE = 0.15        # Copy-paste hữu ích cho detection (mặc định Ultralytics là 0.0)
+    MIXUP = 0.15       # Bật nhẹ mixup cho detection (mặc định Ultralytics là 0.0)
+    # ⚠ COPY_PASTE CHỈ CÓ TÁC DỤNG VỚI LABEL DẠNG SEGMENTATION.
+    # ultralytics.data.augment.CopyPaste.__call__ return luôn khi
+    # len(labels["instances"].segments) == 0. Label VOC do Ultralytics convert là
+    # bbox-only → giá trị này là NO-OP trên VOC, đặt bao nhiêu cũng không đổi gì.
+    # Giữ lại để dùng khi chuyển sang dataset có segment; đặt 0.0 nếu muốn config
+    # phản ánh đúng những gì thực sự chạy.
+    COPY_PASTE = 0.15
 
     # ===================== Strategy Configuration =====================
     # Strategy 1: best.pt — RAW checkpoint có fitness cao nhất trên val'
@@ -79,13 +85,28 @@ class Config:
     # ngoài Top-K — không lưu tất cả epoch (xem train.py)
     KEEP_TOP_K_CHECKPOINTS = 5  # nên = max(TOP_K_VALUES)
 
-    # BatchNorm update sau khi average — bắt chước update_bn() của repo gốc:
-    # sau average, running_mean/running_var giữ nguyên từ ckpt tốt nhất (không
-    # average vì đây là population stats) nhưng weights đổi → phải chạy
-    # forward pass trên train để re-estimate BN stats khớp weights mới,
-    # nếu không mAP của Strategy 2 sẽ tụt do BN lệch phân phối.
+    # Strategy 1 lấy từ rank #1 của chính bảng ranking Top-K (raw FP32) thay vì
+    # best.pt. Cùng epoch, cùng weights — nhưng best.pt được Ultralytics lưu ở
+    # FP16 nên nếu so trực tiếp với bản average FP32 thì hai nhánh lệch
+    # precision. True = so sánh apples-to-apples. False = dùng best.pt.
+    STRATEGY1_FROM_RAW_TOPK = True
+
+    # BatchNorm recalibration sau khi average — tương đương update_bn() của
+    # torch.optim.swa_utils: sau average, running_mean/running_var giữ nguyên từ
+    # ckpt tốt nhất (không average vì đây là population stats) nhưng weights đã
+    # đổi → phải LẶP QUA TRAINING DATA ở chế độ forward-only (no_grad, không
+    # optimizer) để ước lượng lại BN stats khớp weights mới. Không làm thì mAP
+    # của Strategy 2 tụt do BN lệch phân phối.
     USE_BN_UPDATE = True
-    BN_UPDATE_BATCHES = 100  # giống num_batches=100 của repo gốc
+    BN_UPDATE_BATCHES = 100   # số batch forward (giống num_batches=100 repo gốc)
+    BN_UPDATE_AUGMENT = True  # True = dataloader mode='train' (đúng phân phối đã
+                              # augment mà BN stats gốc được tích lũy trên đó)
+    BN_UPDATE_AMP = True      # autocast trên CUDA cho khớp precision lúc train
+    # Control quan trọng cho paper: Strategy 2 được BN-recalibrate còn Strategy 1
+    # thì không → không thể biết cải thiện đến từ AVERAGING hay từ BN. Bật cờ này
+    # để eval thêm dòng "Strategy 1 + BN recal" (baseline đã BN-recalibrate) làm
+    # ablation. Tốn thêm 1 lần BN update + 1 lần eval mỗi seed.
+    BN_UPDATE_CONTROL = True
 
     # ===================== Evaluation Configuration =====================
     # Split dùng cho báo cáo cuối (Strategy 1 vs Strategy 2):
@@ -95,15 +116,31 @@ class Config:
     IOU = None   # NMS IoU threshold; None = mặc định Ultralytics
 
     # ===================== Output Configuration =====================
+    # Cây thư mục kết quả của `python main.py train --exp-name <NAME>`:
+    #
+    #   results/detection/<NAME>/
+    #   ├── SUMMARY.xlsx            ★ mean ± std của TẤT CẢ seed × strategy
+    #   ├── experiment_config.json  snapshot config lúc chạy
+    #   ├── charts/                 chart tổng hợp cả experiment (5 hình)
+    #   └── seeds/seed_<N>/
+    #       ├── results_seed_<N>.xlsx
+    #       └── charts/{training, test_<strategy>}/
+    #
+    # Không giữ lại bất kỳ checkpoint .pt nào.
     PROJECT = os.path.join("results", "detection")  # thư mục output gốc
     # Truyền qua CLI: --exp-name voc_yolov8s_raw_topk_run01
     # Có EXP_NAME thì pipeline dùng đúng tên này, không ghép timestamp/model.
     EXP_NAME = None
     NAME = None          # prefix legacy khi không truyền EXP_NAME
     EXIST_OK = False
-    EXCEL_OUTPUT = None  # None = <run_dir>/detection_results.xlsx
-    # Checkpoint chỉ là file tạm để rank/average/eval; CSV/Excel/plots được giữ.
+    EXCEL_OUTPUT = None  # chỉ dùng cho `main.py eval/export`; train luôn tự đặt tên
+    # Checkpoint chỉ là file tạm để rank/average/eval; Excel/chart được giữ.
     DELETE_CHECKPOINTS_AFTER_RUN = True
+    # Dọn run dir mỗi seed xuống còn đúng Excel + charts/
+    TIDY_RUN_DIR = True
+    KEEP_RESULTS_CSV = False    # nội dung đã nằm nguyên trong sheet PerEpoch
+    KEEP_SAMPLE_IMAGES = False  # train_batch*.jpg / val_batch*.jpg (ảnh debug, nặng)
+    MAKE_CHARTS = True          # vẽ chart tổng hợp mean ± std ở cuối experiment
 
     # Random seed: dùng cho cả tách val' (dataset.py) và model.train(seed=...).
     # Hỗ trợ số nguyên đơn lẻ (ví dụ: 42) hoặc danh sách các seed (ví dụ: [42, 100, 2026]).
@@ -173,6 +210,14 @@ class Config:
             if not 0.0 <= float(getattr(cls, prob)) <= 1.0:
                 raise ValueError(f"{prob} must be in [0, 1]")
 
+        if float(cls.COPY_PASTE) > 0 and str(cls.DATA).endswith("VOC.yaml"):
+            print(
+                f"⚠ WARNING: COPY_PASTE={cls.COPY_PASTE} nhưng label VOC là bbox-only. "
+                "Ultralytics chỉ áp dụng copy-paste khi có segmentation mask "
+                "(CopyPaste.__call__ return ngay nếu instances.segments rỗng) → "
+                "tham số này KHÔNG có tác dụng gì trên VOC."
+            )
+
         if str(cls.LOSS_FUNCTION).lower() not in ("bce", "focal"):
             raise ValueError(
                 f"LOSS_FUNCTION={cls.LOSS_FUNCTION!r} không hỗ trợ. "
@@ -186,6 +231,12 @@ class Config:
         if cls.EVAL_SPLIT not in cls.VALID_EVAL_SPLITS:
             raise ValueError(f"EVAL_SPLIT must be one of {cls.VALID_EVAL_SPLITS}")
 
+        seeds = cls.RANDOM_SEED if isinstance(cls.RANDOM_SEED, (list, tuple)) else [cls.RANDOM_SEED]
+        if not seeds:
+            raise ValueError("RANDOM_SEED must be an int or a non-empty list of ints")
+        if len(set(int(s) for s in seeds)) != len(seeds):
+            raise ValueError(f"RANDOM_SEED có seed trùng nhau: {list(seeds)}")
+
         if cls.USE_STRATEGY2:
             if not cls.TOP_K_VALUES or any(int(k) <= 1 for k in cls.TOP_K_VALUES):
                 raise ValueError("TOP_K_VALUES must be a non-empty list of ints > 1")
@@ -194,10 +245,23 @@ class Config:
                     "KEEP_TOP_K_CHECKPOINTS must be >= max(TOP_K_VALUES) "
                     "để đủ checkpoint cho mọi giá trị K"
                 )
+            if int(cls.EPOCHS) < max(cls.TOP_K_VALUES):
+                raise ValueError(
+                    f"EPOCHS={cls.EPOCHS} < max(TOP_K_VALUES)={max(cls.TOP_K_VALUES)} "
+                    "→ không đủ checkpoint để average"
+                )
+            if cls.USE_BN_UPDATE and int(cls.BN_UPDATE_BATCHES) <= 0:
+                raise ValueError("BN_UPDATE_BATCHES must be positive khi USE_BN_UPDATE=True")
             if float(cls.VAL_RATIO) == 0.0 and str(cls.DATA).endswith("VOC.yaml"):
                 print(
                     "⚠ WARNING: USE_STRATEGY2=True nhưng VAL_RATIO=0 → không có val "
                     "độc lập, checkpoint sẽ được chọn trên chính tập test (leakage)!"
+                )
+            if not cls.USE_BN_UPDATE:
+                print(
+                    "⚠ WARNING: USE_BN_UPDATE=False → sau khi average, BN running stats "
+                    "vẫn là của checkpoint tốt nhất trong khi weights đã đổi. "
+                    "mAP của Strategy 2 nhiều khả năng bị tụt oan."
                 )
 
         if cls.EXPORT_ENABLED and not cls.EXPORT_FORMAT:
@@ -205,13 +269,23 @@ class Config:
 
         print("[OK] Config validated successfully")
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
-        print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
+        print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO} (val' tách từ train)")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        print(f"  Seeds : {list(seeds)}")
         print(f"  Task  : Object Detection")
         print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
         print(f"  Loss  : {cls.LOSS_FUNCTION}"
               + (f" (γ={cls.FOCAL_GAMMA}, α={cls.FOCAL_ALPHA})" if cls.LOSS_FUNCTION == 'focal' else ""))
         print(f"  Strategy 2: {'ON — Top-K ' + str(cls.TOP_K_VALUES) if cls.USE_STRATEGY2 else 'OFF'}")
+        if cls.USE_STRATEGY2:
+            print("    averaging  : uniform element-wise mean của learnable params (KHÔNG EMA)")
+            print(
+                "    BN recal   : "
+                + (f"ON — {cls.BN_UPDATE_BATCHES} batch trên split train, forward-only"
+                   if cls.USE_BN_UPDATE else "OFF")
+            )
+            print(f"    BN control : {'ON (thêm dòng Strategy 1 + BN recal)' if cls.BN_UPDATE_CONTROL else 'OFF'}")
+            print(f"    Strategy 1 : {'rank #1 raw FP32' if cls.STRATEGY1_FROM_RAW_TOPK else 'best.pt (FP16)'}")
         print(
             "  Checkpoints: "
             + ("temporary → delete after evaluation" if cls.DELETE_CHECKPOINTS_AFTER_RUN else "keep")

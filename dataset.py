@@ -73,7 +73,10 @@ def _write_holdout_split(root, train_images, test_entry, names, val_ratio, seed)
 
     # Idempotent: cùng seed + ratio → dùng lại split đã sinh (đảm bảo reproduce)
     if yaml_path.exists() and train_txt.exists() and val_txt.exists():
-        print(f"  ✓ Dùng lại holdout split đã có: {yaml_path}")
+        n_train = sum(1 for line in train_txt.read_text().splitlines() if line.strip())
+        n_val = sum(1 for line in val_txt.read_text().splitlines() if line.strip())
+        print(f"  ✓ Dùng lại holdout split đã có (seed={seed}): "
+              f"train'={n_train} | val'={n_val} ảnh → {yaml_path.name}")
         return yaml_path
 
     if len(train_images) < 2:

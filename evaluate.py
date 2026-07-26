@@ -2,109 +2,57 @@
 Evaluation cho Strategy 2 - Object Detection (Ultralytics YOLO + Pascal VOC).
 
 - Metrics đọc TRỰC TIẾP từ DetMetrics của Ultralytics (results.box.*:
-  map50, map, mp, mr, per-class AP, fitness) — không tự tính lại mAP.
-- Strategy 1: best.pt (checkpoint fitness cao nhất trên val', Ultralytics tự chọn).
-- Strategy 2: average weights của Top-K checkpoint tốt nhất trên val'
-  (giống average_weights của nhánh classification, áp dụng cho ckpt YOLO).
-- Export Excel 2 sheet: "Summary" (run info + overall + per-class theo strategy)
-  và "PerEpoch" (parse results.csv do Ultralytics tự sinh trong run dir).
+  map50, map75, map, mp, mr, per-class AP, fitness) — không tự tính lại mAP.
+- Strategy 1 (baseline): checkpoint đơn có fitness cao nhất trên val'.
+- Strategy 2: UNIFORM ELEMENT-WISE AVERAGE các learnable parameter của Top-K
+  checkpoint tốt nhất trên val'. Không có EMA, không có trọng số theo rank —
+  mỗi checkpoint đóng góp đúng 1/K.
+- Sau khi average: BatchNorm running stats được ước lượng LẠI bằng cách lặp
+  qua training data ở chế độ forward-only (torch.no_grad, không optimizer,
+  không backward) — xem update_bn_stats().
+
+Phần trình bày kết quả (Excel, chart, dọn thư mục) nằm ở reporting.py.
 """
 import json
 import math
-import os
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
 import yaml
 
 from config import Config
+from reporting import (  # re-export để train.py / main.py import từ 1 chỗ
+    export_experiment_charts,
+    export_experiment_summary,
+    export_seed_excel,
+    extract_overall_metrics,
+    extract_per_class_metrics,
+    make_strategy_record,
+    print_detection_metrics,
+    print_multi_seed_table,
+    read_results_csv,
+    slugify,
+)
 
 # File ranking do TopKCheckpointManager (train.py) ghi trong <run_dir>/weights/
 RANKING_FILE = "strategy2_checkpoints.json"
 
-INDEPENDENT_VAL_NOTE = (
-    "Validation set (val') ĐỘC LẬP được tách từ train theo VAL_RATIO — chỉ dùng để "
-    "chọn best.pt / rank Top-K checkpoint. Test = VOC2007 test (4952 ảnh), giữ nguyên "
-    "làm hold-out, chỉ dùng cho báo cáo cuối."
-)
-VAL_TEST_WARNING = (
-    "VAL_RATIO=0: dùng nguyên data.yaml gốc. Với VOC.yaml của Ultralytics, split 'val' "
-    "và 'test' TRÙNG NHAU (đều là VOC2007 test) — không có val độc lập, checkpoint được "
-    "chọn trên chính tập test (nguy cơ leakage khi đọc số liệu)."
-)
-
-
-# ==================== Metrics extraction (từ DetMetrics) ====================
-
-def extract_overall_metrics(metrics):
-    """Trả về dict metrics overall từ DetMetrics (metrics.box.*)."""
-    box = metrics.box
-    overall = {
-        "Precision": float(box.mp),
-        "Recall": float(box.mr),
-        "mAP@0.5": float(box.map50),
-        "mAP@0.75": float(box.map75),
-        "mAP@0.5:0.95": float(box.map),
-    }
-    # fitness = 0.1*mAP50 + 0.9*mAP50-95 (định nghĩa của Ultralytics)
-    fitness = getattr(metrics, "fitness", None)
-    if fitness is not None:
-        overall["Fitness"] = float(fitness)
-    return overall
-
-
-def extract_per_class_metrics(metrics):
-    """
-    List dict per-class (P, R, AP@0.5, AP@0.5:0.95) từ DetMetrics.
-    box.ap_class_index = các class-id thực sự xuất hiện trong tập eval;
-    box.class_result(i) trả (p, r, ap50, ap) cho phần tử thứ i.
-    """
-    box = metrics.box
-    names = getattr(metrics, "names", {}) or {}
-    rows = []
-    for i, class_idx in enumerate(getattr(box, "ap_class_index", [])):
-        class_idx = int(class_idx)
-        p, r, ap50, ap = box.class_result(i)
-        rows.append({
-            "Class ID": class_idx,
-            "Class": str(names.get(class_idx, class_idx)),
-            "Precision": float(p),
-            "Recall": float(r),
-            "AP@0.5": float(ap50),
-            "AP@0.5:0.95": float(ap),
-        })
-    return rows
-
-
-def print_detection_metrics(metrics, header="DETECTION EVALUATION RESULTS"):
-    """In metrics detection ra console (format banner giống repo gốc)."""
-    overall = extract_overall_metrics(metrics)
-    per_class = extract_per_class_metrics(metrics)
-
-    print("\n" + "=" * 70)
-    print(f" {header}")
-    print("=" * 70)
-    for key, value in overall.items():
-        print(f"  {key:<14}: {value:.4f}")
-
-    if per_class:
-        print("-" * 70)
-        print(f"  {'Class':<18} {'Precision':>10} {'Recall':>10} {'AP@0.5':>10} {'AP@0.5:0.95':>12}")
-        for row in per_class:
-            print(
-                f"  {row['Class']:<18} {row['Precision']:>10.4f} {row['Recall']:>10.4f} "
-                f"{row['AP@0.5']:>10.4f} {row['AP@0.5:0.95']:>12.4f}"
-            )
-    print("=" * 70)
-    return overall, per_class
+# Thư mục con trong run dir chứa output của model.val() cho từng strategy.
+EVAL_CHARTS_DIRNAME = "charts"
 
 
 # ==================== model.val() wrapper ====================
 
-def build_val_args(data, split=None):
-    """Map Config → kwargs của model.val()."""
+def build_val_args(data, split=None, project=None, name=None):
+    """
+    Map Config → kwargs của model.val().
+
+    `project`/`name` được truyền tường minh để artifact của val (confusion
+    matrix, PR/F1 curve) rơi vào ĐÚNG run dir của seed, thay vì rải ra
+    runs/detect/val, val2, val3... ở thư mục làm việc.
+    """
     val_args = {
         "data": str(data),
         "imgsz": int(Config.IMGSZ),
@@ -121,10 +69,14 @@ def build_val_args(data, split=None):
         val_args["conf"] = float(Config.CONF)
     if Config.IOU is not None:
         val_args["iou"] = float(Config.IOU)
+    if project is not None:
+        val_args["project"] = str(project)
+        val_args["name"] = str(name or "val")
+        val_args["exist_ok"] = True
     return val_args
 
 
-def evaluate_weights(weights, data, split=None, header=None):
+def evaluate_weights(weights, data, split=None, header=None, project=None, name=None):
     """Chạy model.val() với weights đã train, in metrics, trả về DetMetrics."""
     from ultralytics import YOLO
 
@@ -140,14 +92,33 @@ def evaluate_weights(weights, data, split=None, header=None):
             f"Pipeline này chỉ hỗ trợ object detection, nhưng {weights!s} "
             f"có task={getattr(model, 'task', None)!r}."
         )
-    metrics = model.val(**build_val_args(data, split))
+    metrics = model.val(**build_val_args(data, split, project=project, name=name))
     print_detection_metrics(
-        metrics, header=header or f"EVALUATION (split={split or 'default'}) — {Path(str(weights)).name}"
+        metrics,
+        header=header or f"EVALUATION (split={split or 'default'}) — {Path(str(weights)).name}",
     )
     return metrics
 
 
-# ==================== Strategy 2: ranking + weight averaging ====================
+# ==================== Strategy 2: ranking ====================
+
+def _rank_key(fitness, epoch):
+    """
+    Khóa sắp xếp: fitness cao trước; hòa thì epoch LỚN hơn (muộn hơn) trước.
+
+    Khớp đúng ngữ nghĩa best.pt của Ultralytics. Trong BaseTrainer:
+
+        if not self.best_fitness or self.best_fitness < fitness:
+            self.best_fitness = fitness          # chỉ đổi khi LỚN HƠN HẲN
+        ...
+        if self.best_fitness == self.fitness:
+            self.best.write_bytes(serialized_ckpt)   # nhưng GHI LẠI khi BẰNG
+
+    Nên khi hòa, best.pt bị ghi đè bằng epoch MUỘN hơn. Rank #1 của ta vì vậy
+    cũng phải chọn epoch muộn hơn thì mới trùng epoch với best.pt.
+    """
+    return (fitness, epoch)
+
 
 def rank_checkpoints(run_dir):
     """
@@ -199,25 +170,53 @@ def rank_checkpoints(run_dir):
             if fitness is not None:
                 records.append((path, float(fitness), file_epoch))
 
-    # Fitness cao nhất đứng đầu; nếu hòa thì ưu tiên epoch mới hơn.
-    records.sort(key=lambda r: (r[1], r[2]), reverse=True)
+    records.sort(key=lambda r: _rank_key(r[1], r[2]), reverse=True)
     return records
 
 
-def average_checkpoints(ckpt_paths, output_path):
-    """
-    Uniform element-wise average RAW learnable parameters của checkpoint YOLO.
+def ranking_to_records(ranked):
+    """[(path, fitness, epoch)] → list dict để đưa vào Excel/JSON."""
+    return [
+        {"file": path.name, "fitness": float(fitness), "epoch": int(epoch)}
+        for path, fitness, epoch in ranked
+    ]
 
-    - Average TẤT CẢ learnable parameter (float): weights, biases, γ/β của BN.
-    - KHÔNG average buffers/state không learnable (BN running stats, counter,
-      anchors/stride/cache...). Giữ chúng từ checkpoint tốt nhất.
-    - Sau khi average, BN stats KHÔNG khớp với weights mới → phải chạy
-      update_bn_stats() để re-estimate trên train (xem hàm bên dưới).
+
+# ==================== Strategy 2: element-wise weight averaging ====================
+
+def average_checkpoints(ckpt_paths, output_path, verbose=True):
+    """
+    UNIFORM ELEMENT-WISE AVERAGE các learnable parameter của K checkpoint.
+
+    Công thức, áp dụng độc lập cho từng phần tử của từng tensor tham số θ:
+
+        θ_avg = (1/K) * Σ_{i=1..K} θ_i
+
+    Đây KHÔNG phải EMA: không có hệ số decay, không phụ thuộc thứ tự, mỗi
+    checkpoint đóng góp đúng 1/K bất kể rank hay epoch.
+
+    Cái gì được average / không:
+      - ĐƯỢC : mọi learnable parameter dạng float — conv/linear weight, bias,
+               gamma & beta của BatchNorm (đều nằm trong named_parameters()).
+      - KHÔNG: buffer và state không learnable — BN running_mean/running_var/
+               num_batches_tracked, anchors, stride, cache... Trung bình cộng
+               các đại lượng thống kê này không có ý nghĩa; chúng được giữ từ
+               checkpoint TỐT NHẤT rồi ước lượng lại bằng update_bn_stats().
+
+    Phép cộng thực hiện ở float64 rồi mới hạ về dtype gốc, nên kết quả không
+    phụ thuộc thứ tự cộng và không tích lũy sai số làm tròn theo K.
 
     Input chỉ nhận checkpoint có ``weight_source='raw'``. Output giữ FP32,
-    không chứa EMA/optimizer, và load lại bằng YOLO(path) như checkpoint thường.
+    không chứa EMA/optimizer, load lại bằng YOLO(path) như checkpoint thường.
     """
     import torch
+
+    ckpt_paths = [Path(p) for p in ckpt_paths]
+    if not ckpt_paths:
+        raise ValueError("average_checkpoints() cần ít nhất 1 checkpoint")
+    resolved = [p.resolve() for p in ckpt_paths]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(f"Danh sách checkpoint bị trùng: {[p.name for p in ckpt_paths]}")
 
     ckpts = [torch.load(str(p), map_location="cpu", weights_only=False) for p in ckpt_paths]
     invalid = [
@@ -235,25 +234,46 @@ def average_checkpoints(ckpt_paths, output_path):
     state_dicts = [m.state_dict() for m in modules]
     parameter_keys = set(dict(modules[0].named_parameters()))
 
-    # Skip BN running stats — giống keys_to_keep của Strategy2_TinyImageNet
-    def is_bn_stat(key):
-        return any(marker in key for marker in ("running_mean", "running_var", "num_batches_tracked"))
+    # Mọi checkpoint phải cùng kiến trúc — nếu lệch key/shape thì average sai
+    # về mặt ngữ nghĩa, phải dừng chứ không được im lặng bỏ qua.
+    reference_keys = set(state_dicts[0])
+    for path, sd in zip(ckpt_paths[1:], state_dicts[1:]):
+        if set(sd) != reference_keys:
+            missing = sorted(reference_keys - set(sd))[:5]
+            extra = sorted(set(sd) - reference_keys)[:5]
+            raise ValueError(
+                f"State dict của {path.name} không khớp {ckpt_paths[0].name}: "
+                f"thiếu {missing}, thừa {extra}"
+            )
+        for key in reference_keys:
+            if sd[key].shape != state_dicts[0][key].shape:
+                raise ValueError(
+                    f"Shape lệch ở key {key!r}: {ckpt_paths[0].name}"
+                    f"{tuple(state_dicts[0][key].shape)} vs {path.name}{tuple(sd[key].shape)}"
+                )
 
-    # Short-circuit K=1: khớp hành vi của average_weights bên TinyImageNet
-    if len(ckpt_paths) == 1:
-        avg_state = {k: v.clone() for k, v in state_dicts[0].items()}
-    else:
-        avg_state = {}
-        for key, ref_tensor in state_dicts[0].items():
-            if key not in parameter_keys or is_bn_stat(key) or not ref_tensor.dtype.is_floating_point:
-                # Giữ nguyên từ checkpoint đầu (đã sort theo fitness giảm dần)
-                avg_state[key] = ref_tensor.clone()
-            else:
-                avg_state[key] = torch.stack([sd[key].float() for sd in state_dicts]).mean(dim=0)
+    k = len(state_dicts)
+    averaged = copied = 0
+    avg_state = {}
+    for key, ref_tensor in state_dicts[0].items():
+        is_learnable_float = key in parameter_keys and ref_tensor.dtype.is_floating_point
+        if k == 1 or not is_learnable_float:
+            # K=1 → average của 1 phần tử chính là chính nó (clone để an toàn).
+            avg_state[key] = ref_tensor.detach().clone()
+            copied += 0 if k == 1 else 1
+            continue
+        # Cộng ở float64 → chia K. Uniform, không trọng số, không EMA.
+        accumulator = ref_tensor.detach().to(torch.float64).clone()
+        for sd in state_dicts[1:]:
+            accumulator += sd[key].detach().to(torch.float64)
+        accumulator /= float(k)
+        avg_state[key] = accumulator.to(ref_tensor.dtype)
+        averaged += 1
 
     merged_module = modules[0]
-    merged_module.load_state_dict(avg_state)
+    merged_module.load_state_dict(avg_state, strict=True)
 
+    source_epochs = [int(ckpt.get("epoch", -1)) for ckpt in ckpts]
     torch.save(
         {
             # FP32 giảm sai số làm tròn so với FP16 khi cộng/chia K tensors.
@@ -264,27 +284,53 @@ def average_checkpoints(ckpt_paths, output_path):
             "train_args": ckpts[0].get("train_args", {}),
             "date": datetime.now().isoformat(timespec="seconds"),
             "weight_source": "raw_topk_average",
+            "average_k": k,
+            "average_type": "uniform_elementwise_mean",
+            "source_checkpoints": [p.name for p in ckpt_paths],
+            "source_epochs": source_epochs,
+            "bn_recalibrated": False,
         },
         str(output_path),
     )
+    if verbose:
+        print(
+            f"      ✓ Averaged K={k} checkpoint (epoch {source_epochs}) — "
+            f"{averaged} tensor tham số lấy trung bình 1/{k}, "
+            f"{copied} buffer/non-learnable giữ từ checkpoint tốt nhất"
+        )
     return Path(output_path)
 
 
+# ==================== Strategy 2: BatchNorm recalibration ====================
+
 def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     """
-    Re-estimate BN running statistics của model đã average — tương đương
-    update_bn() của nhánh Strategy2_TinyImageNet, thích ứng cho YOLO.
+    Ước lượng LẠI BatchNorm running statistics của model đã average.
 
-    Vì sao: sau average_checkpoints() BN running_mean/running_var được giữ từ
-    ckpt tốt nhất (không average) nhưng weights của các layer trước BN đã đổi
-    → phân phối activation lệch với running stats cũ. Chạy forward pass trên
-    train (BN ở mode 'train', momentum=None → cumulative moving average) để
-    tính lại running stats khớp weights mới. Ghi đè lại `weights_path`.
+    Vì sao cần: average_checkpoints() giữ nguyên running_mean/running_var từ
+    checkpoint tốt nhất (không average vì đó là thống kê quần thể) nhưng weights
+    của các layer phía trước BN đã đổi → phân phối activation không còn khớp
+    thống kê cũ. Không hiệu chỉnh thì mAP của Strategy 2 tụt do BN lệch.
+
+    Cách làm (tương đương torch.optim.swa_utils.update_bn):
+      1. reset_running_stats() + momentum = None → BN dùng CUMULATIVE MOVING
+         AVERAGE, tức trung bình chính xác trên toàn bộ batch đã đi qua,
+         không phụ thuộc thứ tự batch và không có hệ số quán tính.
+      2. LẶP QUA TRAINING DATA ở chế độ forward-only:
+         - toàn bộ chạy trong torch.no_grad() → KHÔNG dựng graph, KHÔNG backward
+         - KHÔNG có optimizer, KHÔNG optimizer.step()
+         - model.eval() cho toàn mạng (tắt dropout/nhánh train), riêng các
+           module BN bật train() để chúng tích lũy mean/var
+         - kiểm tra lại sau vòng lặp: mọi parameter.grad phải là None
+      3. Chỉ running_mean/running_var/num_batches_tracked thay đổi; learnable
+         parameters giữ nguyên hệt giá trị vừa average.
+
+    Dữ liệu dùng: SPLIT TRAIN của data_yaml (train' sau khi đã tách val').
+    Tuyệt đối không đụng val' hay test.
 
     Args:
         weights_path: file .pt đã average (do `average_checkpoints` sinh ra).
-        data_yaml: path data yaml (holdout hoặc gốc) — dùng SPLIT TRAIN để
-                   ước lượng BN, không đụng val'/test.
+        data_yaml: path data yaml (holdout hoặc gốc).
         num_batches: số batch forward (mặc định Config.BN_UPDATE_BATCHES).
         device: None = auto GPU nếu có.
 
@@ -305,7 +351,7 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     model = yolo.model
     bn_modules = [m for m in model.modules() if isinstance(m, _BatchNorm)]
     if not bn_modules:
-        print("      (Không tìm thấy BN layer nào, bỏ qua update_bn)")
+        print("      (Không tìm thấy BN layer nào — bỏ qua BN recalibration)")
         return weights_path
 
     device_obj = torch.device(
@@ -314,14 +360,21 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
             else "cuda" if torch.cuda.is_available() else "cpu")
     )
     model = model.float().to(device_obj)
+    # Không cần gradient ở bất kỳ đâu trong hàm này.
+    model.requires_grad_(False)
     stride = int(max(model.stride)) if hasattr(model, "stride") else 32
 
-    # Build train dataloader kiểu Ultralytics (đúng augmentation train)
+    # Dataloader kiểu Ultralytics trên split TRAIN.
+    # mode="train" giữ nguyên augmentation của lúc train: BN stats khi train
+    # vốn được tích lũy trên phân phối đã augment, nên muốn tái lập đúng
+    # estimator đó thì phải forward trên cùng phân phối.
     data = check_det_dataset(str(data_yaml))
+    mode = "train" if Config.BN_UPDATE_AUGMENT else "val"
     batch = int(Config.BATCH) if int(Config.BATCH) > 0 else 16
     bn_overrides = {
         "imgsz": int(Config.IMGSZ),
         "task": "detect",
+        "mode": "train",
         "mixup": float(Config.MIXUP),
         "copy_paste": float(Config.COPY_PASTE),
     }
@@ -329,140 +382,231 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     bn_overrides["task"] = "detect"
     cfg = get_cfg(overrides=bn_overrides)
     dataset = build_yolo_dataset(
-        cfg, data["train"], batch, data, mode="train", rect=False, stride=stride
+        cfg, data["train"], batch, data, mode=mode, rect=False, stride=stride
     )
-    loader = build_dataloader(
-        dataset, batch, workers=int(Config.WORKERS), shuffle=True, rank=-1
-    )
-
-    # Reset BN running stats + đổi momentum=None (cumulative moving average)
-    saved_momentum = {}
-    for m in bn_modules:
-        saved_momentum[m] = m.momentum
-        m.reset_running_stats()
-        m.momentum = None
-
-    # Toàn model ở eval() để tắt dropout/random aug ở path forward, riêng BN
-    # bật train() để tích lũy running stats — pattern giống update_bn của
-    # nhánh classification.
-    was_training = model.training
-    model.eval()
-    for m in bn_modules:
-        m.train()
-
-    # Autocast khớp precision train (repo gốc dùng autocast_context BF16 khi
-    # USE_AMP=True + CUDA). BN chỉ tích lũy mean/var nên không nhạy cảm với
-    # precision, nhưng match train precision cho nhất quán và nhanh hơn trên
-    # GPU. Không ảnh hưởng correctness khi Config.AMP=False.
-    if getattr(Config, "AMP", True) and device_obj.type == "cuda":
-        autocast_ctx = torch.autocast(
-            device_type="cuda",
-            dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+    loader = build_dataloader(dataset, batch, workers=int(Config.WORKERS), shuffle=True, rank=-1)
+    batches_per_epoch = max(len(loader), 1)
+    if num_batches > batches_per_epoch:
+        print(
+            f"      ⚠ BN_UPDATE_BATCHES={num_batches} > số batch/epoch "
+            f"({batches_per_epoch}) → một phần ảnh sẽ được duyệt lại"
         )
-    else:
-        autocast_ctx = torch.autocast(device_type=device_obj.type, enabled=False)
 
-    print(f"      Updating BN stats bằng {num_batches} batch train (device={device_obj})...")
-    with torch.no_grad(), autocast_ctx:
-        for i, batch_data in enumerate(loader):
-            if i >= num_batches:
-                break
-            img = batch_data["img"].to(device_obj, non_blocking=True).float() / 255.0
-            _ = model(img)
+    # momentum=None ⇒ cumulative moving average trên toàn bộ batch đã thấy.
+    saved_momentum = [(m, m.momentum) for m in bn_modules]
+    was_training = model.training
+    seen_images = seen_batches = 0
+    try:
+        for module in bn_modules:
+            module.reset_running_stats()
+            module.momentum = None
 
-    for m, mom in saved_momentum.items():
-        m.momentum = mom
-    model.train(was_training)
+        model.eval()
+        for module in bn_modules:
+            module.train()
 
-    # Chỉ thay BN running statistics; learnable parameters average vẫn là FP32.
+        # Autocast khớp precision lúc train. BN chỉ tích lũy mean/var nên không
+        # nhạy với precision, nhưng giữ cho nhất quán và nhanh hơn trên GPU.
+        if Config.BN_UPDATE_AMP and device_obj.type == "cuda":
+            autocast_ctx = torch.autocast(
+                device_type="cuda",
+                dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+            )
+        else:
+            autocast_ctx = torch.autocast(device_type=device_obj.type, enabled=False)
+
+        print(
+            f"      BN recalibration: {num_batches} batch × {batch} ảnh trên split TRAIN "
+            f"(mode={mode}, device={device_obj}, no_grad, không optimizer)..."
+        )
+        with torch.no_grad(), autocast_ctx:
+            for i, batch_data in enumerate(loader):
+                if i >= num_batches:
+                    break
+                img = batch_data["img"].to(device_obj, non_blocking=True).float() / 255.0
+                model(img)
+                seen_images += int(img.shape[0])
+                seen_batches += 1
+    finally:
+        for module, momentum in saved_momentum:
+            module.momentum = momentum
+        model.train(was_training)
+
+    # Bằng chứng "chỉ forward, không cập nhật gradient": không parameter nào có .grad
+    with_grad = [name for name, p in model.named_parameters() if p.grad is not None]
+    if with_grad:
+        raise RuntimeError(
+            "BN recalibration phải là forward-only nhưng có gradient được tích lũy: "
+            f"{with_grad[:5]}"
+        )
+
+    # Chỉ thay BN running statistics; learnable parameters vẫn là bản average FP32.
     ckpt = torch.load(str(weights_path), map_location="cpu", weights_only=False)
     ckpt["model"] = model.float().cpu()
+    # attempt_load_one_weight() ưu tiên ckpt["ema"] hơn ckpt["model"]; nếu file
+    # nguồn còn field 'ema' thì model vừa hiệu chỉnh BN sẽ bị bỏ qua khi load.
+    ckpt["ema"] = None
+    ckpt["bn_recalibrated"] = True
+    ckpt["bn_update_images"] = seen_images
+    ckpt["bn_update_batches"] = seen_batches
     torch.save(ckpt, str(weights_path))
-    print(f"      ✓ BN stats updated: {weights_path.name}")
+    print(f"      ✓ BN stats updated trên {seen_images} ảnh train: {weights_path.name}")
     return weights_path
 
 
-def run_strategy_evaluation(run_dir, data=None, split=None, seed=None):
+# ==================== Strategy orchestration ====================
+
+def _eval_record(weights, data, split, run_dir, name, short, kind, k=None,
+                 epochs=None, bn_update=False):
+    """Eval 1 checkpoint và đóng gói thành strategy record (chart của val vào run dir)."""
+    metrics = evaluate_weights(
+        weights,
+        data,
+        split,
+        header=f"{name} (split={split or 'default'})",
+        project=Path(run_dir) / EVAL_CHARTS_DIRNAME,
+        name=f"test_{slugify(short)}",
+    )
+    return make_strategy_record(name, short, kind, metrics, k=k, epochs=epochs, bn_update=bn_update)
+
+
+def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_excel=True):
     """
-    Đánh giá Strategy 1 (best.pt) và Strategy 2 (Top-K average) trên split
-    báo cáo (mặc định Config.EVAL_SPLIT='test' — VOC2007 test), in bảng so
-    sánh và export Excel.
+    Đánh giá trên split báo cáo (mặc định Config.EVAL_SPLIT='test' — VOC2007 test):
+
+      - Strategy 1          : checkpoint đơn tốt nhất trên val'
+      - Strategy 1 + BN     : cùng checkpoint đó nhưng ĐÃ BN-recalibrate (control
+                              để tách phần cải thiện do averaging khỏi phần do
+                              hiệu chỉnh BN) — bật/tắt bằng Config.BN_UPDATE_CONTROL
+      - Strategy 2 (Top-K)  : average Top-K checkpoint, K ∈ Config.TOP_K_VALUES
 
     Returns:
-        dict {strategy_name: DetMetrics}
+        dict {"strategy_records": [...], "ranking": [...], "excel": path|None}
     """
     run_dir = Path(run_dir)
     data = data or resolve_data_from_run(run_dir) or Config.DATA
     split = split or Config.EVAL_SPLIT
+    weights_dir = run_dir / "weights"
 
     print("\n" + "=" * 70)
     print(f" STRATEGY EVALUATION (split={split or 'default'}, data={data})")
     print("=" * 70)
 
-    results = {}
+    records = []
+    temp_files = []
+    ranked = rank_checkpoints(run_dir) if Config.USE_STRATEGY2 else []
+    if ranked:
+        print("  Ranking checkpoint theo fitness trên val' (cao → thấp):")
+        for rank, (path, fitness, epoch) in enumerate(ranked, start=1):
+            print(f"    #{rank}  epoch {epoch:<4} fitness {fitness:.6f}  ({path.name})")
 
-    # ----- Strategy 1: best.pt (fitness cao nhất trên val') -----
-    best_weights = run_dir / "weights" / "best.pt"
-    if best_weights.exists():
-        results["Strategy 1 (best.pt)"] = evaluate_weights(
-            best_weights, data, split, header=f"Strategy 1 — best.pt (split={split})"
-        )
-    else:
-        print(f"  ⚠ Không tìm thấy {best_weights} — bỏ qua Strategy 1")
-
-    # ----- Strategy 2: average Top-K checkpoint tốt nhất trên val' -----
-    if Config.USE_STRATEGY2:
-        ranked = rank_checkpoints(run_dir)
-        if not ranked:
-            print("  ⚠ Không tìm thấy checkpoint epoch nào để average — bỏ qua Strategy 2")
-            print("    (cần train với USE_STRATEGY2=True để lưu Top-K checkpoint)")
+    try:
+        # ----- Strategy 1: checkpoint đơn tốt nhất trên val' -----
+        best_weights = weights_dir / "best.pt"
+        baseline_epochs = []
+        if ranked and Config.STRATEGY1_FROM_RAW_TOPK:
+            # Dùng rank #1 (raw FP32) thay vì best.pt (Ultralytics lưu FP16):
+            # cùng epoch, cùng weights, nhưng cùng precision và cùng đường
+            # load/eval với Strategy 2 → so sánh mới thực sự apples-to-apples.
+            baseline_path, _, baseline_epoch = ranked[0]
+            baseline_epochs = [baseline_epoch]
+            print(f"\n  Strategy 1 dùng rank #1 raw FP32 (epoch {baseline_epoch}) "
+                  f"— cùng epoch với best.pt, tránh lệch precision FP16 khi so sánh")
+        elif best_weights.exists():
+            baseline_path = best_weights
         else:
-            print(f"\n  Checkpoint khả dụng (rank theo fitness val'): "
-                  f"{[(p.name, round(f, 4)) for p, f, _ in ranked]}")
-            for k in Config.TOP_K_VALUES:
-                k = int(k)
+            baseline_path = None
+            print(f"  ⚠ Không tìm thấy {best_weights} — bỏ qua Strategy 1")
+
+        if baseline_path is not None:
+            records.append(_eval_record(
+                baseline_path, data, split, run_dir,
+                name="Strategy 1 (best ckpt)", short="Best", kind="baseline",
+                k=1, epochs=baseline_epochs,
+            ))
+
+            # ----- Control: baseline + BN recalibration -----
+            # Strategy 2 được BN-recalibrate; nếu không có control này thì không
+            # thể biết phần cải thiện đến từ averaging hay từ hiệu chỉnh BN.
+            if Config.USE_STRATEGY2 and Config.USE_BN_UPDATE and Config.BN_UPDATE_CONTROL and ranked:
+                bn_ctrl_path = weights_dir / "strategy1_bn_control.pt"
+                temp_files.append(bn_ctrl_path)
+                shutil.copyfile(baseline_path, bn_ctrl_path)
+                update_bn_stats(bn_ctrl_path, data)
+                records.append(_eval_record(
+                    bn_ctrl_path, data, split, run_dir,
+                    name="Strategy 1 + BN recal", short="Best+BN", kind="baseline_bn",
+                    k=1, epochs=baseline_epochs, bn_update=True,
+                ))
+
+        # ----- Strategy 2: average Top-K checkpoint tốt nhất trên val' -----
+        if Config.USE_STRATEGY2:
+            if not ranked:
+                print("  ⚠ Không tìm thấy checkpoint epoch nào để average — bỏ qua Strategy 2")
+                print("    (cần train với USE_STRATEGY2=True để lưu Top-K checkpoint)")
+            for k in sorted(int(k) for k in Config.TOP_K_VALUES):
                 if k > len(ranked):
                     print(f"  ⚠ Top-{k}: chỉ có {len(ranked)} checkpoint — bỏ qua")
                     continue
-                avg_path = run_dir / "weights" / f"strategy2_top{k}_avg.pt"
-                try:
-                    average_checkpoints([p for p, _, _ in ranked[:k]], avg_path)
-                    # Re-estimate buffers BN trên train, tuyệt đối không dùng test.
-                    if Config.USE_BN_UPDATE:
-                        update_bn_stats(avg_path, data)
-                    results[f"Strategy 2 (Top-{k} avg)"] = evaluate_weights(
-                        avg_path,
-                        data,
-                        split,
-                        header=f"Strategy 2 — Top-{k} average (split={split})",
-                    )
-                finally:
-                    # Average checkpoint chỉ cần tồn tại trong lúc model.val().
-                    if Config.DELETE_CHECKPOINTS_AFTER_RUN and avg_path.exists():
-                        avg_path.unlink()
-                        print(f"      ✓ Đã xóa averaged checkpoint tạm: {avg_path.name}")
+                avg_path = weights_dir / f"strategy2_top{k}_avg.pt"
+                temp_files.append(avg_path)
+                selected = ranked[:k]
+                average_checkpoints([p for p, _, _ in selected], avg_path)
+                if Config.USE_BN_UPDATE:
+                    # Re-estimate BN buffers trên train — tuyệt đối không dùng test.
+                    update_bn_stats(avg_path, data)
+                records.append(_eval_record(
+                    avg_path, data, split, run_dir,
+                    name=f"Strategy 2 (Top-{k})", short=f"Top-{k}", kind="topk_avg",
+                    k=k, epochs=[e for _, _, e in selected],
+                    bn_update=bool(Config.USE_BN_UPDATE),
+                ))
+    finally:
+        # Checkpoint average/control chỉ cần tồn tại trong lúc model.val().
+        if Config.DELETE_CHECKPOINTS_AFTER_RUN:
+            for path in temp_files:
+                if path.exists():
+                    path.unlink()
 
-    if not results:
+    if not records:
         print("  ✗ Không có strategy nào được đánh giá")
-        return results
+        return {"strategy_records": [], "ranking": ranking_to_records(ranked), "excel": None}
 
-    # ----- Bảng so sánh (giống format tổng hợp của repo gốc) -----
-    print("\n" + "=" * 70)
-    print(f" STRATEGY COMPARISON (split={split or 'default'})")
-    print("=" * 70)
-    for name, metrics in results.items():
-        m = extract_overall_metrics(metrics)
+    # ----- Bảng so sánh -----
+    print("\n" + "=" * 78)
+    print(f" STRATEGY COMPARISON (split={split or 'default'}, seed={seed})")
+    print("=" * 78)
+    baseline_overall = extract_overall_metrics(records[0]["metrics"])
+    for record in records:
+        m = extract_overall_metrics(record["metrics"])
+        delta = m["mAP@0.5:0.95"] - baseline_overall["mAP@0.5:0.95"]
+        delta_str = "  (baseline)" if record is records[0] else f"  Δ {delta:+.4f}"
         print(
-            f"  {name:<26} mAP50: {m['mAP@0.5']:.4f} | mAP50-95: {m['mAP@0.5:0.95']:.4f} | "
-            f"P: {m['Precision']:.4f} | R: {m['Recall']:.4f}"
+            f"  {record['name']:<26} mAP50: {m['mAP@0.5']:.4f} | "
+            f"mAP50-95: {m['mAP@0.5:0.95']:.4f} | P: {m['Precision']:.4f} | "
+            f"R: {m['Recall']:.4f}{delta_str}"
         )
     print(
-        "\n  Các K phía trên đã được định trước trong Config.TOP_K_VALUES. "
-        "Split báo cáo không được dùng để chọn best K."
+        "\n  Các K ở trên đã được định trước trong Config.TOP_K_VALUES. "
+        "Split báo cáo KHÔNG được dùng để chọn K."
     )
 
-    export_to_excel(run_dir, strategy_results=results, data=data, split=split, seed=seed)
-    return results
+    excel_path = None
+    if export_excel:
+        excel_path = export_seed_excel(
+            run_dir,
+            strategy_results=records,
+            data=data,
+            split=split,
+            seed=seed,
+            ranking=ranking_to_records(ranked),
+        )
+
+    return {
+        "strategy_records": records,
+        "ranking": ranking_to_records(ranked),
+        "excel": excel_path,
+    }
 
 
 def resolve_data_from_run(run_dir):
@@ -481,233 +625,37 @@ def infer_run_dir(weights):
     return None
 
 
-# ==================== Excel export (Summary + PerEpoch) ====================
-
-def read_results_csv(run_dir):
-    """Đọc results.csv Ultralytics sinh trong run_dir → DataFrame per-epoch."""
-    csv_path = os.path.join(str(run_dir), "results.csv")
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"results.csv not found in run dir: {run_dir}")
-    df = pd.read_csv(csv_path)
-    # Bản Ultralytics cũ pad khoảng trắng trong header → chuẩn hóa tên cột
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def _data_note(data):
-    """Chọn note đúng theo cách chuẩn bị data (holdout hay data.yaml gốc)."""
-    if "holdout" in os.path.basename(str(data)):
-        return INDEPENDENT_VAL_NOTE
-    return VAL_TEST_WARNING
+def export_to_excel(run_dir, strategy_results=None, data=None, split=None,
+                    output_path=None, seed=None):
+    """Wrapper giữ tương thích cho `main.py eval` / `main.py export`."""
+    return export_seed_excel(
+        run_dir,
+        strategy_results=strategy_results,
+        data=data,
+        split=split,
+        output_path=output_path or Config.EXCEL_OUTPUT,
+        seed=seed,
+    )
 
 
-def export_to_excel(run_dir, strategy_results=None, data=None, split=None, output_path=None, seed=None):
-    """
-    Xuất Excel 2 sheet cho một run detection:
-
-    - "Summary" : run info + bảng overall metrics theo strategy + per-class AP
-                  theo strategy (cột Strategy — giống Per-Class sheet repo gốc).
-                  Nếu strategy_results=None (export offline) → overall lấy từ
-                  row cuối results.csv, không có per-class AP.
-    - "PerEpoch": toàn bộ results.csv (box/cls/dfl loss train+val, P, R,
-                  mAP50, mAP50-95, lr... — mỗi epoch 1 row).
-    """
-    run_dir = str(run_dir)
-    data = data or Config.DATA
-
-    per_epoch_df = None
-    try:
-        per_epoch_df = read_results_csv(run_dir)
-    except FileNotFoundError:
-        print(f"  ⚠ Không tìm thấy results.csv trong {run_dir} — bỏ qua sheet PerEpoch")
-
-    # ----- Bảng overall + per-class theo strategy -----
-    overall_rows, per_class_rows = [], []
-    if strategy_results:
-        for name, metrics in strategy_results.items():
-            overall_rows.append({"Strategy": name, **extract_overall_metrics(metrics)})
-            for row in extract_per_class_metrics(metrics):
-                per_class_rows.append({"Strategy": name, **row})
-        summary_source = "model.val() — Ultralytics DetMetrics"
-    elif per_epoch_df is not None:
-        last = per_epoch_df.iloc[-1]
-        column_map = {
-            "Precision": "metrics/precision(B)",
-            "Recall": "metrics/recall(B)",
-            "mAP@0.5": "metrics/mAP50(B)",
-            "mAP@0.5:0.95": "metrics/mAP50-95(B)",
-        }
-        row = {"Strategy": "Last epoch (results.csv)"}
-        for metric_name, column in column_map.items():
-            if column in per_epoch_df.columns:
-                row[metric_name] = float(last[column])
-        overall_rows.append(row)
-        summary_source = "results.csv (epoch cuối) — chạy `strategies`/`eval` để có per-class AP"
-    else:
-        raise ValueError("Không có strategy results lẫn results.csv — không thể export Excel")
-
-    # ----- Block Run Info (pattern Parameter/Value như repo gốc) -----
-    try:
-        import ultralytics
-        ultralytics_version = ultralytics.__version__
-    except ImportError:
-        ultralytics_version = "N/A"
-
-    run_info_rows = [
-        ("model", Config.MODEL or "N/A"),
-        ("data", str(data)),
-        ("val_ratio (tách từ train)", Config.VAL_RATIO),
-        ("epochs", Config.EPOCHS),
-        ("imgsz", Config.IMGSZ),
-        ("batch", Config.BATCH),
-        ("device", Config.DEVICE if Config.DEVICE is not None else "auto"),
-        # Ưu tiên seed thực sự dùng cho run này (tham số seed), fallback Config
-        ("seed", seed if seed is not None else Config.RANDOM_SEED),
-        ("cls_loss", Config.LOSS_FUNCTION + (
-            f" (γ={Config.FOCAL_GAMMA}, α={Config.FOCAL_ALPHA})"
-            if Config.LOSS_FUNCTION == "focal" else ""
-        )),
-        ("eval_split", split or Config.EVAL_SPLIT or "mặc định theo data.yaml"),
-        ("strategy2", f"Top-K {Config.TOP_K_VALUES}" if Config.USE_STRATEGY2 else "OFF"),
-        ("checkpoint_weight_source", "raw (EMA disabled)" if Config.USE_STRATEGY2 else "Ultralytics default"),
-        (
-            "checkpoint_retention",
-            "temporary; deleted after evaluation"
-            if Config.DELETE_CHECKPOINTS_AFTER_RUN
-            else "kept",
-        ),
-        ("run_dir", run_dir),
-        ("summary_source", summary_source),
-        ("export_date", datetime.now().isoformat(timespec="seconds")),
-        ("ultralytics_version", ultralytics_version),
-        ("NOTE data split", _data_note(data)),
-    ]
-
-    if output_path is None:
-        if seed is not None:
-            default_name = f"detection_results_seed{seed}.xlsx"
-        else:
-            default_name = "detection_results.xlsx"
-        output_path = Config.EXCEL_OUTPUT or os.path.join(run_dir, default_name)
-    output_parent = os.path.dirname(output_path)
-    if output_parent:
-        os.makedirs(output_parent, exist_ok=True)
-
-    info_df = pd.DataFrame(run_info_rows, columns=["Parameter", "Value"])
-    overall_df = pd.DataFrame(overall_rows)
-    per_class_df = pd.DataFrame(per_class_rows)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Sheet 1 "Summary": Run Info → Overall per strategy → Per-class per strategy
-        info_df.to_excel(writer, sheet_name="Summary", index=False, startrow=0)
-        next_row = len(info_df) + 2
-        overall_df.to_excel(writer, sheet_name="Summary", index=False, startrow=next_row)
-        next_row += len(overall_df) + 2
-        if not per_class_df.empty:
-            per_class_df.to_excel(writer, sheet_name="Summary", index=False, startrow=next_row)
-
-        # Sheet 2 "PerEpoch"
-        if per_epoch_df is not None:
-            per_epoch_df.to_excel(writer, sheet_name="PerEpoch", index=False)
-
-    print(f"\n  ✓ Excel exported: {output_path}")
-    print(f"    - Sheet 'Summary' : {len(overall_rows)} strategy row(s) + "
-          f"{len(per_class_rows)} per-class row(s) + run info")
-    if per_epoch_df is not None:
-        print(f"    - Sheet 'PerEpoch': {len(per_epoch_df)} epochs (từ results.csv)")
-    else:
-        print("    - Sheet 'PerEpoch': bỏ qua (không có results.csv)")
-    return output_path
-
-
-# ==================== Multi-seed summary export ====================
-
-def export_multi_seed_summary(all_runs_results, output_dir=None):
-    """
-    Export file Excel tổng hợp tất cả seed runs vào <output_dir>/multi_seed_summary.xlsx.
-
-    Sheets:
-    - "Summary"     : mỗi row = 1 seed × 1 strategy; có cột Seed + Run Folder rõ ràng.
-    - "Mean ± Std"  : mean/std của từng metric nhóm theo Strategy qua tất cả seeds.
-    - "Per-Class AP": AP từng class, nhóm theo Seed × Run Folder × Strategy.
-
-    Args:
-        all_runs_results: list[dict] từ train_detector() — mỗi phần tử gồm
-            {seed, run_dir, strategy_results, val_metrics, ...}.
-        output_dir: thư mục chứa file tổng hợp (mặc định = Config.PROJECT).
-
-    Returns:
-        Path file .xlsx đã ghi, hoặc None nếu không có kết quả.
-    """
-    output_dir = output_dir or Config.PROJECT
-    os.makedirs(str(output_dir), exist_ok=True)
-    output_path = os.path.join(str(output_dir), "multi_seed_summary.xlsx")
-
-    summary_rows = []   # 1 row per seed × strategy
-    per_class_rows = [] # 1 row per seed × strategy × class
-
-    for run in all_runs_results:
-        seed_val = run["seed"]
-        run_dir_str = run["run_dir"]
-        strategy_results = run.get("strategy_results") or {}
-        for strat_name, metrics in strategy_results.items():
-            if metrics is None:
-                continue
-            overall = extract_overall_metrics(metrics)
-            summary_rows.append({
-                "Seed": seed_val,
-                "Run Folder": run_dir_str,
-                "Strategy": strat_name,
-                **overall,
-            })
-            for row in extract_per_class_metrics(metrics):
-                per_class_rows.append({
-                    "Seed": seed_val,
-                    "Run Folder": run_dir_str,
-                    "Strategy": strat_name,
-                    **row,
-                })
-
-    if not summary_rows:
-        print("  ⚠ Không có kết quả nào để export multi-seed summary")
-        return None
-
-    summary_df = pd.DataFrame(summary_rows)
-    per_class_df = pd.DataFrame(per_class_rows)
-
-    # Mean ± Std grouped by Strategy (giữ thứ tự xuất hiện lần đầu)
-    metric_cols = ["mAP@0.5", "mAP@0.5:0.95", "mAP@0.75", "Precision", "Recall"]
-    if "Fitness" in summary_df.columns:
-        metric_cols.append("Fitness")
-    metric_cols = [c for c in metric_cols if c in summary_df.columns]
-
-    # Giữ thứ tự strategy theo thứ tự xuất hiện trong summary_df
-    seen_strats = []
-    for s in summary_df["Strategy"]:
-        if s not in seen_strats:
-            seen_strats.append(s)
-
-    mean_std_rows = []
-    for strat_name in seen_strats:
-        grp = summary_df[summary_df["Strategy"] == strat_name]
-        row = {"Strategy": strat_name, "N seeds": len(grp)}
-        for col in metric_cols:
-            row[f"{col} mean"] = round(float(grp[col].mean()), 6)
-            row[f"{col} std"]  = round(float(grp[col].std()),  6)
-        mean_std_rows.append(row)
-    mean_std_df = pd.DataFrame(mean_std_rows)
-
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        summary_df.to_excel(writer,   sheet_name="Summary",      index=False)
-        mean_std_df.to_excel(writer,  sheet_name="Mean ± Std",   index=False)
-        if not per_class_df.empty:
-            per_class_df.to_excel(writer, sheet_name="Per-Class AP", index=False)
-
-    seeds_done = [r["seed"] for r in all_runs_results]
-    print(f"\n  ✓ Multi-seed summary exported: {output_path}")
-    print(f"    Seeds           : {seeds_done}")
-    print(f"    Sheet 'Summary'     : {len(summary_rows)} rows ({len(seen_strats)} strategy × {len(seeds_done)} seeds)")
-    print(f"    Sheet 'Mean ± Std'  : {len(mean_std_rows)} strategy rows")
-    if not per_class_df.empty:
-        print(f"    Sheet 'Per-Class AP': {len(per_class_rows)} rows")
-    return output_path
+__all__ = [
+    "RANKING_FILE",
+    "average_checkpoints",
+    "build_val_args",
+    "evaluate_weights",
+    "export_experiment_charts",
+    "export_experiment_summary",
+    "export_seed_excel",
+    "export_to_excel",
+    "extract_overall_metrics",
+    "extract_per_class_metrics",
+    "infer_run_dir",
+    "print_detection_metrics",
+    "print_multi_seed_table",
+    "rank_checkpoints",
+    "ranking_to_records",
+    "read_results_csv",
+    "resolve_data_from_run",
+    "run_strategy_evaluation",
+    "update_bn_stats",
+]
