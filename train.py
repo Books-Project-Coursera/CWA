@@ -77,6 +77,62 @@ def unwrap_ultralytics_model(model):
         return unwrap_model(model)
 
 
+def materialize_inference_tensors(module):
+    """
+    Thay mọi *inference tensor* trong ``module`` bằng clone thường (in-place).
+
+    Vì sao cần: validator của Ultralytics chạy dưới ``torch.inference_mode()``
+    (``BaseValidator.__call__`` được decorate bằng ``smart_inference_mode``) và
+    trong lúc train nó gọi ``model.half()`` rồi ``model.float()`` trên chính
+    module validation này. ``nn.Module._apply`` THAY THẾ buffer bằng tensor mới::
+
+        self._buffers[key] = fn(buf)
+
+    nên các buffer float của BatchNorm (running_mean/running_var) được TẠO RA
+    bên trong inference_mode ⇒ chúng trở thành inference tensor. Sang epoch sau,
+    ``load_state_dict`` copy in-place vào đúng các buffer đó nhưng ở NGOÀI
+    inference_mode, và PyTorch chặn::
+
+        While copying the parameter named "model.23.cv3.2.0.1.bn.running_mean"
+        ... Inplace update to inference tensor outside InferenceMode is not
+        allowed. You can make a clone to get a normal tensor before doing
+        inplace update.
+
+    Parameter không dính lỗi này vì ``_apply`` đi đường ``param.data = ...``
+    (giữ nguyên object Parameter bên ngoài), còn ``num_batches_tracked`` là
+    int64 nên ``.half()/.float()`` trả về chính nó — khớp đúng với việc log lỗi
+    chỉ liệt kê running_mean/running_var.
+
+    Clone (đúng cách PyTorch gợi ý trong thông báo lỗi) trả về tensor thường,
+    giữ nguyên giá trị/dtype/device/shape, nên phép copy in-place sau đó hợp lệ
+    trở lại. Chỉ tensor nào thực sự là inference tensor mới bị thay, module
+    không có thì hàm là no-op.
+
+    CHÚ Ý: hàm tạo object ``Parameter`` MỚI, nên chỉ dùng cho module validation.
+    Không gọi trên ``trainer.model`` — optimizer giữ tham chiếu tới các
+    Parameter cũ, thay object sẽ khiến optimizer update nhầm tensor.
+
+    Returns:
+        Số tensor đã được thay bằng clone.
+    """
+    import torch
+
+    replaced = 0
+    with torch.no_grad():
+        for submodule in module.modules():
+            for name, buf in list(submodule._buffers.items()):
+                if buf is not None and buf.is_inference():
+                    submodule._buffers[name] = buf.clone()
+                    replaced += 1
+            for name, param in list(submodule._parameters.items()):
+                if param is not None and param.is_inference():
+                    submodule._parameters[name] = torch.nn.Parameter(
+                        param.clone(), requires_grad=param.requires_grad
+                    )
+                    replaced += 1
+    return replaced
+
+
 class TopKCheckpointManager:
     """
     Quản lý raw-model checkpoint cho Strategy 2.
@@ -150,6 +206,12 @@ class TopKCheckpointManager:
             validation_model = deepcopy(raw_model).eval()
             validation_model.requires_grad_(False)
             trainer.ema.ema = validation_model
+
+        # Sau lần validation trước, các buffer BN của module này đã bị
+        # model.half()/model.float() của validator tạo lại BÊN TRONG
+        # torch.inference_mode() ⇒ là inference tensor và không cho copy in-place
+        # ở ngoài inference_mode. Đổi chúng thành tensor thường trước khi copy.
+        materialize_inference_tensors(validation_model)
 
         with torch.no_grad():
             # Validator của Ultralytics gọi model.half() khi val trong lúc train,
