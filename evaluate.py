@@ -24,6 +24,7 @@ import yaml
 
 from config import Config
 from memory import (
+    cpu_quota,
     free_memory,
     release_validator,
     release_yolo,
@@ -62,11 +63,18 @@ def eval_workers():
     chỉ có 1 loader chạy liên tục nên chịu được; còn mỗi seed lại chạy tới 6
     lượt val + 5 lượt BN recalibration, dùng lại đúng con số đó là tự chuốc
     OOM. None = min(WORKERS, 8).
+
+    Các lượt này gọi ``build_dataloader`` trực tiếp (không có ×2 như val loader
+    lúc train), nhưng vẫn clamp theo CPU job được cấp vì Ultralytics chỉ chặn
+    bằng ``os.cpu_count()`` của cả node.
     """
     workers = Config.EVAL_WORKERS
     if workers is None:
         workers = min(int(Config.WORKERS), 8)
-    return max(0, int(workers))
+    workers = max(0, int(workers))
+    if Config.AUTO_LIMIT_WORKERS:
+        workers = min(workers, cpu_quota())
+    return workers
 
 
 def build_val_args(data, split=None, project=None, name=None):

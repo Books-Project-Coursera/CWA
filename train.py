@@ -37,7 +37,13 @@ from evaluate import (
     run_strategy_evaluation,
 )
 from losses import assert_cls_loss_installed, install_cls_loss
-from memory import free_memory, memory_report, release_yolo
+from memory import (
+    cpu_quota,
+    free_memory,
+    memory_report,
+    release_yolo,
+    training_prefetch_bytes,
+)
 from reporting import tidy_run_dir
 
 
@@ -279,6 +285,54 @@ def delete_checkpoint_artifacts(run_dir):
     return len(files)
 
 
+_WORKER_LIMIT_LOGGED = False
+
+
+def resolve_train_workers():
+    """
+    Số worker truyền cho model.train(), đã clamp theo CPU job thực sự được cấp.
+
+    Vì sao cần clamp — hai điều Ultralytics làm ngầm:
+
+    1. ``DetectionTrainer.get_dataloader``::
+
+           workers = self.args.workers if mode == "train" else self.args.workers * 2
+
+       nên val loader trong lúc train xin GẤP ĐÔI. Đặt WORKERS=16 thì log hiện
+       "32 worker processes" — đó không phải bug của config, mà là ×2 này.
+
+    2. ``build_dataloader`` chỉ chặn bằng ``os.cpu_count()`` (CPU của CẢ NODE),
+       trong khi PyTorch cảnh báo dựa trên ``os.sched_getaffinity`` (CPU mà
+       SLURM cấp cho job). Trên node nhiều CPU nhưng job xin ít, Ultralytics vẫn
+       tạo đủ 2×workers còn PyTorch thì kêu quá tay.
+
+    Cả hai loader sống SONG SONG suốt quá trình train (``_setup_train`` tạo cả
+    hai) ⇒ 3 × workers process con. Đặt trần ``workers ≤ cpu_quota // 2`` để
+    không loader nào vượt số CPU được cấp — vừa hết warning, vừa bớt RAM.
+    Tắt bằng Config.AUTO_LIMIT_WORKERS = False.
+    """
+    global _WORKER_LIMIT_LOGGED
+
+    requested = int(Config.WORKERS)
+    if not Config.AUTO_LIMIT_WORKERS:
+        return requested
+
+    quota = cpu_quota()
+    allowed = max(1, quota // 2)  # val loader dùng workers×2, phải ≤ quota
+    if requested <= allowed:
+        return requested
+
+    if not _WORKER_LIMIT_LOGGED:
+        _WORKER_LIMIT_LOGGED = True
+        print(
+            f"  ⚠ WORKERS={requested} → giảm còn {allowed}: job chỉ được cấp {quota} CPU, "
+            f"mà Ultralytics dựng val loader với workers×2 ({requested * 2} worker) "
+            "nên PyTorch sẽ cảnh báo 'This DataLoader will create ... worker processes'. "
+            "Đặt Config.AUTO_LIMIT_WORKERS=False nếu muốn giữ nguyên."
+        )
+    return allowed
+
+
 def build_train_args(data_yaml):
     """
     Map Config → kwargs của model.train().
@@ -291,7 +345,7 @@ def build_train_args(data_yaml):
         "epochs": int(Config.EPOCHS),
         "imgsz": int(Config.IMGSZ),
         "batch": int(Config.BATCH),
-        "workers": int(Config.WORKERS),
+        "workers": resolve_train_workers(),
         "seed": int(Config.RANDOM_SEED),
         "patience": int(Config.PATIENCE),
         "pretrained": bool(Config.PRETRAINED),

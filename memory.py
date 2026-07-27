@@ -26,6 +26,57 @@ cho garbage collector.
 """
 import gc
 import multiprocessing
+import os
+
+
+def cpu_quota():
+    """
+    Số CPU THỰC SỰ được cấp cho process này, không phải của cả node.
+
+    Quan trọng trên SLURM: ``build_dataloader`` của Ultralytics chặn số worker
+    bằng ``os.cpu_count()`` — tổng CPU của máy — nên trên node 96 CPU mà job chỉ
+    xin 16 thì nó vẫn cho phép 32 worker, và PyTorch (dùng ``sched_getaffinity``)
+    lại cảnh báo "This DataLoader will create 32 worker processes in total".
+
+    Lấy min của mọi nguồn tin để không bao giờ ước lượng quá tay.
+    """
+    candidates = []
+    try:
+        candidates.append(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        pass
+    for var in ("SLURM_CPUS_PER_TASK", "SLURM_CPUS_ON_NODE"):
+        value = os.environ.get(var, "")
+        if value.isdigit() and int(value) > 0:
+            candidates.append(int(value))
+    total = os.cpu_count()
+    if total:
+        candidates.append(total)
+    return max(1, min(candidates)) if candidates else 1
+
+
+def dataloader_queue_bytes(workers, batch, imgsz, prefetch_factor=2):
+    """
+    RAM hàng đợi prefetch của MỘT dataloader: mỗi worker giữ sẵn
+    ``prefetch_factor`` batch ảnh uint8 (batch × 3 × imgsz²).
+    """
+    return int(workers) * int(prefetch_factor) * int(batch) * 3 * int(imgsz) ** 2
+
+
+def training_prefetch_bytes(workers, batch, imgsz):
+    """
+    RAM hàng đợi prefetch lúc train — Ultralytics giữ HAI loader song song
+    (``BaseTrainer._setup_train``):
+
+        train_loader : workers      worker, batch
+        test_loader  : workers × 2  worker, batch × 2
+
+    Cả hai hệ số ×2 đều nằm trong Ultralytics: ``DetectionTrainer.get_dataloader``
+    dùng ``self.args.workers * 2`` cho mode='val', còn ``_setup_train`` gọi nó với
+    ``batch_size * 2``. Nên val loader tốn gấp ~4 lần train loader.
+    """
+    return (dataloader_queue_bytes(workers, batch, imgsz)
+            + dataloader_queue_bytes(workers * 2, batch * 2, imgsz))
 
 
 def shutdown_dataloader(loader):

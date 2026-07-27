@@ -228,6 +228,7 @@ python main.py train --exp-name deploy_run01 --export-after-train
 | `EXP_NAME` | Tên experiment ổn định trên server |
 | `WORKERS` | Worker của dataloader lúc train |
 | `EVAL_WORKERS` | Worker cho `model.val()` + BN recal (mặc định 8) — xem mục RAM |
+| `AUTO_LIMIT_WORKERS` | Tự hạ worker theo số CPU SLURM cấp cho job (mặc định `True`) |
 
 Tại sao `STRATEGY1_FROM_RAW_TOPK=True`: `best.pt` được Ultralytics
 `strip_optimizer()` lưu ở FP16, trong khi checkpoint average là FP32. Rank #1
@@ -297,6 +298,34 @@ Vì vậy pipeline:
 
 Log đầu mỗi seed in `RSS ... | ... worker process`. Con số này phải **đi ngang**
 qua các seed; nếu tăng dần thì còn chỗ giữ dataloader lại.
+
+### Vì sao `WORKERS=16` lại thành 32 worker trong log
+
+Hai hệ số ×2 nằm bên trong Ultralytics 8.3.152:
+
+- `DetectionTrainer.get_dataloader` (`models/yolo/detect/train.py:88`):
+  `workers = self.args.workers if mode == "train" else self.args.workers * 2`
+- `BaseTrainer._setup_train` (`engine/trainer.py:312`) gọi nó với `batch_size * 2`
+
+Nên lúc train luôn có **hai** loader sống song song, và loader validation tốn
+gấp ~4 lần loader train:
+
+| loader | worker | batch | prefetch (imgsz 640) |
+|---|---|---|---|
+| `train_loader` | `WORKERS` | `BATCH` | 16 × 2 × 128 → 5.0 GB |
+| `test_loader` | `WORKERS × 2` | `BATCH × 2` | 32 × 2 × 256 → 20.1 GB |
+
+Cảnh báo `This DataLoader will create 32 worker processes in total` xuất hiện vì
+`build_dataloader` chặn worker bằng `os.cpu_count()` — CPU của **cả node** —
+trong khi PyTorch so với `os.sched_getaffinity` — CPU **SLURM cấp cho job**.
+Node 96 CPU nhưng job xin 16 thì Ultralytics vẫn tạo đủ 32.
+
+`AUTO_LIMIT_WORKERS=True` (mặc định) hạ `WORKERS` xuống `cpu_quota // 2` để
+không loader nào vượt số CPU được cấp, và hạ `EVAL_WORKERS` xuống `cpu_quota`.
+`validate_config()` in ra con số hiệu lực + ước lượng RAM prefetch.
+
+`CACHE` **không** liên quan tới lỗi này: mặc định đã là `False` (không cache ảnh
+vào RAM). Chỉ `CACHE="ram"` mới nạp cả dataset vào RAM — đừng bật trên VOC.
 
 Troubleshooting:
 

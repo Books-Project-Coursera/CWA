@@ -48,6 +48,11 @@ class Config:
     # chỉ có 1 loader nên chịu được, nhưng mỗi seed còn chạy 6 lượt val + 5 lượt
     # BN recalibration nối nhau. None = min(WORKERS, 8).
     EVAL_WORKERS = 8
+    # Tự hạ WORKERS/EVAL_WORKERS theo số CPU mà SLURM thực sự cấp cho job.
+    # Cần vì Ultralytics chặn worker bằng os.cpu_count() (CPU của CẢ NODE) còn
+    # PyTorch cảnh báo theo os.sched_getaffinity (CPU của job) → mặc kệ thì log
+    # đầy "This DataLoader will create N worker processes in total".
+    AUTO_LIMIT_WORKERS = True
     PATIENCE = 10   # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
     CACHE = False     # False | "ram" | "disk" — cache dataset
@@ -213,12 +218,23 @@ class Config:
         # job bị OOM killer giết ("Killed" / slurmstepd: oom_kill) chứ không
         # phải CUDA out of memory.
         if int(cls.BATCH) > 0:
-            queue_bytes = int(cls.WORKERS) * 2 * int(cls.BATCH) * 3 * int(cls.IMGSZ) ** 2
-            if queue_bytes > 4 * 1024 ** 3:
+            from memory import cpu_quota, training_prefetch_bytes
+
+            workers = int(cls.WORKERS)
+            if cls.AUTO_LIMIT_WORKERS:
+                workers = min(workers, max(1, cpu_quota() // 2))
+            queue_bytes = training_prefetch_bytes(workers, int(cls.BATCH), int(cls.IMGSZ))
+            print(
+                f"  RAM prefetch (ước lượng): ~{queue_bytes / 1024 ** 3:.1f} GB — "
+                f"train loader {workers} worker × batch {cls.BATCH} + "
+                f"val loader {workers * 2} worker × batch {cls.BATCH * 2} "
+                "(Ultralytics tự nhân đôi cả hai cho val)"
+            )
+            if queue_bytes > 8 * 1024 ** 3:
                 print(
-                    f"⚠ WARNING: WORKERS={cls.WORKERS} × batch={cls.BATCH} × imgsz={cls.IMGSZ} "
-                    f"→ riêng hàng đợi prefetch của dataloader train đã ~{queue_bytes / 1024 ** 3:.1f} GB RAM. "
-                    "Xin đủ --mem cho job SLURM, hoặc giảm WORKERS nếu bị OOM killer."
+                    "⚠ WARNING: hàng đợi prefetch có thể chiếm "
+                    f"~{queue_bytes / 1024 ** 3:.1f} GB RAM host. Xin đủ --mem cho job SLURM, "
+                    "hoặc giảm WORKERS / BATCH nếu bị OOM killer."
                 )
 
         if not cls.OPTIMIZER:
@@ -295,10 +311,23 @@ class Config:
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO} (val' tách từ train)")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        from memory import cpu_quota
+
+        train_workers = int(cls.WORKERS)
+        eval_workers = (int(cls.EVAL_WORKERS) if cls.EVAL_WORKERS is not None
+                        else min(int(cls.WORKERS), 8))
+        limited = ""
+        if cls.AUTO_LIMIT_WORKERS:
+            quota = cpu_quota()
+            capped_train = min(train_workers, max(1, quota // 2))
+            capped_eval = min(eval_workers, quota)
+            if (capped_train, capped_eval) != (train_workers, eval_workers):
+                limited = (f"  (đã hạ từ {train_workers}/{eval_workers} "
+                           f"theo {quota} CPU job được cấp)")
+            train_workers, eval_workers = capped_train, capped_eval
         print(
-            f"  Workers: {cls.WORKERS} khi train | "
-            f"{cls.EVAL_WORKERS if cls.EVAL_WORKERS is not None else min(int(cls.WORKERS), 8)} "
-            "khi val/BN recal"
+            f"  Workers: {train_workers} khi train (Ultralytics dùng "
+            f"{train_workers * 2} cho val loader) | {eval_workers} khi val/BN recal{limited}"
         )
         print(f"  Seeds : {list(seeds)}")
         print(f"  Task  : Object Detection")
