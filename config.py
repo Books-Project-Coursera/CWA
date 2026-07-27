@@ -39,7 +39,7 @@ class Config:
     IMGSZ = 640
     BATCH = 128     # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
-    WORKERS = 24
+    WORKERS = 8
     # Số worker cho dataloader của các lượt SAU train (model.val của từng
     # strategy + BN recalibration). Tách khỏi WORKERS vì RAM, không vì tốc độ:
     # mỗi worker giữ prefetch_factor(=2) batch trong hàng đợi, tức
