@@ -70,8 +70,52 @@ VAL_TEST_WARNING = (
 
 # ==================== Metrics extraction (từ DetMetrics) ====================
 
+class MetricsSnapshot:
+    """
+    Bản chụp CHỈ-SỐ-LIỆU của một ``DetMetrics``.
+
+    Vì sao không giữ thẳng DetMetrics: object đó giữ ``on_plot`` = bound method
+    của validator, kéo theo ``validator.dataloader`` và toàn bộ worker process
+    của dataloader (xem memory.py). Kết quả từng seed được giữ tới cuối
+    experiment, nên giữ DetMetrics = giữ luôn mọi dataloader của mọi lượt eval
+    → RAM cộng dồn qua các seed và job bị OOM killer giết.
+
+    Snapshot chỉ gồm float/str/dict thuần nên an toàn để giữ bao lâu tùy ý.
+    """
+
+    __slots__ = ("overall", "per_class", "speed", "save_dir")
+
+    def __init__(self, overall, per_class, speed=None, save_dir=None):
+        self.overall = dict(overall or {})
+        self.per_class = [dict(row) for row in (per_class or [])]
+        self.speed = dict(speed or {})
+        self.save_dir = save_dir
+
+    def __repr__(self):
+        primary = self.overall.get("mAP@0.5:0.95")
+        return f"MetricsSnapshot(mAP@0.5:0.95={primary}, per_class={len(self.per_class)})"
+
+
+def snapshot_metrics(metrics):
+    """
+    DetMetrics → MetricsSnapshot (idempotent: snapshot vào thì snapshot ra).
+
+    Gọi NGAY sau ``model.val()`` rồi vứt DetMetrics đi.
+    """
+    if metrics is None or isinstance(metrics, MetricsSnapshot):
+        return metrics
+    return MetricsSnapshot(
+        overall=extract_overall_metrics(metrics),
+        per_class=extract_per_class_metrics(metrics),
+        speed=getattr(metrics, "speed", None),
+        save_dir=getattr(metrics, "save_dir", None),
+    )
+
+
 def extract_overall_metrics(metrics):
     """Dict metrics overall từ DetMetrics của Ultralytics (metrics.box.*)."""
+    if isinstance(metrics, MetricsSnapshot):
+        return dict(metrics.overall)
     box = metrics.box
     overall = {
         "Precision": float(box.mp),
@@ -94,6 +138,8 @@ def extract_per_class_metrics(metrics):
     box.ap_class_index = các class-id thực sự xuất hiện trong tập eval;
     box.class_result(i) trả (p, r, ap50, ap) cho phần tử thứ i.
     """
+    if isinstance(metrics, MetricsSnapshot):
+        return [dict(row) for row in metrics.per_class]
     box = metrics.box
     names = getattr(metrics, "names", {}) or {}
     rows = []
@@ -139,6 +185,8 @@ def print_detection_metrics(metrics, header="DETECTION EVALUATION RESULTS"):
 # epoch nguồn, có BN recalibration hay không, và DetMetrics tương ứng.
 
 def make_strategy_record(name, short, kind, metrics, k=None, epochs=None, bn_update=False):
+    # metrics luôn được chụp thành MetricsSnapshot: record này sống tới cuối
+    # experiment, giữ DetMetrics gốc là giữ luôn validator + dataloader của nó.
     return {
         "name": name,
         "short": short,
@@ -146,7 +194,7 @@ def make_strategy_record(name, short, kind, metrics, k=None, epochs=None, bn_upd
         "k": k,
         "epochs": list(epochs or []),
         "bn_update": bool(bn_update),
-        "metrics": metrics,
+        "metrics": snapshot_metrics(metrics),
     }
 
 

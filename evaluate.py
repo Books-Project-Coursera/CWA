@@ -23,6 +23,13 @@ from pathlib import Path
 import yaml
 
 from config import Config
+from memory import (
+    free_memory,
+    release_validator,
+    release_yolo,
+    shutdown_dataloader,
+    validator_of,
+)
 from reporting import (  # re-export để train.py / main.py import từ 1 chỗ
     export_experiment_charts,
     export_experiment_summary,
@@ -34,6 +41,7 @@ from reporting import (  # re-export để train.py / main.py import từ 1 ch�
     print_multi_seed_table,
     read_results_csv,
     slugify,
+    snapshot_metrics,
 )
 
 # File ranking do TopKCheckpointManager (train.py) ghi trong <run_dir>/weights/
@@ -44,6 +52,22 @@ EVAL_CHARTS_DIRNAME = "charts"
 
 
 # ==================== model.val() wrapper ====================
+
+def eval_workers():
+    """
+    Số worker cho dataloader của các lượt eval/BN sau train.
+
+    Mỗi worker giữ ``prefetch_factor`` batch trong RAM (batch×3×imgsz² byte),
+    nên WORKERS=24 với batch=128 là ~7 GB hàng đợi cho MỘT dataloader. Train
+    chỉ có 1 loader chạy liên tục nên chịu được; còn mỗi seed lại chạy tới 6
+    lượt val + 5 lượt BN recalibration, dùng lại đúng con số đó là tự chuốc
+    OOM. None = min(WORKERS, 8).
+    """
+    workers = Config.EVAL_WORKERS
+    if workers is None:
+        workers = min(int(Config.WORKERS), 8)
+    return max(0, int(workers))
+
 
 def build_val_args(data, split=None, project=None, name=None):
     """
@@ -56,7 +80,7 @@ def build_val_args(data, split=None, project=None, name=None):
     val_args = {
         "data": str(data),
         "imgsz": int(Config.IMGSZ),
-        "workers": int(Config.WORKERS),
+        "workers": eval_workers(),
     }
     # auto-batch (-1) chỉ dành cho train → khi val dùng mặc định nếu BATCH=-1
     if int(Config.BATCH) > 0:
@@ -77,7 +101,15 @@ def build_val_args(data, split=None, project=None, name=None):
 
 
 def evaluate_weights(weights, data, split=None, header=None, project=None, name=None):
-    """Chạy model.val() với weights đã train, in metrics, trả về DetMetrics."""
+    """
+    Chạy model.val() với weights đã train, in metrics, trả về MetricsSnapshot.
+
+    Trả SNAPSHOT chứ không phải DetMetrics: DetMetrics giữ ``on_plot`` = bound
+    method của validator → ``validator.dataloader`` → worker process + prefetch
+    queue của dataloader. Kết quả eval được giữ tới cuối experiment, nên trả
+    thẳng DetMetrics đồng nghĩa với việc mọi dataloader của mọi lượt eval đều
+    không bao giờ được thu hồi (xem memory.py).
+    """
     from ultralytics import YOLO
 
     if not weights:
@@ -92,12 +124,30 @@ def evaluate_weights(weights, data, split=None, header=None, project=None, name=
             f"Pipeline này chỉ hỗ trợ object detection, nhưng {weights!s} "
             f"có task={getattr(model, 'task', None)!r}."
         )
-    metrics = model.val(**build_val_args(data, split, project=project, name=name))
+
+    # Model.val() không giữ lại validator ở đâu cả, nên bắt nó qua callback để
+    # còn đóng dataloader ngay khi val xong.
+    validators = []
+    model.add_callback("on_val_end", validators.append)
+    metrics = None
+    try:
+        metrics = model.val(**build_val_args(data, split, project=project, name=name))
+        snapshot = snapshot_metrics(metrics)
+    finally:
+        # validator_of(): phòng khi một bản Ultralytics nào đó không chạy
+        # on_val_end — DetMetrics vẫn trỏ ngược về validator qua on_plot.
+        for validator in validators + [validator_of(metrics)]:
+            release_validator(validator)
+        release_yolo(model)
+        metrics = None
+        del model
+        free_memory()
+
     print_detection_metrics(
-        metrics,
+        snapshot,
         header=header or f"EVALUATION (split={split or 'default'}) — {Path(str(weights)).name}",
     )
-    return metrics
+    return snapshot
 
 
 # ==================== Strategy 2: ranking ====================
@@ -298,6 +348,11 @@ def average_checkpoints(ckpt_paths, output_path, verbose=True):
             f"{averaged} tensor tham số lấy trung bình 1/{k}, "
             f"{copied} buffer/non-learnable giữ từ checkpoint tốt nhất"
         )
+
+    # K model FP32 + K state_dict + accumulator float64 đang nằm trong RAM;
+    # bỏ ngay chứ không chờ hết hàm, bước kế tiếp (BN recal) lại ngốn tiếp.
+    del ckpts, modules, state_dicts, avg_state, merged_module
+    free_memory()
     return Path(output_path)
 
 
@@ -384,7 +439,7 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     dataset = build_yolo_dataset(
         cfg, data["train"], batch, data, mode=mode, rect=False, stride=stride
     )
-    loader = build_dataloader(dataset, batch, workers=int(Config.WORKERS), shuffle=True, rank=-1)
+    loader = build_dataloader(dataset, batch, workers=eval_workers(), shuffle=True, rank=-1)
     batches_per_epoch = max(len(loader), 1)
     if num_batches > batches_per_epoch:
         print(
@@ -431,6 +486,12 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
         for module, momentum in saved_momentum:
             module.momentum = momentum
         model.train(was_training)
+        # Vòng lặp thoát sớm bằng `break` nên iterator vẫn còn sống cùng toàn bộ
+        # worker process + prefetch queue. Đóng tay ngay: hàm này được gọi tới 5
+        # lần mỗi seed, để GC lo thì RAM chồng lên nhau.
+        shutdown_dataloader(loader)
+        loader = dataset = None
+        free_memory()
 
     # Bằng chứng "chỉ forward, không cập nhật gradient": không parameter nào có .grad
     with_grad = [name for name, p in model.named_parameters() if p.grad is not None]
@@ -451,6 +512,9 @@ def update_bn_stats(weights_path, data_yaml, num_batches=None, device=None):
     ckpt["bn_update_batches"] = seen_batches
     torch.save(ckpt, str(weights_path))
     print(f"      ✓ BN stats updated trên {seen_images} ảnh train: {weights_path.name}")
+
+    del ckpt, model, yolo, bn_modules, saved_momentum
+    free_memory()
     return weights_path
 
 
@@ -642,6 +706,7 @@ __all__ = [
     "RANKING_FILE",
     "average_checkpoints",
     "build_val_args",
+    "eval_workers",
     "evaluate_weights",
     "export_experiment_charts",
     "export_experiment_summary",
@@ -657,5 +722,6 @@ __all__ = [
     "read_results_csv",
     "resolve_data_from_run",
     "run_strategy_evaluation",
+    "snapshot_metrics",
     "update_bn_stats",
 ]

@@ -226,6 +226,8 @@ python main.py train --exp-name deploy_run01 --export-after-train
 | `MAKE_CHARTS` | Vẽ chart tổng hợp cuối experiment |
 | `EVAL_SPLIT` | Split báo cáo cuối, mặc định `test` |
 | `EXP_NAME` | Tên experiment ổn định trên server |
+| `WORKERS` | Worker của dataloader lúc train |
+| `EVAL_WORKERS` | Worker cho `model.val()` + BN recal (mặc định 8) — xem mục RAM |
 
 Tại sao `STRATEGY1_FROM_RAW_TOPK=True`: `best.pt` được Ultralytics
 `strip_optimizer()` lưu ở FP16, trong khi checkpoint average là FP32. Rank #1
@@ -264,9 +266,44 @@ data split và cùng quá trình train, nên so sánh theo cặp mới đúng th
 nghiệm (unpaired sẽ bị nuốt bởi biến thiên giữa các seed, vốn lớn hơn hiệu ứng
 nhiều lần). `p` tính bằng regularized incomplete beta, không cần scipy.
 
+## RAM của host (không phải VRAM)
+
+Nhiều seed chạy trong **cùng một process**, nên RAM phải quay về mức cũ sau mỗi
+seed. Hai thứ khiến nó không quay về nếu không xử lý — cả hai đã được xử lý
+trong `memory.py`:
+
+1. `InfiniteDataLoader` của Ultralytics tạo sẵn `self.iterator` ngay trong
+   `__init__` và giữ suốt đời object ⇒ `workers` process con sống tới khi
+   loader bị hủy, mỗi worker còn ôm `prefetch_factor`(=2) batch trong hàng đợi.
+2. `DetMetrics` mà `model.val()` trả về giữ `on_plot` = bound method của
+   validator ⇒ giữ luôn `validator.dataloader` ở (1). Kết quả từng seed được
+   giữ tới cuối experiment, nên chỉ cần lưu DetMetrics là mọi dataloader của
+   mọi lượt eval đều không bao giờ được thu hồi.
+
+Với `USE_STRATEGY2=True`, MỖI seed dựng 3 dataloader lúc train + 6 lượt
+`model.val()` + 5 lượt BN recalibration = 14 dataloader. Ở `WORKERS=24` là 336
+process con còn sống sau seed đầu tiên, seed thứ hai chết ngay lúc build
+dataset (`Killed` / `slurmstepd: ... oom_kill`).
+
+Vì vậy pipeline:
+
+- Trả về `MetricsSnapshot` (chỉ float/str) thay cho `DetMetrics`.
+- Đóng dataloader **tường minh** (`_shutdown_workers`) sau mỗi lượt val, mỗi
+  lượt BN recal và sau mỗi seed, thay vì phó mặc cho GC.
+- Dùng `EVAL_WORKERS` (mặc định 8) cho các lượt sau train: hàng đợi prefetch
+  tốn `workers × 2 × batch × 3 × imgsz²` byte — với `WORKERS=24, batch=128,
+  imgsz=640` là ~7.5 GB cho **một** dataloader. Đổi giá trị này không ảnh hưởng
+  metrics, chỉ ảnh hưởng tốc độ và RAM.
+
+Log đầu mỗi seed in `RSS ... | ... worker process`. Con số này phải **đi ngang**
+qua các seed; nếu tăng dần thì còn chỗ giữ dataloader lại.
+
 Troubleshooting:
 
-- OOM: giảm `BATCH`/`IMGSZ` hoặc dùng `--batch -1`.
+- OOM host (`Killed`, `slurmstepd: oom_kill`, không phải `CUDA out of memory`):
+  giảm `--eval-workers` rồi tới `--workers`, hoặc xin thêm `--mem` cho job.
+  `validate_config()` in sẵn ước lượng RAM hàng đợi khi con số này vượt 8 GB.
+- OOM VRAM (`CUDA out of memory`): giảm `BATCH`/`IMGSZ` hoặc dùng `--batch -1`.
 - Không đủ Top-K: số epoch thực tế trước early stopping nhỏ hơn K.
 - Run cũ báo không phải raw checkpoint: phải train lại bằng code hiện tại;
   code chủ động không trộn EMA checkpoint với raw averaging.

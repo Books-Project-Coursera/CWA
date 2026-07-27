@@ -37,6 +37,7 @@ from evaluate import (
     run_strategy_evaluation,
 )
 from losses import assert_cls_loss_installed, install_cls_loss
+from memory import free_memory, memory_report, release_yolo
 from reporting import tidy_run_dir
 
 
@@ -397,6 +398,9 @@ def _train_one_seed(seed, exp_dir):
                 metrics, header=f"FINAL VALIDATION on val' (best ckpt) | Seed {seed}"
             )
             val_metrics = extract_overall_metrics(metrics)
+        # DetMetrics giữ tham chiếu ngược tới validator của trainer (và
+        # dataloader của nó) — số liệu đã trích xong nên bỏ ngay.
+        metrics = None
 
         # Test chỉ báo cáo hiệu năng cho các K đã định trước; không dùng chọn K.
         evaluation = run_strategy_evaluation(run_dir, data=data_yaml, seed=seed)
@@ -424,6 +428,15 @@ def _train_one_seed(seed, exp_dir):
             trainer = getattr(model, "trainer", None)
             save_dir = getattr(trainer, "save_dir", None)
             run_dir = Path(save_dir) if save_dir else None
+
+        # Trả RAM về TRƯỚC khi seed kế tiếp dựng dataset/dataloader mới.
+        # trainer giữ train_loader + test_loader, mỗi loader giữ WORKERS
+        # process con còn sống kèm prefetch queue — không đóng tay thì seed sau
+        # bị OOM killer giết ngay lúc build dataset (xem memory.py).
+        release_yolo(model)
+        del model
+        free_memory()
+
         if run_dir is not None:
             if Config.DELETE_CHECKPOINTS_AFTER_RUN:
                 delete_checkpoint_artifacts(run_dir)
@@ -524,7 +537,13 @@ def train_detector():
 
     try:
         for idx, seed in enumerate(seeds):
-            print(f"\n>>>> [Seed {idx + 1}/{len(seeds)}] RANDOM_SEED = {seed} <<<<")
+            # Log RAM đầu mỗi seed: con số này phải ĐI NGANG qua các seed.
+            # Nếu nó tăng dần (hoặc "worker process" > 0 lúc bắt đầu) thì còn
+            # dataloader/validator bị giữ lại và job sẽ OOM ở seed sau.
+            print(
+                f"\n>>>> [Seed {idx + 1}/{len(seeds)}] RANDOM_SEED = {seed}"
+                f"  |  {memory_report()} <<<<"
+            )
             try:
                 all_runs_results.append(_train_one_seed(seed, exp_dir))
             except KeyboardInterrupt:
@@ -535,6 +554,9 @@ def train_detector():
                 failures.append({"seed": seed, "error": f"{type(exc).__name__}: {exc}"})
                 print(f"\n  ✗ Seed {seed} THẤT BẠI: {type(exc).__name__}: {exc}")
                 traceback.print_exc()
+            finally:
+                free_memory()
+                print(f"  [RAM] Sau seed {seed}: {memory_report()}")
     finally:
         # ── Khôi phục cấu hình gốc kể cả khi có lỗi ───────────────────────────
         Config.RANDOM_SEED = orig_seeds

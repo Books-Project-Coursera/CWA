@@ -61,7 +61,12 @@ def add_common_args(parser):
     parser.add_argument("--imgsz", type=int, help="Override Config.IMGSZ.")
     parser.add_argument("--batch", type=int, help="Override Config.BATCH (-1 = auto-batch).")
     parser.add_argument("--device", help="Device: 0 | 0,1 | cpu. Mặc định auto.")
-    parser.add_argument("--workers", type=int, help="Override Config.WORKERS.")
+    parser.add_argument("--workers", type=int, help="Override Config.WORKERS (dataloader lúc train).")
+    parser.add_argument(
+        "--eval-workers", "--eval_workers", dest="eval_workers", type=int,
+        help="Override Config.EVAL_WORKERS — worker cho model.val()/BN recal. "
+             "Giảm nếu job bị OOM (RAM host), không ảnh hưởng kết quả.",
+    )
     parser.add_argument("--seed", type=int, nargs="+", help="Override Config.RANDOM_SEED (chấp nhận 1 hoặc nhiều seed, ví dụ: --seed 42 100).")
     parser.add_argument("--optimizer", help="Override Config.OPTIMIZER (auto/SGD/AdamW/...).")
     parser.add_argument("--lr0", type=float, help="Override Config.LR0.")
@@ -175,6 +180,7 @@ def apply_cli_overrides(args):
         ("BATCH", getattr(args, "batch", None)),
         ("DEVICE", getattr(args, "device", None)),
         ("WORKERS", getattr(args, "workers", None)),
+        ("EVAL_WORKERS", getattr(args, "eval_workers", None)),
         ("RANDOM_SEED", getattr(args, "seed", None)),
         ("OPTIMIZER", getattr(args, "optimizer", None)),
         ("LR0", getattr(args, "lr0", None)),

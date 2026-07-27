@@ -40,6 +40,14 @@ class Config:
     BATCH = 128     # -1 = auto-batch theo VRAM (chỉ áp dụng khi train)
     DEVICE = None     # None = auto (GPU nếu có); "0" | "0,1" | "cpu"
     WORKERS = 24
+    # Số worker cho dataloader của các lượt SAU train (model.val của từng
+    # strategy + BN recalibration). Tách khỏi WORKERS vì RAM, không vì tốc độ:
+    # mỗi worker giữ prefetch_factor(=2) batch trong hàng đợi, tức
+    #     workers × 2 × batch × 3 × imgsz² byte
+    # ≈ 7 GB với WORKERS=24, batch=128, imgsz=640 cho MỘT dataloader. Lúc train
+    # chỉ có 1 loader nên chịu được, nhưng mỗi seed còn chạy 6 lượt val + 5 lượt
+    # BN recalibration nối nhau. None = min(WORKERS, 8).
+    EVAL_WORKERS = 8
     PATIENCE = 10   # Ultralytics early stopping (epoch không cải thiện fitness val)
     PRETRAINED = True
     CACHE = False     # False | "ram" | "disk" — cache dataset
@@ -197,6 +205,22 @@ class Config:
         if int(cls.WORKERS) < 0:
             raise ValueError("WORKERS must be non-negative")
 
+        if cls.EVAL_WORKERS is not None and int(cls.EVAL_WORKERS) < 0:
+            raise ValueError("EVAL_WORKERS must be non-negative, or None to use min(WORKERS, 8)")
+
+        # Cảnh báo RAM HOST (không phải VRAM): mỗi worker của dataloader giữ
+        # prefetch_factor(=2) batch ảnh uint8 trong hàng đợi. Đây là thứ khiến
+        # job bị OOM killer giết ("Killed" / slurmstepd: oom_kill) chứ không
+        # phải CUDA out of memory.
+        if int(cls.BATCH) > 0:
+            queue_bytes = int(cls.WORKERS) * 2 * int(cls.BATCH) * 3 * int(cls.IMGSZ) ** 2
+            if queue_bytes > 4 * 1024 ** 3:
+                print(
+                    f"⚠ WARNING: WORKERS={cls.WORKERS} × batch={cls.BATCH} × imgsz={cls.IMGSZ} "
+                    f"→ riêng hàng đợi prefetch của dataloader train đã ~{queue_bytes / 1024 ** 3:.1f} GB RAM. "
+                    "Xin đủ --mem cho job SLURM, hoặc giảm WORKERS nếu bị OOM killer."
+                )
+
         if not cls.OPTIMIZER:
             raise ValueError("OPTIMIZER must not be empty")
 
@@ -271,6 +295,11 @@ class Config:
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO} (val' tách từ train)")
         print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        print(
+            f"  Workers: {cls.WORKERS} khi train | "
+            f"{cls.EVAL_WORKERS if cls.EVAL_WORKERS is not None else min(int(cls.WORKERS), 8)} "
+            "khi val/BN recal"
+        )
         print(f"  Seeds : {list(seeds)}")
         print(f"  Task  : Object Detection")
         print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
