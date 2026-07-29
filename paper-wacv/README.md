@@ -22,15 +22,19 @@ limit that excludes references. Supplementary: 2 pages. Both compile with
 3. **Fill `\TODO` markers.** Two, both in `sec/4_setup.tex`: the per-model
    configuration table and the shared-settings paragraph. Search for `TODO`.
    The red `\TODO{}` rendering must be gone before submission.
-4. **Camera-ready.** Swap to `\usepackage{wacv}` and restore the author block
-   in `main.tex`.
+4. **Camera-ready.** Swap to `\usepackage{wacv}` and fill in the author block
+   in `main.tex` and `supplementary.tex`. In review mode `wacv.sty` ignores
+   `\author` and typesets the anonymous header itself, so the placeholder
+   blocks are inert until then — but they are what gets printed the moment the
+   `review` option comes off.
 
 ## Layout
 
 | File | Contents |
 |---|---|
 | `main.tex` | document, title, track/ID switches |
-| `preamble.tex` | packages plus `\ms`/`\best` table cell macros |
+| `preamble.tex` | packages, `\ms`/`\best` table macros, figure colors |
+| `sec/fig_pipeline.tex` | Fig. 1, drawn in TikZ (no image dependency) |
 | `sec/0_abstract.tex` … `sec/7_conclusion.tex` | body |
 | `sec/tab_acc.tex` | classification accuracy, 30 configs (main paper) |
 | `sec/tab_f1.tex` | classification macro-F1, 30 configs (supplementary) |

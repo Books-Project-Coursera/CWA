@@ -90,12 +90,3 @@ we regard as the most important missing ablation. \emph{Third}, the selection
 analysis of \cref{sec:selection} rests on CIFAR-100 records only, so its
 quantitative constants should not be read as universal, though the qualitative
 conclusion follows from early stopping being active, which is common.
-
-\paragraph{When it should help.}
-The rule's leverage comes from disagreement among near-equal checkpoints, so it
-should help most when late-epoch validation is noisy and least when the
-criterion has a sharp, stable optimum. Our data agree: the smallest gains occur
-on Burmese Grape, whose baselines sit closest to their ceiling. When a run
-early-stops after very few epochs there are barely $k$ meaningful candidates
-and the method degenerates gracefully towards the baseline, as the ViT-Base
-rows show.

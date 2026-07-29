@@ -176,3 +176,62 @@ rows cost half the vertical space. Two `\TODO` markers mark what to fill.
 All 420 result cells were checked by extracting the text layer of the compiled
 PDFs and matching every `mean ± std` string against the spreadsheet: zero
 mismatches. Both documents compile with 0 errors and 0 overfull boxes.
+
+## Update: algorithm generalized, figure redrawn, format audited
+
+**Algorithm.** It was written for a minimized loss, with the maximized case
+handled by a parenthetical "argmin becomes argmax". That does not survive
+contact with detection, where fitness is maximized. The method now defines a
+selection score `s_t = δ · c_t` with `δ = -1` for a loss and `δ = +1` for a
+score (Eq. 1); everything downstream is a single argmax and is identical for
+both kinds of pipeline. `δ` is now the only task-dependent quantity in the
+method, which is a cleaner statement of the portability claim than the old
+case-split. Algorithm 1 takes `δ` as an explicit input and is staged
+Rank / Average / Recalibrate.
+
+Two facts recovered from `train.py` and `config.py` and now stated in the
+paper, both of which preempt reviewer questions:
+
+- Ultralytics validates through an EMA of the weights by default, and the
+  pipeline disables it so the recorded fitness, the early-stopping signal and
+  the stored weights all refer to the same raw parameters. Without this,
+  checkpoints would be ranked by a quantity computed from weights other than
+  the ones being averaged.
+- The baseline is taken from the top-ranked entry of the same table the rule
+  ranks, not from `best.pt`, which Ultralytics serializes at half precision.
+  Comparing FP16 against an FP32 average would confound the selection rule
+  with a precision change.
+
+The "k+1 states suffice" claim is also no longer hypothetical: the detection
+runs implement exactly that, pruning a checkpoint the moment it falls outside
+the current top k.
+
+**Figure.** `Pipeline.png` showed validation loss only and predated the
+detection and segmentation work. Replaced by a TikZ figure with no image
+dependency, showing the untouched training run, the per-epoch selection scores
+with the top-k highlighted against a dashed last-k window, the criterion box
+giving δ for both task families, and the two selection branches converging on
+one evaluation. The last-k contrast is the point: it makes the paper's central
+distinction visible in the first figure rather than only in Sec. 6.
+`Pipeline.png` was deleted, since nothing references it now.
+
+**Format audit against the author kit.** Two real problems:
+
+- The author block had been replaced with a hand-written "Anonymous WACV
+  submission / Paper ID". In review mode `wacv.sty` ignores `\author` and
+  typesets that header itself, so it looked correct — but `\author` is exactly
+  what gets printed once the `review` option comes off, so the camera-ready
+  would have shown "Anonymous submission" where the authors belong. Restored
+  the kit's placeholder block in both documents.
+- `sec/4_setup.tex` and `sec/6_discussion.tex` had tables overflowing their
+  column; all wide tables are now wrapped to `\textwidth`/`\linewidth`.
+
+Checked and correct: `[review,algorithms]` option, page limit, line numbering,
+paper-ID plumbing, `natbib` + `ieeenat_fullname`, `hyperref` with
+`pagebackref`, and `cleveref` (loaded by `wacv.sty`, so `\cref` yields
+Fig./Tab./Sec. — used throughout rather than hand-written "Table 3").
+
+**Build.** Main 9 pages with the body ending on page 8, so inside the 8-page
+limit; supplementary 2 pages. 0 errors, 0 overfull boxes, no undefined
+references or citations in either. All 420 result cells re-verified against the
+spreadsheet after the edits: zero mismatches.

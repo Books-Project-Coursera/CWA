@@ -25,3 +25,9 @@
 % \ms{mean}{std} — plain cell;  \best{mean}{std} — highlighted best in block
 \newcommand{\ms}[2]{$#1${\scriptsize$\,\pm#2$}}
 \newcommand{\best}[2]{\cellcolor{black!8}$\mathbf{#1}${\scriptsize$\,\pm#2$}}
+
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds,calc}
+\definecolor{selcol}{HTML}{D95F02}   % selected checkpoints
+\definecolor{basecol}{HTML}{1B6CA8}  % baseline / single best
+\definecolor{winbg}{HTML}{9E9E9E}    % last-k window

@@ -1,0 +1,76 @@
+\begin{figure}[t]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[
+  font=\scriptsize, >={Latex[length=1.5mm]},
+  box/.style={draw, rounded corners=1.6pt, align=center, inner sep=2.4pt,
+              line width=0.35pt},
+  flow/.style={->, line width=0.5pt, gray!70},
+]
+\def\W{8.4}       % total width (cm)
+\def\bw{0.29}     % bar pitch
+\def\bh{0.95}     % bar area height
+
+%% ── the untouched training run ─────────────────────────────────────────
+\node[box, fill=gray!8, text width=\W cm-6pt] (train)
+  {\textbf{Standard training run} --- optimizer, LR schedule, early stopping
+   and epoch budget \emph{unchanged}};
+
+%% ── checkpoint set, as per-epoch selection scores ──────────────────────
+\coordinate (o) at ($(train.south west)+(1.30,-1.42)$);
+\foreach \i/\h/\sel in {%
+  1/0.12/0, 2/0.28/0, 3/0.40/0, 4/0.58/0, 5/0.70/0, 6/0.84/1,
+  7/0.76/0, 8/0.90/1, 9/0.80/1, 10/0.87/1, 11/0.72/0, 12/0.82/1,
+  13/0.68/0, 14/0.64/0, 15/0.60/0, 16/0.58/0}{
+  \ifnum\sel=1\def\c{selcol}\else\def\c{black!22}\fi
+  \fill[\c] ($(o)+(\i*\bw-\bw,0)$) rectangle ++(\bw*0.70,\h*\bh);
+}
+\draw[black!45, line width=0.35pt] (o) -- ++(16*\bw,0);
+\draw[dashed, winbg, line width=0.5pt]
+  ($(o)+(11*\bw,-0.05)$) rectangle ++(5*\bw,\bh*1.04);
+\node[winbg, anchor=north, font=\tiny] at ($(o)+(13.5*\bw,-0.07)$)
+  {last-$k$ window};
+\node[anchor=east, align=right, font=\tiny] at ($(o)+(-0.05,\bh*0.5)$)
+  {selection\\score $s_t$};
+\node[anchor=south, selcol, font=\tiny] at ($(o)+(9*\bw,0.93*\bh)$) {top-$k$};
+\node[anchor=north, font=\tiny] at ($(o)+(8*\bw,-0.34)$)
+  {epoch $t=1\dots T$: checkpoints $\mathbf{w}_t$ with scores $s_t$};
+
+%% ── criterion box ──────────────────────────────────────────────────────
+\node[box, fill=white, draw=black!45, anchor=west, align=left, font=\tiny]
+  (crit) at ($(o)+(16.4*\bw,\bh*0.52)$)
+  {$s_t=\delta\cdot c_t$\\[1pt]
+   classification: $\delta{=}{-}1$, $c_t{=}\ell^{\text{val}}_t$\\
+   det.\ / seg.: $\delta{=}{+}1$, $c_t{=}\varphi_t$};
+
+%% ── the two selection rules ────────────────────────────────────────────
+\node[box, fill=basecol!8, draw=basecol, anchor=north west, text width=2.9cm]
+  (base) at ($(train.south west)+(0,-2.62)$)
+  {\textbf{Baseline} ($k{=}1$)\\[1pt]
+   keep $\mathbf{w}_{t^{*}}$, $t^{*}{=}\arg\max_t s_t$};
+\node[box, fill=selcol!8, draw=selcol, anchor=north east, text width=4.5cm]
+  (ours) at ($(train.south east)+(0,-2.62)$)
+  {\textbf{Ours} (top-$k$)\\[1pt]
+   $\mathbf{w}_{\text{avg}}{=}\frac{1}{k}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t$,
+   then reset \& recompute BN statistics};
+
+%% ── evaluation ─────────────────────────────────────────────────────────
+\node[box, fill=gray!8, text width=\W cm-6pt, anchor=north]
+  (eval) at ($(base.south)!0.5!(ours.south)+(0,-0.34)$)
+  {\textbf{Final evaluation} --- held-out split, single-model inference cost};
+
+%% ── arrows ─────────────────────────────────────────────────────────────
+\draw[flow] (train.south) -- ++(0,-0.26);
+\draw[flow] ($(o)+(2.0*\bw,-0.52)$) -- (base.north);
+\draw[flow] ($(o)+(11.5*\bw,-0.52)$) -- (ours.north);
+\draw[flow] (base.south) -- (base.south |- eval.north);
+\draw[flow] (ours.south) -- (ours.south |- eval.north);
+\end{tikzpicture}}
+\caption{The rule changes only the last step of the pipeline. A standard run is
+  left untouched and emits checkpoints with the validation criterion $c_t$ it
+  already records; the sign $\delta$ orients that criterion so larger is better
+  (\cref{eq:score}) and is the method's only task-dependent quantity. Selecting
+  by score rather than by position, the chosen set need not be contiguous nor
+  lie inside a last-$k$ window (\cref{sec:selection}). Bars are schematic.}
+\label{fig:pipeline}
+\end{figure}

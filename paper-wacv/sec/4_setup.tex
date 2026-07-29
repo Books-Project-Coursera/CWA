@@ -67,9 +67,9 @@ the VOC2007 test set untouched for reporting.
 
 \paragraph{Segmentation.}
 Carparts \cite{ultralytics2024carparts} is an instance-segmentation dataset of
-vehicle parts with 23 classes and a 3,156/401/276 train/val/test split. As
-above, the selection split is held out from the training pool and the test
-split is used only for reporting.
+vehicle parts with 23 classes and a 3,156/401/276 split; as above, the
+selection split is held out from the training pool and the test split is used
+only for reporting.
 
 \subsection{Models}
 
@@ -89,14 +89,13 @@ models on Carparts give four more, for 34 in total.
 \subsection{Matched-Trajectory Protocol}
 
 Every configuration is trained independently with five seeds
-$\{1,10,42,100,500\}$. For a given seed, the baseline and all $k$ are derived
-from the \emph{same} completed run and the same checkpoint set, so they share
-architecture, initialization, data order, optimizer, schedule and training
-duration, and differ only in the post-training selection rule. Any difference
-between them is therefore attributable to that rule and not to training
-variance. We report mean $\pm$ standard deviation over the five seeds. All
-values of $k$ are reported as a sensitivity analysis; $k$ is never chosen using
-the final evaluation split.
+$\{1,10,42,100,500\}$. For a given seed, the baseline and all $k$ come from the
+\emph{same} completed run and the same checkpoint set, so they share
+architecture, initialization, data order, optimizer, schedule and duration, and
+differ only in the post-training selection rule; any difference between them is
+attributable to that rule and not to training variance. We report mean $\pm$
+standard deviation over the five seeds. All values of $k$ are reported as a
+sensitivity analysis; $k$ is never chosen on the final evaluation split.
 
 \subsection{Training Configuration}
 

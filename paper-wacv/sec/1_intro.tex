@@ -1,16 +1,7 @@
 \section{Introduction}
 \label{sec:intro}
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\linewidth]{Pipeline.png}
-  \caption{The rule operates only at the model-selection stage. Training runs
-    unmodified and emits a checkpoint set; the baseline keeps the single
-    best-scoring state, while we keep the top $k$ by the same criterion, average
-    their trainable parameters, and recompute Batch-Normalization statistics
-  before the final evaluation.}
-  \label{fig:pipeline}
-\end{figure}
+\input{sec/fig_pipeline}
 
 Nearly every supervised vision pipeline ends with the same step. Training
 produces a sequence of epoch checkpoints, each is scored on a held-out

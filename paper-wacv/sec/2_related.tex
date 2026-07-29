@@ -18,19 +18,17 @@ checkpoint scores. TWA \cite{li2022trainable} learns the averaging coefficients
 in the subspace spanned by the candidates, improving over SWA at the cost of a
 secondary optimization stage.
 
-Our rule differs from all of these in when it acts and in what it needs. It
-runs after training has terminated, prescribes no optimizer, schedule, cycle
-structure or stopping rule, and performs no secondary optimization. It requires
-only that epoch checkpoints and their validation scores exist, which standard
-pipelines already produce.
+Our rule differs in when it acts and in what it needs: it runs after training
+has terminated, prescribes no optimizer, schedule, cycle structure or stopping
+rule, performs no secondary optimization, and requires only the epoch
+checkpoints and validation scores standard pipelines already produce.
 
 \paragraph{Inference-time ensembling.}
 Combining diverse hypotheses improves generalization at inference cost
 proportional to ensemble size \cite{dietterich2000ensemble}. Snapshot ensembles
-reduce the \emph{training} cost of obtaining diverse members by exploiting
-cyclical learning rates within one run \cite{huang2017snapshotensemblestrain1},
-but the inference overhead remains. Our setting assumes that overhead is not
-available.
+cut the \emph{training} cost of obtaining diverse members
+\cite{huang2017snapshotensemblestrain1}, but the inference overhead remains,
+and our setting assumes it is unavailable.
 
 \paragraph{Post-training aggregation.}
 Temporal-window averaging selects checkpoints by position: the last $k$ epochs,

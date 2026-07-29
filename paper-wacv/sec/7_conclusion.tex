@@ -2,23 +2,22 @@
 \label{sec:conclusion}
 
 We replaced the winner-takes-all checkpoint selection that ends most vision
-pipelines with a rule that costs nothing at training or inference time: rank the
-checkpoints of a completed run by the validation criterion the pipeline already
-computes, keep the top $k$, average them. Because the rule reads only one scalar
-per checkpoint, the same procedure applies to classification, detection and
-segmentation with no task-specific modification beyond naming that scalar.
+pipelines with a rule that costs nothing at training or inference time: rank
+the checkpoints of a completed run by the validation criterion the pipeline
+already computes, keep the top $k$, average them. Because the rule reads only
+one scalar per checkpoint, oriented by a single sign, the same procedure
+applies to classification, detection and segmentation unchanged.
 
 Across 34 model--dataset configurations with five seeds each, under a protocol
 in which the baseline and every $k$ share a training trajectory, $k{=}5$
-improves the primary metric in all 34. Classification accuracy rises
+improves the primary metric in all 34: classification accuracy rises
 81.73\%$\to$83.76\% and macro-F1 81.65\%$\to$83.86\% in equally weighted mean,
 detection and segmentation fitness gain 5.8--6.9\% relative, and across-seed
 standard deviation drops by roughly a fifth. The effect of $k$ is not uniformly
 monotonic per configuration, so the finding is not that larger $k$ is always
-better; it is that a small criterion-ranked set is a better default than a
-single winner, at $k\in\{4,5\}$.
-
-We also showed the rule is not last-$k$ averaging in disguise: the selected
-checkpoints are usually non-contiguous and rarely near the end of training. The
-next step is the matched comparison that observation invites---last-$k$, EMA,
-post-hoc SWA and a BN-recalibrated baseline on the same trajectories.
+better, but that a small criterion-ranked set is a better default than a single
+winner. We also showed the rule is not last-$k$ averaging in disguise: the
+selected checkpoints are usually non-contiguous and rarely near the end of
+training. The matched comparison that observation invites---last-$k$, EMA,
+post-hoc SWA and a BN-recalibrated baseline on the same trajectories---is the
+natural next step.
