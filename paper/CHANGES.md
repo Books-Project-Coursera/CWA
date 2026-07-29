@@ -104,3 +104,75 @@ figure blocks out of the file.
 `pdflatex` × 3 + `bibtex`, TeX Live 2023: 0 errors, 0 overfull boxes, no
 undefined references or citations, in both the default (13 pp.) and
 figures-enabled (15 pp.) configurations.
+
+---
+
+# Update: WACV 2027 version (`../paper-wacv/`)
+
+The LNCS draft in this directory is superseded by `paper-wacv/`, ported to the
+official WACV 2027 author kit and extended with the detection and segmentation
+results that were in the spreadsheet all along, in `Final results` rows
+103--116, and that I wrongly scoped out as belonging to a different paper.
+
+## Scope change
+
+The paper is no longer classification-only. Adding VOC and Carparts required
+reframing rather than appending:
+
+- **Title and framing.** The method is now stated as a task-agnostic
+  model-selection rule whose only interface to the task is one scalar per
+  checkpoint. Classification supplies validation loss, detection and
+  segmentation supply validation fitness. That framing is what lets four
+  detection/segmentation configurations sit in the same paper as the 30
+  classification ones instead of looking bolted on.
+- **The old limitation "evaluation is limited to image classification" is
+  gone**, since it is no longer true.
+- 30 configurations became 34; every count, claim and aggregate was recomputed.
+
+## New results
+
+Detection (VOC, YOLOv8s/YOLO11s) and instance segmentation (Carparts,
+YOLOv8s/YOLO11s), five seeds each, k=1..5. Fitness improves at every k in all
+four configurations, +5.8% to +6.9% relative at k=5. Every mAP variant improves
+in all four.
+
+The one non-uniform result is reported rather than buried: on Carparts,
+precision *falls* for both models while recall rises three to five times as
+much. It is the same precision/recall asymmetry the classification aggregate
+shows, and the text says plainly that practitioners who are precision-bound
+should expect this trade.
+
+## Fitness definition
+
+Verified against the data: for VOC, `0.1*mAP@0.5 + 0.9*mAP@0.5:0.95`
+reproduces the reported fitness to four decimals. For Carparts it does not —
+the reported values exceed 1 and the residual matches a second, mask-side
+component, consistent with the Ultralytics segmentation fitness summing box and
+mask. The caption states this. **Worth confirming**: whether the Precision /
+Recall / mAP columns for Carparts are box metrics, mask metrics, or box only.
+The caption currently says box.
+
+## Config table
+
+Left blank as requested, but restructured into two side-by-side halves so 34
+rows cost half the vertical space. Two `\TODO` markers mark what to fill.
+
+## Reviewer risks, in the order I would worry about them
+
+1. **BN recalibration is applied to the averaged model but not to the
+   baseline.** Detection `config.py` already has `BN_UPDATE_CONTROL = True`
+   for exactly this control, but no such row exists in the spreadsheet, so it
+   could not be reported. This is the ablation a reviewer is most likely to
+   demand, and running it would materially strengthen the paper. It is stated
+   as the most important missing ablation rather than glossed.
+2. **No head-to-head against last-k, EMA or post-hoc SWA.** Sec. 6 shows the
+   selected checkpoints differ from a last-k window, which establishes the
+   rules are distinct but not that ours wins. The paper says so explicitly.
+3. **The selection-geometry analysis is CIFAR-100 only**, since only those
+   per-seed records exist. Flagged in the limitations.
+
+## Verification
+
+All 420 result cells were checked by extracting the text layer of the compiled
+PDFs and matching every `mean ± std` string against the spreadsheet: zero
+mismatches. Both documents compile with 0 errors and 0 overfull boxes.

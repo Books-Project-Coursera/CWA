@@ -1,0 +1,49 @@
+% WACV 2027 submission — Post-Training Top-k Checkpoint Averaging
+%
+% Toggle review / camera-ready on the \usepackage line below.
+% Remember to set \wacvPaperID once CMT assigns it.
+
+\documentclass[10pt,twocolumn,letterpaper]{article}
+
+%%%%%%%%% PAPER TYPE  - PLEASE UPDATE FOR FINAL VERSION
+\usepackage[review,algorithms]{wacv}      % REVIEW version, algorithms track
+% \usepackage[review,applications]{wacv}  % REVIEW version, applications track
+% \usepackage{wacv}                       % CAMERA-READY version
+
+\input{preamble}
+
+\definecolor{wacvblue}{rgb}{0.21,0.49,0.74}
+\usepackage[pagebackref,breaklinks,colorlinks,allcolors=wacvblue]{hyperref}
+
+%%%%%%%%% PAPER ID  - PLEASE UPDATE
+\def\wacvPaperID{*****} % *** Enter the WACV Paper ID here
+\def\confName{WACV}
+\def\confYear{2027}
+
+%%%%%%%%% TITLE
+\title{Criterion-Guided Top-$k$ Checkpoint Averaging:\\
+A Post-Training Model-Selection Rule for Classification, Detection and Segmentation}
+
+%%%%%%%%% AUTHORS - anonymous for review; fill in for camera-ready
+\author{Anonymous \confName~submission\\
+Paper ID \wacvPaperID}
+
+\begin{document}
+\maketitle
+
+\input{sec/0_abstract}
+\input{sec/1_intro}
+\input{sec/2_related}
+\input{sec/3_method}
+\input{sec/4_setup}
+\input{sec/5_results}
+\input{sec/6_discussion}
+\input{sec/7_conclusion}
+
+{
+    \small
+    \bibliographystyle{ieeenat_fullname}
+    \bibliography{refs}
+}
+
+\end{document}

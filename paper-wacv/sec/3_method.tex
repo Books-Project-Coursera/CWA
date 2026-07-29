@@ -1,0 +1,99 @@
+\section{Method}
+\label{sec:method}
+
+\subsection{Setting}
+
+A standard run produces a checkpoint set
+$\mathcal{C}=\{(\mathbf{w}_t,\, c_t)\}_{t=1}^{T}$, where $\mathbf{w}_t$ are the
+parameters after epoch $t$ and $c_t$ is a scalar validation criterion recorded
+at that epoch on a split disjoint from the final evaluation set. Conventional
+selection returns the single best state,
+\begin{equation}
+  t^{*}=\arg\min_{1\le t\le T} c_t ,
+  \qquad
+  \mathbf{w}_{\text{base}}=\mathbf{w}_{t^{*}} ,
+  \label{eq:baseline}
+\end{equation}
+written here for a criterion that is minimized; for a criterion that is
+maximized, $\arg\min$ becomes $\arg\max$ throughout and nothing else changes.
+
+\subsection{Criterion-Guided Top-$k$ Averaging}
+
+Instead of the single minimizer we take the $k$ best-scoring epochs,
+\begin{equation}
+  \mathcal{S}_k=\operatorname*{arg\,min}_{\substack{\mathcal{S}\subseteq\{1,\dots,T\}\\ |\mathcal{S}|=k}}\ \sum_{t\in\mathcal{S}} c_t ,
+  \label{eq:topk}
+\end{equation}
+that is, the indices of the $k$ smallest $c_t$, with ties broken in favour of
+later epochs, and average their trainable parameters element-wise:
+\begin{equation}
+  \mathbf{w}_{\text{avg}}=\frac{1}{|\mathcal{S}_k|}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t .
+  \label{eq:avg}
+\end{equation}
+Note that $\mathcal{S}_1=\{t^{*}\}$, so \cref{eq:baseline} is the $k{=}1$ case
+of \cref{eq:topk} and the baseline is nested inside the method rather than
+being a separate procedure. More generally $\mathcal{S}_{k-1}\subset
+\mathcal{S}_k$: increasing $k$ only admits one further checkpoint and never
+displaces an existing one.
+
+\paragraph{Normalization statistics.}
+Averaging is applied to trainable parameters only. Batch-Normalization
+\cite{ioffe2015batch} running statistics are population estimates tied to the
+particular weights that produced them, so those inherited from any single
+member need not match $\mathbf{w}_{\text{avg}}$. Following SWA
+\cite{izmailov2019averagingweightsleadswider} we reset them and recompute them
+with forward passes over training data in training mode, without gradients or
+optimizer updates. This is the method's only compute overhead and it is paid
+once.
+
+\subsection{Instantiating the Criterion}
+
+The rule touches the task only through $c_t$, which is why it transfers without
+modification. We use whichever criterion the pipeline already computes to
+select its best checkpoint:
+
+\begin{itemize}
+\itemsep0em
+\item \textbf{Classification.} $c_t$ is the validation cross-entropy loss,
+minimized.
+\item \textbf{Detection and segmentation.} $c_t$ is the validation fitness
+score, maximized. We use the Ultralytics definition
+\cite{jocher2023ultralytics}, $0.1\,\mathrm{mAP}_{50}+0.9\,\mathrm{mAP}_{50:95}$,
+summed over the box and mask components for segmentation.
+\end{itemize}
+
+No part of \cref{eq:topk,eq:avg} is task-specific, and we tune nothing per task
+beyond this substitution. The rule consequently inherits whatever biases the
+pipeline's criterion already has: if the criterion is a poor proxy for test
+performance, ranking by it will not repair that.
+
+\subsection{Procedure and Cost}
+
+\begin{algorithm}[t]
+\caption{Post-training criterion-guided top-$k$ averaging}
+\label{alg:topk}
+\begin{algorithmic}[1]
+\Require checkpoint set $\{(\mathbf{w}_t,c_t)\}_{t=1}^{T}$; size $k$;
+training data $\mathcal{D}_{\text{train}}$
+\Ensure averaged model $\mathcal{M}_{\text{avg}}$
+\State $\mathcal{S}_k \gets$ indices of the $k$ best $c_t$ \Comment{ties favour later $t$}
+\State $\mathbf{w}_{\text{avg}} \gets \frac{1}{k}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t$
+\State load $\mathbf{w}_{\text{avg}}$ into $\mathcal{M}_{\text{avg}}$
+\If{$\mathcal{M}_{\text{avg}}$ contains BN layers}
+  \State reset BN running statistics
+  \State recompute them by forward passes over
+  $\mathcal{D}_{\text{train}}$ in training mode, no gradients
+\EndIf
+\State \Return $\mathcal{M}_{\text{avg}}$
+\end{algorithmic}
+\end{algorithm}
+
+\Cref{alg:topk} summarizes the procedure. Training cost is unchanged by
+construction, since the run is untouched. Post-training cost is $k$ tensor
+additions plus one BN recalibration pass, both negligible against training.
+Inference cost is that of a single model. The one real cost is storage:
+candidates must be retained until the run ends. Retaining all $T$ states is
+wasteful and unnecessary---maintaining a running set of the $k$ best seen so
+far requires $k{+}1$ states and yields exactly the same $\mathcal{S}_k$ as
+ranking the full set offline, since \cref{eq:topk} depends only on the ordering
+of $c_t$. We report observed checkpoint counts in \cref{sec:selection}.

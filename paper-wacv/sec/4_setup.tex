@@ -1,0 +1,141 @@
+\section{Experimental Setup}
+\label{sec:setup}
+
+\subsection{Tasks, Datasets and Protocols}
+
+We evaluate on three tasks. \Cref{tab:datasets} lists the datasets and the
+split used at each stage. Throughout, the \emph{selection} split is the one the
+criterion $c_t$ is computed on, and it is always disjoint from the split used
+for the reported numbers.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \caption{Datasets and evaluation protocol. ``Selection'' is the split the
+    ranking criterion $c_t$ is computed on; it is disjoint from ``Final
+    evaluation'' in every case. Tiny ImageNet publishes no labelled test split,
+    so its official validation split is the held-out evaluation set and its
+    numbers are reported as validation metrics
+    \cite{abai2019densenet,huynh2022vision}. For PASCAL VOC the original
+    Ultralytics configuration aliases \texttt{val} to the VOC2007 test split,
+    which would let the criterion see the evaluation data; we therefore hold out
+  an independent selection split from the training pool.}
+  \label{tab:datasets}
+  \resizebox{\textwidth}{!}{%
+\begin{tabular}{llccll}
+    \toprule
+    Task & Dataset & Classes & Available images & Selection & Final evaluation \\
+    \midrule
+    \multirow{5}{*}{Classification}
+      & Tomato Leaf Disease \cite{solapure2024tomato}      & 10  & 1,609  & 15\% of set & 15\% test split \\
+      & Burmese Grape Leaf Disease \cite{rahman2025burmese}& 5   & 3,103  & 15\% of set & 15\% test split \\
+      & Potato Leaf Disease \cite{Shabrina2023Potato}      & 7   & 3,076  & 15\% of set & 15\% test split \\
+      & CIFAR-100 \cite{krizhevsky2009learning}            & 100 & 50,000 train + 10,000 test & 5,000 from train & 10,000 official test \\
+      & Tiny ImageNet \cite{le2015tiny}                    & 200 & 100,000 train + 10,000 val & 10,000 from train & 10,000 official val.\ \\
+    \midrule
+    Detection
+      & PASCAL VOC \cite{everingham2010pascal}             & 20  & 16,551 trainval + 4,952 test & 1,655 from trainval & 4,952 VOC2007 test \\
+    \midrule
+    Segmentation
+      & Carparts \cite{ultralytics2024carparts}            & 23  & 3,156 train + 401 val + 276 test & held out from train & 276 test split \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}
+
+\paragraph{Classification.}
+Three agricultural datasets---Tomato, Burmese Grape and Potato leaf
+disease---provide a domain-specific, small-data regime, and CIFAR-100 and Tiny
+ImageNet provide standard general-purpose benchmarks. The agricultural sets use
+a stratified 70/15/15 train/selection/test partition. CIFAR-100 keeps its
+official test split intact and carves 5,000 selection images out of the
+training partition. Tiny ImageNet has no publicly labelled test split, so
+following common practice on this benchmark
+\cite{abai2019densenet,huynh2022vision} its official validation split serves as
+the held-out evaluation set; every Tiny ImageNet number we report is therefore
+labelled a validation metric, and its selection split is a separate 10,000
+images stratified out of the training partition.
+
+\paragraph{Detection.}
+PASCAL VOC \cite{everingham2010pascal} in the Ultralytics configuration trains
+on the union of the VOC2007 and VOC2012 \texttt{trainval} sets (16,551 images,
+20 classes) and evaluates on the VOC2007 test set (4,952 images). That
+configuration aliases the \texttt{val} split to the test split, which would
+make the selection criterion a function of the evaluation data. We therefore
+hold out 10\% of the training pool as an independent selection split and leave
+the VOC2007 test set untouched for reporting.
+
+\paragraph{Segmentation.}
+Carparts \cite{ultralytics2024carparts} is an instance-segmentation dataset of
+vehicle parts with 23 classes and a 3,156/401/276 train/val/test split. As
+above, the selection split is held out from the training pool and the test
+split is used only for reporting.
+
+\subsection{Models}
+
+For classification we fine-tune six ImageNet-pretrained backbones end-to-end,
+instantiated from \texttt{timm} \cite{rw2019timm}, chosen to span
+architectural families: VGG16 \cite{simonyan2015vgg} (plain convolutions),
+ResNet101 \cite{he2016deep} (residual), DenseNet121 \cite{huang2017densely}
+(dense connectivity), MobileNetV2 \cite{sandler2018mobilenetv2} (depthwise
+separable, mobile budget), EfficientNetB0 \cite{tan2019efficientnet} (compound
+scaling), and ViT-Base \cite{dosovitskiy2021imageworth16x16words}
+(transformer). For detection and segmentation we use YOLOv8s
+\cite{jocher2023ultralytics} and YOLO11s \cite{jocher2024yolo11}, covering two
+generations of the same family. The six classification backbones across five
+datasets give 30 configurations; two detectors on VOC and two segmentation
+models on Carparts give four more, for 34 in total.
+
+\subsection{Matched-Trajectory Protocol}
+
+Every configuration is trained independently with five seeds
+$\{1,10,42,100,500\}$. For a given seed, the baseline and all $k$ are derived
+from the \emph{same} completed run and the same checkpoint set, so they share
+architecture, initialization, data order, optimizer, schedule and training
+duration, and differ only in the post-training selection rule. Any difference
+between them is therefore attributable to that rule and not to training
+variance. We report mean $\pm$ standard deviation over the five seeds. All
+values of $k$ are reported as a sensitivity analysis; $k$ is never chosen using
+the final evaluation split.
+
+\subsection{Training Configuration}
+
+Training pipelines are held fixed between the baseline and every $k$, so the
+configuration below affects both arms identically and cannot favour either.
+\Cref{tab:configs} records the per-model settings.
+
+\begin{table*}[t]
+  \centering \small
+  \setlength{\tabcolsep}{5pt}\renewcommand{\arraystretch}{1.08}
+  \caption{Per-model training configuration. The pipeline is identical for the baseline and every $k$, so these settings affect both arms equally and cannot favour either. \TODO{fill in}}
+  \label{tab:configs}
+  \resizebox{\textwidth}{!}{%
+  \begin{tabular}{@{}llcccc@{\hspace{2.5em}}llcccc@{}}
+    \toprule
+    Dataset & Model & Batch & Epochs & LR & Patience & Dataset & Model & Batch & Epochs & LR & Patience \\
+    \midrule
+    \multirow{6}{*}{Tomato Leaf} & ViT-Base & & & & & \multirow{6}{*}{CIFAR-100} & ViT-Base & & & & \\
+     & VGG16 & & & & &  & VGG16 & & & & \\
+     & ResNet101 & & & & &  & ResNet101 & & & & \\
+     & MobileNetV2 & & & & &  & MobileNetV2 & & & & \\
+     & DenseNet121 & & & & &  & DenseNet121 & & & & \\
+     & EfficientNetB0 & & & & &  & EfficientNetB0 & & & & \\\cmidrule(r){1-6}\cmidrule(l){7-12}
+    \multirow{6}{*}{Burmese Grape} & ViT-Base & & & & & \multirow{6}{*}{Tiny ImageNet} & ViT-Base & & & & \\
+     & VGG16 & & & & &  & VGG16 & & & & \\
+     & ResNet101 & & & & &  & ResNet101 & & & & \\
+     & MobileNetV2 & & & & &  & MobileNetV2 & & & & \\
+     & DenseNet121 & & & & &  & DenseNet121 & & & & \\
+     & EfficientNetB0 & & & & &  & EfficientNetB0 & & & & \\\cmidrule(r){1-6}\cmidrule(l){7-12}
+    \multirow{6}{*}{Potato Leaf} & ViT-Base & & & & & \multirow{2}{*}{PASCAL VOC} & YOLOv8s & & & & \\
+     & VGG16 & & & & &  & YOLO11s & & & & \\\cmidrule(l){7-12}
+     & ResNet101 & & & & & \multirow{2}{*}{Carparts} & YOLOv8s & & & & \\
+     & MobileNetV2 & & & & &  & YOLO11s & & & & \\
+     & DenseNet121 & & & & &  &  & & & & \\
+     & EfficientNetB0 & & & & &  &  & & & & \\\cmidrule(r){1-6}
+    \bottomrule
+  \end{tabular}}
+\end{table*}
+
+\paragraph{Shared settings.}
+\TODO{fill in: optimizer, LR schedule and warmup, weight decay, loss,
+input resolution, classifier head, augmentation, BN-recalibration batches.}

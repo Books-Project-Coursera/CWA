@@ -1,0 +1,101 @@
+\section{Which Checkpoints Get Selected?}
+\label{sec:selection}
+
+\Cref{sec:related} argued that ranking by criterion differs from ranking by
+recency. That is a claim about the selected sets, not about accuracy, and it is
+directly checkable. We inspect the selected epoch indices for the CIFAR-100
+runs, for which per-seed selection records are available: six architectures
+$\times$ five seeds $=30$ completed runs, hence 150 selected checkpoints at
+$k{=}5$. \Cref{tab:selection} summarizes where they sit.
+
+\begin{table}[t]
+  \centering \small
+  \setlength{\tabcolsep}{4pt}\renewcommand{\arraystretch}{1.12}
+  \caption{Position of the selected checkpoints on CIFAR-100, averaged over
+    five seeds. $T$ is the number of epochs actually completed (early stopping
+    usually ends a run before its budget), $t^{*}$ the baseline's best epoch.
+    \emph{Span} is $\max\mathcal{S}_5-\min\mathcal{S}_5+1$, so a contiguous
+    block would span exactly 5. The last column counts members of
+  $\mathcal{S}_5$ inside the final five epochs of the run.}
+  \label{tab:selection}
+  \resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lccccc@{}}
+    \toprule
+    Model & $T$ & $t^{*}$ & \makecell{Span of\\$\mathcal{S}_5$}
+    & \makecell{Non-contig.\\(of 5 seeds)}
+    & $|\mathcal{S}_5\cap\text{last-}5|$ \\
+    \midrule
+    VGG16          & 75.8 & 63.8 & 17.6 & 5 & 1.0 \\
+    DenseNet121    & 37.2 & 25.2 & 10.0 & 5 & 0.2 \\
+    EfficientNetB0 & 23.8 & 11.8 &  9.0 & 5 & 0.2 \\
+    MobileNetV2    & 50.0 & 38.0 & 16.0 & 5 & 0.4 \\
+    ResNet101      & 46.6 & 34.6 & 14.4 & 5 & 1.6 \\
+    ViT-Base       & 14.2 &  6.2 &  5.0 & 0 & 0.0 \\
+    \midrule
+    All            & 41.3 & 30.0 & 12.0 & 25 & 0.6 \\
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+\paragraph{The selected set is rarely a window.}
+A block of five consecutive epochs spans exactly 5; the observed mean span is
+12.0, and only 5 of 30 runs produce a contiguous set. In the other 25 the
+criterion skips epochs, with a mean largest internal gap of 5.0 epochs. The
+contiguous cases are all ViT-Base, which early-stops after roughly 14 epochs
+and so has little room for its five best checkpoints to be anything but
+adjacent---the exception that identifies the mechanism rather than one that
+contradicts it. The longer the run, the further selection departs from a
+window: VGG16 trains 75.8 epochs and spreads its five checkpoints over 17.6.
+
+\paragraph{Nor is it concentrated at the end.}
+Only 17 of the 150 selected checkpoints (11.3\%) lie in the final five epochs,
+and in 20 of 30 runs $\mathcal{S}_5$ is entirely disjoint from that window. The
+earliest selected checkpoint precedes the end of training by 16.4 epochs on
+average, and $t^{*}$ itself sits at about 66\% of the completed trajectory---a
+direct consequence of early stopping with patience 8--12. A last-$5$ average on
+these same runs would therefore aggregate a largely different set of weights.
+This establishes that the two rules are structurally distinct; it does not by
+itself establish that ours is the better of the two, which would require the
+matched comparison we flag as future work below.
+
+\paragraph{Storage.}
+Runs retain 41.3 checkpoints on average under naive retention. As noted in
+\cref{sec:method}, a running top-$k$ set reduces this to $k{+}1$ states with an
+identical result, so the practical cost is six checkpoints at $k{=}5$.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{What the matched-trajectory design buys.}
+Because the baseline and every $k$ come from one run per seed, the comparison
+controls for architecture, initialization, data order, optimizer, schedule and
+budget, so the consistent direction of the effect across three tasks, eight models and 34
+configurations is hard to attribute to training variance. A plausible mechanism
+is that the single best checkpoint's advantage is partly transient---it won a
+noisy comparison---and that averaging several states of comparable validation
+quality keeps what they agree on while cancelling part of what is idiosyncratic
+to each.
+
+\paragraph{Limitations.}
+Three are worth stating plainly. \emph{First}, we establish an advantage over
+single-checkpoint selection, not over alternative aggregation strategies.
+Last-$k$ averaging, EMA, post-hoc SWA and prediction ensembling are not run
+here under a matched protocol; \cref{sec:selection} shows last-$k$ would select
+different checkpoints but not that it would perform worse. \emph{Second}, the
+averaged model receives a BN recalibration pass that the single-checkpoint
+baseline does not need and does not get. For architectures with normalization
+layers this leaves open how much of the gain is attributable to averaging
+versus to recalibration; the clean control is a BN-recalibrated baseline, which
+we regard as the most important missing ablation. \emph{Third}, the selection
+analysis of \cref{sec:selection} rests on CIFAR-100 records only, so its
+quantitative constants should not be read as universal, though the qualitative
+conclusion follows from early stopping being active, which is common.
+
+\paragraph{When it should help.}
+The rule's leverage comes from disagreement among near-equal checkpoints, so it
+should help most when late-epoch validation is noisy and least when the
+criterion has a sharp, stable optimum. Our data agree: the smallest gains occur
+on Burmese Grape, whose baselines sit closest to their ceiling. When a run
+early-stops after very few epochs there are barely $k$ meaningful candidates
+and the method degenerates gracefully towards the baseline, as the ViT-Base
+rows show.

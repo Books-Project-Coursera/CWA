@@ -1,0 +1,120 @@
+\section{Results}
+\label{sec:results}
+
+\input{sec/tab_acc}
+
+\subsection{Classification}
+
+\Cref{tab:results-acc} reports accuracy for the 30 classification
+configurations; the corresponding per-configuration macro-F1 table is given in
+the supplementary material and is summarized in \cref{tab:aggregate}. At the common setting $k{=}5$ both metrics
+improve over the single-checkpoint baseline in \emph{all 30}; at least one $k$
+improves over the baseline in all 30 as well, so no configuration is harmed by
+adopting the rule.
+
+\paragraph{General-purpose benchmarks.}
+On CIFAR-100 the largest CNN gain is EfficientNetB0, $76.76\to81.15\%$
+(+4.39 points), while ViT-Base reaches the strongest absolute accuracy,
+$87.19\pm0.65\to89.64\pm0.28\%$ (+2.45 points) with variance more than halved.
+On Tiny ImageNet, where entries are validation metrics, ResNet101 gains most,
+$77.50\to81.34\%$ (+3.84 points), and ViT-Base advances $89.68\to91.53\%$ with
+standard deviation dropping $0.34\to0.12$.
+
+\paragraph{Agricultural datasets.}
+Gains are larger but noisier here, consistent with these being the smallest
+datasets. The biggest single improvement anywhere is Tomato Leaf ResNet101,
+$81.84\to87.52\%$ accuracy and $84.48\to90.01\%$ macro-F1 at $k{=}4$
+(+5.68 and +5.53 points). On Potato Leaf, DenseNet121 gains 3.47 points and
+ViT-Base reaches $90.90\%$ at $k{=}4$. Burmese Grape is the least responsive
+dataset: MobileNetV2 still gains 3.30 points at $k{=}4$, but ViT-Base moves
+only $86.98\to87.01\%$ at $k{=}5$, the smallest improvement in the study.
+
+\paragraph{Beyond accuracy.}
+\Cref{tab:aggregate} aggregates all five recorded classification metrics with
+equal weight per configuration; every one increases monotonically in $k$.
+Recall gains more than precision (+2.22 vs.\ +1.85 points), so the averaged
+model recovers comparatively more of the under-represented classes, which is
+why macro-F1 improves slightly more than accuracy. AUC rises only 0.39 points
+because the baseline already exceeds 97.7\%, but it rises in 23 of the 24
+configurations where it was recorded, so averaging improves the ranking of
+predicted scores and not merely the arg-max decision.
+
+\begin{table}[t]
+  \centering \small
+  \setlength{\tabcolsep}{3pt}\renewcommand{\arraystretch}{1.12}
+  \caption{Equally weighted mean over the 30 classification configurations;
+    change from the $k{=}1$ baseline in parentheses, in points.
+    $^{\ddagger}$AUC averages the 24 configurations for which it was recorded
+  (all but Tiny ImageNet).}
+  \label{tab:aggregate}
+  \resizebox{\linewidth}{!}{%
+\begin{tabular}{@{}lccccc@{}}
+    \toprule
+    $k$ & Accuracy & Macro-F1 & \makecell{Macro\\Prec.} & \makecell{Macro\\Rec.} & AUC$^{\ddagger}$ \\
+    \midrule
+    1 (base) & 81.73 & 81.65 & 82.58 & 81.58 & 97.77 \\
+    2 & 83.10\,{\scriptsize(+1.37)} & 83.19\,{\scriptsize(+1.54)} & 83.94\,{\scriptsize(+1.37)} & 83.06\,{\scriptsize(+1.47)} & 98.05\,{\scriptsize(+0.28)} \\
+    3 & 83.48\,{\scriptsize(+1.76)} & 83.53\,{\scriptsize(+1.88)} & 84.17\,{\scriptsize(+1.60)} & 83.44\,{\scriptsize(+1.86)} & 98.12\,{\scriptsize(+0.35)} \\
+    4 & 83.72\,{\scriptsize(+1.99)} & 83.76\,{\scriptsize(+2.10)} & 84.38\,{\scriptsize(+1.80)} & 83.70\,{\scriptsize(+2.11)} & 98.15\,{\scriptsize(+0.38)} \\
+    5 & \textbf{83.76}\,{\scriptsize(+2.04)} & \textbf{83.86}\,{\scriptsize(+2.21)} & \textbf{84.42}\,{\scriptsize(+1.85)} & \textbf{83.80}\,{\scriptsize(+2.22)} & \textbf{98.16}\,{\scriptsize(+0.39)} \\
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+\input{sec/tab_det}
+
+\subsection{Detection and Segmentation}
+
+\Cref{tab:results-det} reports the four detection and segmentation
+configurations. Fitness---the criterion the pipeline itself optimizes for model
+selection---improves at \emph{every} $k$ for all four, gaining 5.8--6.9\%
+relative at $k{=}5$: $0.6485\to0.6902$ and $0.6689\to0.7147$ for YOLOv8s and
+YOLO11s on VOC, and $1.1361\to1.2025$ and $1.1706\to1.2471$ on Carparts. Every
+mAP variant improves in all four configurations, with the strictest threshold
+benefiting most on VOC (mAP$_{75}$ +0.050 for YOLO11s), suggesting the averaged
+weights improve localization quality and not only detection recall.
+
+\paragraph{A precision--recall trade on Carparts.}
+The only two exceptions to uniform improvement are informative. On Carparts,
+precision \emph{falls} for both models ($0.6277\to0.6121$ and
+$0.6328\to0.6209$) while recall rises far more ($0.7762\to0.8243$ and
+$0.7794\to0.8386$), and every mAP metric---which accounts for both---improves.
+This mirrors the classification finding that recall gains exceed precision
+gains, and is the expected signature of a model that has become less
+conservative on rare classes: Carparts has 23 classes over roughly 3.2k
+training images. Practitioners for whom precision is the binding constraint
+should note this trade.
+
+\subsection{Sensitivity to $k$}
+\label{sec:sensitivity}
+
+The best $k$ is configuration-dependent. Over the 30 classification
+configurations the highest mean accuracy occurs at $k{=}5$ in 14, $k{=}4$ in
+11, $k{=}3$ in four and $k{=}2$ in one; macro-F1 gives 16/10/3/1. Thus
+$k\in\{4,5\}$ accounts for 25 of 30. Performance is not uniformly monotonic
+per configuration---accuracy is non-decreasing across all of $k{=}1\ldots5$ in
+only 12 of 30---because several models saturate at $k{=}3$ or $k{=}4$ and then
+dip slightly. Detection and segmentation behave the same way: YOLO11s peaks at
+$k{=}4$ on VOC and YOLOv8s at $k{=}3$ on Carparts.
+
+Two things nevertheless hold across the whole study. First, the aggregate is
+monotone (\cref{tab:aggregate}), because the per-configuration dips are small
+relative to the gains. Second, and more useful in practice, $k{=}5$ improves
+the primary metric over the baseline in all 34 configurations even where it is
+not the individual optimum. We therefore recommend $k\in\{4,5\}$ as a default
+operating range and note that if $k$ is tuned, it must be tuned on the
+selection split---never on the evaluation split, as we have done nowhere in
+this paper.
+
+\subsection{Run-to-Run Variability}
+
+Averaging usually, but not always, stabilizes the final model. At $k{=}5$ the
+across-seed accuracy standard deviation is below the baseline's in 25 of 30
+classification configurations and macro-F1 in 23 of 30; averaged over all 30 it
+falls from 1.43 to 1.11 points for accuracy ($-22.3\%$) and 1.45 to 1.11 for
+macro-F1 ($-23.5\%$), most on the general-purpose benchmarks ($-46\%$
+CIFAR-100, $-56\%$ Tiny ImageNet) and least on Tomato Leaf ($-8\%$), the
+smallest dataset. Detection and segmentation follow in three of four
+configurations, most strikingly YOLO11s on Carparts ($0.0538\to0.0159$,
+$-70\%$); YOLOv8s on VOC is the exception, rising $0.0039\to0.0052$. Variance
+reduction is a strong tendency, not a guarantee.
