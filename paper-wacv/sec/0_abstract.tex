@@ -7,9 +7,9 @@ replaces it: rank the epoch checkpoints of a \emph{completed} run by the same
 validation criterion already used to pick the best one, keep the top $k$, and
 uniformly average their parameters. No optimizer, schedule, or training budget
 is changed, no secondary optimization is introduced, and inference cost is that
-of a single model. Because the rule consumes only one scalar per checkpoint, it
-transfers across tasks unchanged: we instantiate it with validation loss for
-classification and with validation fitness for detection and segmentation.
+of a single model. All it needs is a way to order the checkpoints, so it transfers across tasks
+unchanged: we rank by validation loss for classification and by validation
+fitness for detection and segmentation.
 We evaluate 34 model--dataset configurations---six classification
 architectures on five datasets, two detectors on PASCAL VOC, and two
 segmentation models on Carparts---with five seeds each, every variant sharing

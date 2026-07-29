@@ -235,3 +235,44 @@ Fig./Tab./Sec. — used throughout rather than hand-written "Table 3").
 limit; supplementary 2 pages. 0 errors, 0 overfull boxes, no undefined
 references or citations in either. All 420 result cells re-verified against the
 spreadsheet after the edits: zero mismatches.
+
+## Update: method section simplified
+
+The method is a simple one and the write-up had drifted into formalism that did
+not earn its keep. Removed, in favour of plain statement:
+
+- The sign variable `δ` and the derived selection score `s_t = δ·c_t`. It was
+  introduced to unify "minimize a loss" and "maximize a fitness" under one
+  argmax, which is tidy but is machinery for a distinction a reader resolves in
+  one sentence. The text now just says: sort the checkpoints best-first by the
+  validation score the pipeline already computes — lower loss for
+  classification, higher fitness for detection and segmentation — and only the
+  sort direction differs between them.
+- The subset-argmax definition of the selected set, and the set symbol itself.
+  With the checkpoints written in sorted order `w_(1), …, w_(T)`, the selected
+  set is just "the first k" and needs no definition.
+- Three of the four equations. What remains is the average itself, which is the
+  only thing worth setting in display math. The nesting property that used to
+  need `S_{k-1} ⊂ S_k` is now the observation that the top k contains the
+  top k−1.
+
+Same simplification applied outward so the notation does not reappear
+elsewhere: the figure's criterion box now reads "rank by the score the pipeline
+already uses" with the two instantiations spelled out; the selection-analysis
+table headers are words ("Epochs run", "Best epoch", "Span", "Not consec.",
+"In last 5 epochs") instead of set expressions; and the abstract, introduction
+and conclusion drop the "one scalar per checkpoint, oriented by a single sign"
+framing for "all it needs is a way to order the checkpoints".
+
+Algorithm 1 went from 12 lines with three stage headers to 6 lines. It reads:
+sort best-first, average the first k, recompute BatchNorm statistics if the
+model has them, return.
+
+Nothing about the method changed — only how it is described. The claims,
+numbers and experiments are untouched, and all 420 result cells were
+re-verified against the spreadsheet afterwards.
+
+The shorter method section freed roughly a page, which was spent restoring the
+"When it should help" paragraph in the discussion that the previous round had
+cut for space. Main is 9 pages with the body ending on page 8; supplementary is
+2 pages; 0 errors and 0 overfull boxes in both.

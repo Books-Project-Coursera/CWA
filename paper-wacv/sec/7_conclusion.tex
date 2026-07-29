@@ -4,9 +4,9 @@
 We replaced the winner-takes-all checkpoint selection that ends most vision
 pipelines with a rule that costs nothing at training or inference time: rank
 the checkpoints of a completed run by the validation criterion the pipeline
-already computes, keep the top $k$, average them. Because the rule reads only
-one scalar per checkpoint, oriented by a single sign, the same procedure
-applies to classification, detection and segmentation unchanged.
+already computes, keep the top $k$, average them. Because all it needs is an
+ordering of the checkpoints, the same procedure applies to classification,
+detection and segmentation unchanged.
 
 Across 34 model--dataset configurations with five seeds each, under a protocol
 in which the baseline and every $k$ share a training trajectory, $k{=}5$

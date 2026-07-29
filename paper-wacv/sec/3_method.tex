@@ -1,138 +1,90 @@
 \section{Method}
 \label{sec:method}
 
-\subsection{Setting}
+\subsection{The Rule}
 
-A standard run produces a checkpoint set
-$\mathcal{C}=\{(\mathbf{w}_t,\, c_t)\}_{t=1}^{T}$, where $\mathbf{w}_t$ are the
-parameters after epoch $t$ and $c_t$ is the scalar validation criterion the
-pipeline already records at that epoch, on a split disjoint from the final
-evaluation set. Pipelines differ in whether that criterion is minimized (a
-loss) or maximized (a performance score), so we first remove the distinction.
-Let $\delta=-1$ if the pipeline minimizes $c_t$ and $\delta=+1$ if it maximizes
-it, and define the \emph{selection score}
+A standard training run leaves behind one checkpoint per epoch,
+$\mathbf{w}_1,\dots,\mathbf{w}_T$, and a validation score for each of them ---
+the score the pipeline already computes in order to decide which checkpoint to
+keep. Sort the checkpoints from best to worst by that score and write the
+result $\mathbf{w}_{(1)},\dots,\mathbf{w}_{(T)}$, breaking ties in favour of
+the later epoch. Conventional selection keeps $\mathbf{w}_{(1)}$ and discards
+the rest. We keep the first $k$ and average them:
 \begin{equation}
-  s_t \;=\; \delta \cdot c_t ,
-  \label{eq:score}
-\end{equation}
-which is oriented so that larger is always better. Everything below is written
-in terms of $s_t$ and is therefore identical for both kinds of pipeline.
-Conventional selection keeps the single best state,
-\begin{equation}
-  t^{*}=\operatorname*{arg\,max}_{1\le t\le T} s_t ,
-  \qquad
-  \mathbf{w}_{\text{base}}=\mathbf{w}_{t^{*}} .
-  \label{eq:baseline}
-\end{equation}
-
-\subsection{Criterion-Guided Top-$k$ Averaging}
-
-Instead of the single maximizer we take the $k$ best-scoring epochs,
-\begin{equation}
-  \mathcal{S}_k=\operatorname*{arg\,max}_{\substack{\mathcal{S}\subseteq\{1,\dots,T\}\\ |\mathcal{S}|=k}}\ \sum_{t\in\mathcal{S}} s_t ,
-  \label{eq:topk}
-\end{equation}
-that is, the indices of the $k$ largest $s_t$, and average their trainable
-parameters element-wise:
-\begin{equation}
-  \mathbf{w}_{\text{avg}}=\frac{1}{|\mathcal{S}_k|}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t .
+  \mathbf{w}_{\text{avg}}=\frac{1}{k}\sum_{i=1}^{k}\mathbf{w}_{(i)} .
   \label{eq:avg}
 \end{equation}
-Ties are broken in favour of later epochs, matching the convention by which
-standard pipelines overwrite their best checkpoint on an equal score. Because
-\cref{eq:topk} depends on $s_t$ only through its ordering, any strictly
-monotone reparameterization of the criterion leaves $\mathcal{S}_k$ unchanged;
-$\delta$ in \cref{eq:score} is the only task-dependent quantity in the method.
+That is the whole method. Averaging is element-wise and applies to trainable
+parameters only. Setting $k{=}1$ gives back the baseline exactly, so the two
+are the same procedure at two settings rather than two different procedures.
+Increasing $k$ only adds one more checkpoint and never removes one already in
+the average, since the top $k$ always contains the top $k{-}1$.
 
-Two structural properties follow. First, $\mathcal{S}_1=\{t^{*}\}$, so
-\cref{eq:baseline} is the $k{=}1$ case of \cref{eq:topk}: the baseline is
-nested inside the method rather than being a separate procedure. Second,
-$\mathcal{S}_{k-1}\subset\mathcal{S}_k$, so increasing $k$ only admits one
-further checkpoint and never displaces an existing one.
+\subsection{What ``Best'' Means}
+
+The rule needs one thing from the task: an ordering of the checkpoints. We take
+whichever validation score the pipeline already uses for its own best
+checkpoint, so nothing new is introduced and no threshold or weighting is
+tuned. For classification that score is the validation loss and lower is
+better. For detection and segmentation it is the validation fitness reported by
+the Ultralytics trainer \cite{jocher2023ultralytics} --- a fixed combination of
+mAP at IoU $0.5$ and averaged over $0.5{:}0.95$, summed over box and mask for
+segmentation --- and higher is better. Only the sort direction differs, so the
+same code runs on all three tasks.
+
+Because \cref{eq:avg} depends on the scores only through the resulting order,
+the rule is unaffected by any rescaling of the criterion, and it inherits
+whatever the criterion is already good or bad at: if validation score is a poor
+proxy for test performance, ranking by it will not fix that.
 
 \paragraph{Normalization statistics.}
-Averaging is applied to trainable parameters only. Batch-Normalization
-\cite{ioffe2015batch} running statistics are population estimates tied to the
-particular weights that produced them, so those inherited from any single
-member need not match $\mathbf{w}_{\text{avg}}$. Following SWA
+Batch-Normalization \cite{ioffe2015batch} running statistics are population
+estimates tied to the particular weights that produced them, so the ones
+inherited from any single checkpoint need not suit
+$\mathbf{w}_{\text{avg}}$. Following SWA
 \cite{izmailov2019averagingweightsleadswider} we reset them and recompute them
 with forward passes over training data in training mode, without gradients or
-optimizer updates. This is the method's only compute overhead and it is paid
-once.
+optimizer updates.
 
-\subsection{Instantiating the Criterion}
-
-The rule touches the task only through the pair $(c_t,\delta)$, which is why it
-transfers without modification. We use whichever criterion the pipeline already
-computes to select its own best checkpoint, so the method never introduces a
-quantity the pipeline was not already tracking:
-
-For \textbf{classification}, $c_t$ is the validation cross-entropy loss and
-$\delta={-}1$, giving $s_t=-\ell^{\text{val}}_t$. For \textbf{detection and
-segmentation}, $c_t$ is the validation fitness $\varphi_t$ and $\delta={+}1$,
-giving $s_t=\varphi_t$; we read $\varphi_t$ straight from the Ultralytics
-trainer \cite{jocher2023ultralytics}, which defines it as
-$0.1\,\mathrm{mAP}_{50}+0.9\,\mathrm{mAP}_{50:95}$ for detection and as the sum
-of that quantity over the box and mask components for segmentation. In both
-cases it is the same scalar the pipeline uses for its own best checkpoint and
-for early stopping, so baseline and rule are ranked by an identical signal.
-
-No part of \cref{eq:topk,eq:avg} is task-specific, and we tune nothing per task
-beyond setting $\delta$. The rule consequently inherits whatever biases the
-pipeline's criterion already has: if the criterion is a poor proxy for test
-performance, ranking by it will not repair that.
-
-\subsection{Procedure and Cost}
+\subsection{Cost}
 
 \begin{algorithm}[t]
-\caption{Criterion-guided top-$k$ checkpoint averaging}
+\caption{Top-$k$ checkpoint averaging}
 \label{alg:topk}
 \begin{algorithmic}[1]
-\Require completed checkpoint set $\{(\mathbf{w}_t,c_t)\}_{t=1}^{T}$;
-aggregation size $k\le T$; criterion direction
-$\delta\in\{-1,+1\}$ ($-1$ if $c_t$ is a loss, $+1$ if it is a
-score); training data $\mathcal{D}_{\text{train}}$
-\Ensure final model $\mathcal{M}_{\text{avg}}$
-\Statex \textbf{Rank} --- orient the criterion, then select
-\For{$t=1,\dots,T$}
-  \State $s_t \gets \delta\cdot c_t$ \Comment{larger is better}
-\EndFor
-\State $\mathcal{S}_k \gets$ indices of the $k$ largest $s_t$,
-ordering ties by larger $t$
-\Statex \textbf{Average} --- trainable parameters only
-\State $\mathbf{w}_{\text{avg}} \gets \frac{1}{k}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t$
-\State load $\mathbf{w}_{\text{avg}}$ into $\mathcal{M}_{\text{avg}}$
-\Statex \textbf{Recalibrate} --- only if normalization buffers exist
-\If{$\mathcal{M}_{\text{avg}}$ has BatchNorm layers}
-  \State reset their running mean and variance
-  \State \textbf{for} a fixed number of batches from
-  $\mathcal{D}_{\text{train}}$ \textbf{do} forward pass in training
-  mode, no gradients, no optimizer step
+\Require checkpoints $\mathbf{w}_1,\dots,\mathbf{w}_T$ and their validation
+scores; aggregation size $k$; training data
+\Ensure final model
+\State sort the checkpoints best-first by validation score
+\Statex \hfill\textit{(lower loss, or higher fitness; ties $\to$ later epoch)}
+\State $\mathbf{w}_{\text{avg}} \gets$ average of the first $k$
+\If{the model has BatchNorm layers}
+  \State reset their running statistics and recompute them
+  with forward passes over the training data, no gradients
 \EndIf
-\State \Return $\mathcal{M}_{\text{avg}}$
+\State \Return the model with weights $\mathbf{w}_{\text{avg}}$
 \end{algorithmic}
 \end{algorithm}
 
-\Cref{alg:topk} summarizes the procedure; setting $k{=}1$ recovers the baseline
-line for line, which is what makes the two arms comparable. Training cost is
-unchanged by construction, post-training cost is $k$ tensor additions plus one
-recalibration pass, and inference cost is that of a single model. Storage is
-the only real cost and it is bounded: because \cref{eq:topk} depends only on
-the ordering of $s_t$, a running set of the $k$ best checkpoints seen so far
-yields the same $\mathcal{S}_k$ as ranking the full set offline, so $k{+}1$
-states suffice at any moment. Our detection and segmentation runs implement
-exactly this, pruning a new checkpoint immediately if it falls outside the
-current top $k$; the classification runs retain all epochs and we report the
-counts in \cref{sec:selection}.
+\Cref{alg:topk} is the procedure in full. Training is untouched, so training
+cost is unchanged. Afterwards we pay $k$ tensor additions and one
+recalibration pass, both negligible next to training, and the finished model
+costs exactly one forward pass at inference.
 
-\paragraph{Implementation details.}
-Two choices keep the comparison clean. The Ultralytics trainer validates
-through an exponential moving average of the weights by default; we disable
-that smoothing so the recorded fitness, the early-stopping signal and the
-stored weights all refer to the same raw parameters, since otherwise
-checkpoints would be ranked by a quantity computed from weights other than
-those being averaged. We also take the baseline from the top-ranked entry of
-the same table our rule ranks rather than from the framework's exported best
-checkpoint, which is serialized at half precision: comparing it against a
-full-precision average would confound the selection rule with a precision
-change.
+Storage is the only real cost, and it is bounded: since only the order of the
+scores matters, keeping a running set of the $k$ best checkpoints seen so far
+gives the same result as sorting everything at the end, so $k{+}1$ states
+suffice at any moment. Our detection and segmentation runs do exactly this,
+deleting a checkpoint as soon as it drops out of the current top $k$; the
+classification runs keep every epoch, and we report the counts in
+\cref{sec:selection}.
+
+\paragraph{Two implementation details.}
+The Ultralytics trainer validates through an exponential moving average of the
+weights by default. We turn that off, so the recorded fitness, the
+early-stopping signal and the saved weights all refer to the same parameters ---
+otherwise checkpoints would be ranked using weights other than the ones we
+average. We also take the baseline from the top of the same ranking our rule
+uses, rather than from the framework's exported best checkpoint, which is saved
+at half precision: comparing that against a full-precision average would mix a
+precision change into the comparison.

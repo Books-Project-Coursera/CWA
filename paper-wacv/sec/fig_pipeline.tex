@@ -31,28 +31,27 @@
 \node[winbg, anchor=north, font=\tiny] at ($(o)+(13.5*\bw,-0.07)$)
   {last-$k$ window};
 \node[anchor=east, align=right, font=\tiny] at ($(o)+(-0.05,\bh*0.5)$)
-  {selection\\score $s_t$};
+  {validation\\score};
 \node[anchor=south, selcol, font=\tiny] at ($(o)+(9*\bw,0.93*\bh)$) {top-$k$};
 \node[anchor=north, font=\tiny] at ($(o)+(8*\bw,-0.34)$)
-  {epoch $t=1\dots T$: checkpoints $\mathbf{w}_t$ with scores $s_t$};
+  {one checkpoint per epoch, each with its validation score};
 
 %% ── criterion box ──────────────────────────────────────────────────────
 \node[box, fill=white, draw=black!45, anchor=west, align=left, font=\tiny]
   (crit) at ($(o)+(16.4*\bw,\bh*0.52)$)
-  {$s_t=\delta\cdot c_t$\\[1pt]
-   classification: $\delta{=}{-}1$, $c_t{=}\ell^{\text{val}}_t$\\
-   det.\ / seg.: $\delta{=}{+}1$, $c_t{=}\varphi_t$};
+  {\textbf{rank by the score}\\\textbf{the pipeline already uses}\\[1.5pt]
+   classification: validation loss\\
+   detection / seg.: fitness};
 
 %% ── the two selection rules ────────────────────────────────────────────
 \node[box, fill=basecol!8, draw=basecol, anchor=north west, text width=2.9cm]
   (base) at ($(train.south west)+(0,-2.62)$)
   {\textbf{Baseline} ($k{=}1$)\\[1pt]
-   keep $\mathbf{w}_{t^{*}}$, $t^{*}{=}\arg\max_t s_t$};
+   keep the single best checkpoint};
 \node[box, fill=selcol!8, draw=selcol, anchor=north east, text width=4.5cm]
   (ours) at ($(train.south east)+(0,-2.62)$)
   {\textbf{Ours} (top-$k$)\\[1pt]
-   $\mathbf{w}_{\text{avg}}{=}\frac{1}{k}\sum_{t\in\mathcal{S}_k}\mathbf{w}_t$,
-   then reset \& recompute BN statistics};
+   average the $k$ best checkpoints,\\then recompute BN statistics};
 
 %% ── evaluation ─────────────────────────────────────────────────────────
 \node[box, fill=gray!8, text width=\W cm-6pt, anchor=north]
@@ -67,10 +66,10 @@
 \draw[flow] (ours.south) -- (ours.south |- eval.north);
 \end{tikzpicture}}
 \caption{The rule changes only the last step of the pipeline. A standard run is
-  left untouched and emits checkpoints with the validation criterion $c_t$ it
-  already records; the sign $\delta$ orients that criterion so larger is better
-  (\cref{eq:score}) and is the method's only task-dependent quantity. Selecting
-  by score rather than by position, the chosen set need not be contiguous nor
-  lie inside a last-$k$ window (\cref{sec:selection}). Bars are schematic.}
+  left untouched; its checkpoints are ranked by the validation score the
+  pipeline already computes, and instead of keeping the single best we average
+  the best $k$. Because the ranking is by score and not by position, the chosen
+  checkpoints need not be consecutive and need not sit at the end of training
+  (\cref{sec:selection}). Bar heights are schematic.}
 \label{fig:pipeline}
 \end{figure}

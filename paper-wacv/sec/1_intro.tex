@@ -39,12 +39,12 @@ single gradient-free pass, as in SWA. Nothing else changes: not the optimizer,
 the schedule, the early-stopping rule, nor the epoch budget. The result is one
 set of weights with the inference cost of one model.
 
-The rule's only interface to the task is a scalar criterion per checkpoint,
-which is what makes it portable. Classification pipelines rank by validation
-loss; detection and segmentation pipelines already rank by a validation
-\emph{fitness} score. We plug in whichever the pipeline uses and the procedure
-is otherwise identical, which lets us evaluate the same rule on three tasks
-without task-specific tuning.
+All the rule needs from the task is a way to order the checkpoints, which is
+what makes it portable. Classification pipelines rank by validation loss;
+detection and segmentation pipelines already rank by a validation fitness
+score. We use whichever one the pipeline provides, and only the sort direction
+changes, which lets us run the same rule on three tasks with no task-specific
+tuning.
 
 \paragraph{Why top-$k$ by criterion and not the last $k$.}
 Averaging the final $k$ checkpoints is established practice, notably in machine
@@ -60,10 +60,9 @@ window would average a largely disjoint set of weights.
 \paragraph{Contributions.}
 \begin{enumerate}
 \itemsep0em
-\item A post-training, criterion-guided top-$k$ averaging rule that requires no
-change to the training pipeline, no secondary optimization, and no additional
-inference cost, and that is specified independently of the task
-(\cref{sec:method}).
+\item A post-training top-$k$ averaging rule that needs no change to the
+training pipeline, no secondary optimization and no extra inference cost, and
+that is stated without reference to any particular task (\cref{sec:method}).
 \item An evaluation spanning three tasks and 34 model--dataset configurations
 under a matched-trajectory protocol in which the baseline and every $k$ are
 derived from the same completed run and the same seed, so that differences are
