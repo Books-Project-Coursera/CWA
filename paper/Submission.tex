@@ -1,0 +1,1463 @@
+% This is samplepaper.tex, a sample chapter demonstrating the
+% LLNCS macro package for Springer Computer Science proceedings;
+% Version 2.20 of 2017/10/04
+%\documentclass[runningheads]{llncs}
+\documentclass[runningheads]{llncs}
+
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{siunitx}
+
+\usepackage{tabularx}
+\usepackage{makecell}
+\usepackage{tikz}
+\usepackage{adjustbox}
+\newcommand{\Kheader}{\textbf{Header}} % Replace 'Header' with your actual header text
+\usepackage{graphicx}
+\usepackage{xcolor, colortbl}
+\usepackage{placeins}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{needspace}
+\usepackage{orcidlink}
+\hypersetup{hypertexnames=false}
+\usepackage{longtable}
+\usepackage{algorithm}
+\usepackage{float}
+\usepackage{algpseudocode}
+
+\usepackage[T5]{fontenc}
+\usepackage[utf8]{inputenc}
+\newenvironment{red}{\color{red}}{}
+\newenvironment{blue}{\color{blue}}{}
+\usepackage{pgfplots}
+\usepackage{subcaption}
+\usepgfplotslibrary{fillbetween}
+\usepgfplotslibrary{groupplots}
+\pgfplotsset{compat=1.18}
+
+% ── Per-architecture colors required by sensitivity_figures.tex ──────────
+\definecolor{colorViT}{HTML}{D62728}
+\definecolor{colorDenseNet}{HTML}{1F77B4}
+\definecolor{colorResNet}{HTML}{2CA02C}
+\definecolor{colorEfficientNet}{HTML}{FF7F0E}
+\definecolor{colorMobileNet}{HTML}{9467BD}
+\definecolor{colorVGG}{HTML}{7F7F7F}
+
+\definecolor{hdrblue}{RGB}{45, 62, 80}      % Xanh đá phiến đậm (Slate) - sang và có chiều sâu
+\definecolor{hdrtext}{RGB}{255, 255, 255}  % Chữ trắng
+\definecolor{stripe}{RGB}{245, 247, 250}   % Màu sọc xám xanh cực nhẹ, đủ để phân biệt dòng
+
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+
+% -------------------------------------------------------------------------
+\definecolor{rowalt}{RGB}{247,249,252}
+\newcolumntype{K}{>{\centering\arraybackslash\small}p{1.55cm}}
+\newcommand{\ms}[2]{\small$#1{\scriptstyle\,\pm#2}$}
+\newcommand{\msb}[2]{\small$\mathbf{#1}{\scriptstyle\,\pm#2}$}
+\newcommand{\bestms}[2]{\cellcolor{black!10}\msb{#1}{#2}}
+\begin{document}
+\raggedbottom
+\title{Improving Image Classification with Validation-Guided Post-Training Checkpoint Averaging}
+
+\author{
+  % Minh-Dung Le\orcidlink{0009-0006-6924-4363} \and
+  % Minh-Duc Hoang \and
+  % Hoang-Vu Truong \and
+  % Thi-Thu-Hong Phan\thanks{Corresponding author: hongptt@fpt.edu.vn}\orcidlink{0000-0001-6880-3721}
+}
+%
+% \authorrunning{Le et al.}
+\institute{
+  % AIT laboratory, Faculty of Artificial Intelligence, \\ FPT University, Da Nang 550000, Viet Nam\\
+}
+
+\maketitle              % typeset the header of the
+
+\begin{abstract}
+  Selecting a single checkpoint based on validation loss can make the final
+  model sensitive to fluctuations along the training trajectory. We propose a
+  lightweight post-training strategy that ranks epoch checkpoints by validation
+  loss, selects the top-$k$ candidates, and uniformly averages their parameters.
+  The method requires no changes to the training pipeline and retains
+  single-model inference cost. We evaluate the proposed strategy across six
+  architectures and five image-classification datasets using five random seeds.
+  At the common $k=5$ setting, it achieves higher mean accuracy and macro-F1
+  than the single-checkpoint baseline in all 30 model--dataset configurations.
+  When the configurations are weighted equally, mean accuracy increases from
+  81.73\% to 83.76\%, while mean macro-F1 increases from 81.65\% to 83.86\%,
+  corresponding to gains of 2.04 and 2.21 percentage points, respectively.
+  Although the optimal aggregation size remains configuration-dependent, the
+  results show that averaging a small validation-ranked checkpoint set can
+  improve final performance and frequently reduce run-to-run variability
+  without increasing inference-time complexity.
+\end{abstract}
+
+\section{Introduction}
+Convolutional neural networks (CNNs) have achieved strong performance across image classification benchmarks, supported by continual advances in architecture design and optimization \cite{krizhevsky2012imagenet,simonyan2015vgg,he2016deep}. Despite these advances, most practical training pipelines still finalize a model via single-checkpoint selection: from a sequence of epoch-wise checkpoints, the state with the best validation accuracy or lowest validation loss is retained \cite{bishop2006pattern,prechelt2002early}. While simple and widely adopted, this protocol assumes that late-epoch training is sufficiently stable such that a single best epoch reliably reflects generalization performance.
+In practice, late-epoch validation metrics often fluctuate due to mini-batch sampling noise, stochastic optimization dynamics, and data variability \cite{prechelt2002early,izmailov2019averagingweightsleadswider,garipov2018losssurfacesmodeconnectivity}. Checkpoints with similar training loss can exhibit noticeably different generalization behavior \cite{keskar2017largebatchtrainingdeeplearning}, making single-checkpoint selection sensitive to transient validation noise. A natural remedy is to aggregate information from multiple model states rather than committing to one checkpoint.
+Prediction-time ensembling achieves this but increases inference cost proportionally to ensemble size \cite{dietterich2000ensemble}. Weight averaging—which averages parameters rather than outputs—preserves single-model inference. Foundational work on iterate averaging \cite{polyak1992acceleration} and Stochastic Weight Averaging (SWA) \cite{izmailov2019averagingweightsleadswider} has shown that averaging high-quality solutions encountered during training yields more stable models.
+% SWA, however, requires explicit integration into the training procedure (specialized learning-rate schedules and online weight accumulation), making it inapplicable to retrospective post-training selection from standard runs.
+SWA~\cite{izmailov2019averagingweightsleadswider} performs weight
+averaging as part of an additional SGD phase governed by either a cyclical or
+constant learning-rate schedule. Model states are sampled according to that
+schedule and accumulated during optimization. In contrast, our method does not
+introduce any additional optimization phase or prescribe a learning-rate regime;
+it retrospectively ranks checkpoints from a completed standard training run
+using validation loss.
+This paper proposes a criterion-guided post-training checkpoint aggregation strategy that operates strictly at the model selection stage, requiring no changes to the optimization pipeline. We identify the top-$k$ checkpoints with the lowest validation loss and average their weights to form the final model. This approach extends standard validation-based selection from a winner-takes-all decision to aggregation over multiple strong candidates, reducing sensitivity to noisy late-stage fluctuations without increasing inference-time cost.
+We evaluate the method on six widely used architectures: ViT-Base~\cite{dosovitskiy2021imageworth16x16words}, VGG16~\cite{simonyan2015vgg}, ResNet101~\cite{he2016deep}, MobileNetV2~\cite{sandler2018mobilenetv2}, DenseNet121~\cite{huang2017densely}, and EfficientNetB0~\cite{tan2019efficientnet} across five datasets: three agricultural image-classification datasets (Tomato Leaf Disease~\cite{solapure2024tomato}, Burmese Grape Leaf Disease~\cite{rahman2025burmese}, and Potato Leaf Disease~\cite{Shabrina2023Potato}), CIFAR-100~\cite{krizhevsky2009learning}, and Tiny ImageNet~\cite{le2015tiny}. Each model--dataset configuration is repeated using five random seeds, and
+performance is reported using accuracy and macro-F1. This expanded evaluation examines both run-to-run stability and
+generalization beyond the original agricultural domain.
+
+The paper is organised as follows. Section~\ref{sec:related_work} reviews related work.
+Section~\ref{sec:methodology} presents the proposed method.
+Section~\ref{sec:data_description} describes the datasets.
+Section~\ref{sec:ExpandResults} reports the experimental results.
+Section~\ref{sec:discussion} discusses the findings, limitations, and implications of the proposed approach.
+Finally, Section~\ref{sec:conclusion} concludes the paper and outlines future work.
+
+\section{Related Work}
+\label{sec:related_work}
+
+% ----------------------------------------------------------
+\subsection{Training-Time Weight Averaging}
+% ----------------------------------------------------------
+
+Early optimization theory established that averaging iterates reduces
+variance and improves asymptotic convergence~\cite{polyak1992acceleration}.
+In deep learning, Exponential Moving Average (EMA) applies this idea
+online, maintaining a smoothed parameter copy throughout
+training~\cite{tarvainen2018meanteachersbetterrole}.
+Although effective, EMA is influenced by the entire training history,
+potentially retaining information from earlier suboptimal states.
+
+SWA~\cite{izmailov2019averagingweightsleadswider} averages model states
+sampled along an SGD trajectory generated under either a cyclical or
+constant learning-rate schedule.
+Starting from a conventionally trained model, SWA continues optimization
+and captures checkpoints at the minimum learning rate of each cycle, or
+at every epoch under a constant learning rate.
+Its canonical algorithm therefore prescribes learning-rate bounds, a cycle
+length, and a fixed number of optimization iterations.
+The original SWA study allows the preceding conventional training stage to
+use either the full training budget or a predetermined reduced budget;
+the latter corresponds to stopping conventional training before the full
+budget and then starting the SWA phase, and should not be interpreted as
+validation-based early stopping within SWA itself.
+
+Latest Weight Averaging (LAWA)~\cite{kaddour2022stop} proposes maintaining
+a sliding window of the $k$ most recent epoch checkpoints and replacing the
+current model with their uniform average at regular intervals during
+ongoing training.
+On ResNet-50/ImageNet and RoBERTa/WikiText-103, this procedure advances
+loss and accuracy curves by tens of epochs, yielding substantial GPU-hour
+savings.
+LAWA selects candidates by recency: the $k$ checkpoints are always the
+latest ones, sampled at a fixed interval, regardless of their individual
+validation performance.
+Our method instead ranks all epoch checkpoints by validation loss and
+selects the top-$k$ regardless of when they occur in the training
+trajectory; a strong checkpoint from an earlier epoch is included while a
+weaker recent one is not.
+
+Trainable Weight Averaging (TWA)~\cite{li2022trainable} further extends the
+direction by replacing pre-set uniform coefficients with learned ones.
+TWA optimizes the averaging weights within the subspace spanned by the
+candidate checkpoints, using either training or validation data
+(TWA-v), and consistently improves over SWA.
+The key distinction from our work is that TWA introduces a secondary
+optimization stage to determine the aggregation coefficients, whereas our
+method uses a uniform average over validation-loss-ranked checkpoints. It
+requires no secondary optimization, although parameter averaging and Batch
+Normalization recalibration introduce a small one-time post-training cost.
+
+% ----------------------------------------------------------
+\subsection{Inference-Time Ensembling}
+% ----------------------------------------------------------
+
+Classic model ensembling improves generalization by combining diverse
+hypotheses, at the cost of inference overhead proportional to the number
+of ensemble members~\cite{dietterich2000ensemble}.
+Snapshot ensembles partially reduce training cost by exploiting
+learning-rate schedules to obtain multiple diverse checkpoints within a
+single run~\cite{huang2017snapshotensemblestrain1}.
+In resource-constrained deployments, inference-time aggregation is often
+undesirable due to its additional compute and memory requirements.
+
+% ----------------------------------------------------------
+\subsection{Post-Training Checkpoint Aggregation}
+% ----------------------------------------------------------
+
+Temporal-window averaging is a simple post-training strategy in which
+checkpoints are selected according to their position in the training
+sequence---for example, the final $k$ epochs or checkpoints sampled at
+fixed time intervals.
+This practice is well established in neural machine translation; notably,
+Vaswani et al.~\cite{vaswani2017attention} report averaging the last 5
+(base) or last 20 (big) checkpoints to obtain their final Transformer
+models, and subsequent NMT systems have routinely adopted this
+convention~\cite{junczys2016neural}.
+The strategy assumes that temporally adjacent or recent checkpoints have
+reached a stable region and are therefore similarly suitable for
+aggregation.
+
+However, late-stage validation performance is not necessarily monotonic.
+A predefined temporal window may include checkpoints with degraded
+validation performance caused by transient optimization fluctuations,
+overfitting, or scheduler-induced changes.
+At the same time, it may exclude stronger checkpoints located outside the
+selected interval.
+Consequently, the quality of the aggregated model depends on the training
+endpoint, the window location, and the chosen interval rather than on the
+observed generalization quality of the individual checkpoints.
+
+Model Soups~\cite{wortsman2022model} revisit post-training weight
+aggregation in the context of fine-tuning large pre-trained models.
+Rather than selecting the single best checkpoint from a hyperparameter
+sweep, the greedy soup variant sequentially adds each fine-tuned model to
+the soup only if doing so improves validation accuracy.
+Model Soups therefore also uses a validation-guided criterion to filter
+candidates before averaging.
+The key structural difference from our method is that Model Soups
+operates \emph{across independently trained models} with different
+hyperparameter configurations, whereas our approach operates
+\emph{within a single training run}, selecting from the epoch checkpoints
+produced by that run according to their validation loss.
+
+% ----------------------------------------------------------
+\subsection{Positioning of the Present Work}
+% ----------------------------------------------------------
+
+The proposed method differs from SWA not only in when averaging is
+performed but also in how candidate checkpoints are generated and
+selected.
+Canonical SWA deliberately produces averaging candidates through an
+additional optimization phase using a cyclical or constant learning-rate
+schedule.
+LAWA integrates checkpoint averaging as an online procedure inside the
+training loop.
+TWA introduces a learnable weighting stage that optimizes aggregation
+coefficients on held-out data.
+Model Soups operates across independent runs with varied hyperparameters.
+
+Our method instead operates after the original training run has terminated
+and ranks the epoch checkpoints generated by that run according to
+validation loss.
+Consequently, the proposed strategy does not prescribe an optimizer,
+learning-rate schedule, cycle structure, stopping rule, or secondary
+optimization.
+It is compatible with standard training pipelines using different
+schedulers and with or without early stopping, provided that epoch
+checkpoints and their validation losses are available.
+Unlike temporal-window averaging, which selects checkpoints by epoch
+order, our approach averages the top-$k$ checkpoints with the lowest
+validation losses, which need not be consecutive or restricted to the
+final epochs.
+
+\FloatBarrier
+
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Overview}
+
+Figure~\ref{fig:proposed_method} illustrates the proposed post-training checkpoint aggregation framework. The proposed framework operates strictly at the model selection stage of a standard image classification training pipeline. All epoch checkpoints and their validation losses are saved during training without affecting the optimization process. After training terminates, a validation-loss-guided criterion is applied to select and aggregate multiple high-performing checkpoints into a single set of averaged parameters. No component of the training process, including the optimizer, learning-rate schedule, early stopping, or training duration, is modified. The resulting model requires no additional inference cost compared to a single-checkpoint baseline.
+\FloatBarrier
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.8\linewidth]{Pipeline.png}
+  \caption{Workflow of the proposed post-training checkpoint aggregation strategy. The baseline selects a single checkpoint with the lowest validation loss, whereas the proposed method averages the top-$k$ selected checkpoints and recomputes Batch Normalization statistics when applicable before final evaluation.}
+  \label{fig:proposed_method}
+\end{figure}
+
+\FloatBarrier
+The detailed formulation of the proposed criterion-guided checkpoint aggregation strategy is presented in the following subsection.
+
+\subsection{Proposed Post-Training Checkpoint Aggregation}
+
+Let
+$\{\mathbf{w}_1,\mathbf{w}_2,\ldots,\mathbf{w}_T\}$
+denote the trainable-parameter vectors saved at the end of each training
+epoch, where $T$ is the total number of completed epochs. Let
+$\ell_t^{\mathrm{val}}$ denote the loss of checkpoint $\mathbf{w}_t$
+on the held-out checkpoint-selection set.
+
+The conventional baseline selects the single checkpoint with the lowest
+validation loss:
+\begin{equation}
+  t^*
+  =
+  \arg\min_{1\leq t\leq T}\ell_t^{\mathrm{val}},
+  \qquad
+  \mathbf{w}_{\mathrm{baseline}}
+  =
+  \mathbf{w}_{t^*}.
+\end{equation}
+
+The proposed method instead identifies the indices of the $k$ checkpoints
+with the lowest validation losses:
+\begin{equation}
+  \mathcal{S}_k
+  =
+  \operatorname{TopKLowestIndices}
+  \left(
+    \{\ell_t^{\mathrm{val}}\}_{t=1}^{T},k
+  \right).
+\end{equation}
+
+Their trainable parameters are then averaged element-wise:
+\begin{equation}
+  \mathbf{w}_{\mathrm{avg}}
+  =
+  \frac{1}{|\mathcal{S}_k|}
+  \sum_{t\in\mathcal{S}_k}\mathbf{w}_t.
+\end{equation}
+
+Here, $\mathcal{S}_k\subseteq\{1,\ldots,T\}$ contains the epoch indices
+corresponding to the $k$ smallest validation losses, with ties broken by
+preferring later epochs. The averaging is applied only to trainable
+parameters. For networks using Batch Normalization
+(BN)~\cite{ioffe2015batch}, checkpoint-specific running statistics may not
+correspond to the averaged parameters. Following
+SWA~\cite{izmailov2019averagingweightsleadswider}, the BN running statistics
+are therefore reset and recomputed from the training data after averaging.
+This step requires only a forward pass, without gradients or optimizer
+updates, and the finalized model retains single-model inference cost.
+
+% \FloatBarrier
+% \subsection{Evaluated Architectures}
+% To assess the generality of the proposed strategy, we evaluate six architectures spanning convolutional and transformer-based design paradigms. All pretrained backbone parameters remain trainable and are fine-tuned
+% end-to-end on each target dataset. The baseline and all Top-$k$ variants use identical architectures, initializations, and training trajectories, so that their only difference is the post-training checkpoint-selection rule.
+
+% ViT-Base~\cite{dosovitskiy2021imageworth16x16words} reformulates image classification as a sequence modeling problem by splitting an input image into fixed-size patches processed by a Transformer encoder, enabling capture of long-range spatial dependencies. VGG16~\cite{simonyan2015vgg} provides a strong reference baseline via uniform $3\times3$ convolutional layers followed by fully connected classifiers. ResNet101~\cite{he2016deep} addresses deep network optimization through residual connections that facilitate gradient propagation. DenseNet121~\cite{huang2017densely} employs dense connectivity in which each layer receives feature maps from all preceding layers, promoting feature reuse and parameter efficiency. MobileNetV2~\cite{sandler2018mobilenetv2} uses depthwise separable convolutions to achieve competitive accuracy under tight computational budgets. EfficientNetB0~\cite{tan2019efficientnet} introduces compound scaling of depth, width, and resolution via fixed scaling coefficients, achieving strong accuracy--efficiency trade-offs.
+
+\subsection{Evaluated Architectures}
+To assess the generality of the proposed strategy, we evaluate six architectures spanning convolutional and transformer-based paradigms. All pretrained backbone parameters are fine-tuned end-to-end. The baseline and all Top-$k$ variants use identical architectures, initializations, and training trajectories, differing solely in their post-training checkpoint-selection rule.
+
+We evaluate: (i) \textbf{ViT-Base}~\cite{dosovitskiy2021imageworth16x16words} as the representative transformer encoder for capturing long-range spatial dependencies; (ii) \textbf{VGG16}~\cite{simonyan2015vgg} as a standard baseline with uniform convolutions; (iii) \textbf{ResNet101}~\cite{he2016deep} utilizing residual connections; (iv) \textbf{DenseNet121}~\cite{huang2017densely} employing dense connectivity for feature reuse; (v) \textbf{MobileNetV2}~\cite{sandler2018mobilenetv2} featuring depthwise separable convolutions for tight computational budgets; and (vi) \textbf{EfficientNetB0}~\cite{tan2019efficientnet} leveraging compound scaling for optimal accuracy--efficiency trade-offs.
+
+\subsection{Top-$k$ Checkpoint Aggregation Procedure}
+
+Algorithm~\ref{alg:checkpoint_aggregation} summarizes the proposed
+post-training procedure.
+
+\begin{algorithm}[ht]
+  \caption{Post-Training Top-$k$ Validation-Loss-Guided Checkpoint Aggregation}
+  \label{alg:checkpoint_aggregation}
+  \begin{algorithmic}[1]
+
+    \Require Completed checkpoint set
+    $\mathcal{C}
+    =
+    \{(\ell_t^{\mathrm{val}},\mathbf{w}_t)\}_{t=1}^{T}$,
+    aggregation size $k$, training data $\mathcal{D}_{\mathrm{train}}$
+
+    \Ensure Final aggregated model $\mathcal{M}_{\mathrm{avg}}$
+
+    \State $\mathcal{S}_k \leftarrow
+    \operatorname{TopKLowestIndices}
+    \left(
+      \{\ell_t^{\mathrm{val}}\}_{t=1}^{T},k
+    \right)$
+    \Comment{ties favor later epochs}
+
+    \State $\mathbf{w}_{\mathrm{avg}} \leftarrow
+    \dfrac{1}{|\mathcal{S}_k|}
+    \displaystyle\sum_{t\in\mathcal{S}_k}\mathbf{w}_t$
+
+    \State Load $\mathbf{w}_{\mathrm{avg}}$ into
+    $\mathcal{M}_{\mathrm{avg}}$
+
+    \If{$\mathcal{M}_{\mathrm{avg}}$ contains BN layers}
+    \State Reset the BN running statistics
+    \State Recompute them using one forward pass over
+    $\mathcal{D}_{\mathrm{train}}$ in training mode
+    \Statex \hspace{\algorithmicindent}
+    without gradients or optimizer updates
+    \EndIf
+
+    \State \Return $\mathcal{M}_{\mathrm{avg}}$
+
+  \end{algorithmic}
+\end{algorithm}
+\FloatBarrier
+\section{Datasets and Evaluation Protocols}
+\label{sec:data_description}
+
+We evaluate the proposed method on five image-classification datasets:
+three agricultural datasets and two general-purpose benchmarks.
+Table~\ref{tab:dataset_summary} summarizes their principal characteristics
+and evaluation protocols.
+
+\begin{table}[!ht]
+  \centering
+  \caption{Summary of datasets and evaluation protocols. ``Selection'' denotes
+    the split used for checkpoint ranking, and ``Final evaluation'' the held-out
+    split on which the reported metrics are computed. Tiny ImageNet has no
+    publicly labelled test split, so its official validation set serves as the
+    held-out evaluation set and its results are reported as validation metrics
+  throughout~\cite{abai2019densenet,huynh2022vision}.}
+  \label{tab:dataset_summary}
+  \resizebox{\linewidth}{!}{
+    \begin{tabular}{lccccc}
+      \toprule
+      Dataset & Classes & Available images & Train & Selection & Final evaluation \\
+      \midrule
+      Tomato Leaf Disease
+      & 10 & 1,609
+      & 70\% & 15\% & 15\% test \\
+
+      Burmese Grape Leaf Disease
+      & 5 & 3,103
+      & 70\% & 15\% & 15\% test \\
+
+      Potato Leaf Disease
+      & 7 & 3,076
+      & 70\% & 15\% & 15\% test \\
+
+      CIFAR-100
+      & 100 & 50,000 train + 10,000 test
+      & 45,000 & 5,000 & 10,000 official test \\
+
+      Tiny ImageNet
+      & 200 & 100,000 train + 10,000 official val.
+      & 90,000 & 10,000 & 10,000 official val.$^{\dagger}$ \\
+      \bottomrule
+      \multicolumn{6}{@{}l}{\footnotesize $^{\dagger}$Reported as validation
+      metrics; test labels are not publicly available.}
+      \\
+  \end{tabular}}
+\end{table}
+
+\subsection{Agricultural Image Datasets}
+The Tomato~\cite{solapure2024tomato}, Burmese Grape~\cite{rahman2025burmese}, and Potato~\cite{Shabrina2023Potato} Leaf Disease datasets contain 1,609 images across ten classes, 3,103 images across five classes, and 3,076 images across seven classes, respectively. All images are resized to a standardized resolution fitting the input requirements of each evaluated architecture. These datasets provide a diverse agricultural benchmark to evaluate the robustness of the proposed checkpoint-selection strategy under practical, domain-specific scenarios.
+\subsection{CIFAR-100}
+
+CIFAR-100~\cite{krizhevsky2009learning} contains 50,000 training images and
+10,000 official test images distributed evenly across 100 classes. The original
+training partition is divided using a stratified split into 45,000 training
+images and 5,000 checkpoint-selection images. The official test set is kept
+intact and used only for final evaluation.
+
+\subsection{Tiny ImageNet}
+
+Tiny ImageNet~\cite{le2015tiny} comprises 100,000 training and 10,000 official
+validation images across 200 classes. The labels of the official test split are
+not publicly released, so the official validation set takes the role of the
+held-out evaluation set, following the protocol adopted by prior work on this
+benchmark~\cite{abai2019densenet,huynh2022vision}. Because that split is a
+validation split by construction, every number we report for Tiny ImageNet is
+labelled as a validation metric (validation accuracy, validation macro-F1)
+rather than a test metric, and it is never used for checkpoint ranking.
+Checkpoint selection instead uses a separate split obtained by stratifying the
+original training partition into 90,000 local-training images and 10,000
+local-validation images, identically across all experimental setups. The two
+splits are therefore disjoint, and the evaluation split remains unseen by the
+selection criterion exactly as for the other four datasets.
+\FloatBarrier
+
+% \section{Experiments and Results}
+% \label{sec:ExpandResults}
+% \subsection{Training Configuration}
+% All models are initialized with ImageNet-pretrained weights and fine-tuned end-to-end with randomly initialized classifier heads. Experiments are conducted on an NVIDIA Tesla T4 GPU using the Kaggle platform. The training pipeline—including optimizer, learning-rate schedule, early stopping, and total epochs—is kept identical between the baseline and the proposed method, as detailed in Tables~\ref{tab:tomato_configs_transposed}--\ref{tab:potato_configs_transposed}. All models use Linear Warmup ($0.06 \times$ total epochs) followed by Cosine Annealing ($\eta_{\min}=1 \times 10^{-6}$). Checkpoints and their validation losses are recorded at the end of each epoch; the aggregation is applied strictly post-training.
+
+% Each model dataset configuration is trained independently using five random
+% seeds: 1, 10, 42, 100, and 500. For each seed, the single-checkpoint baseline
+% and all Top-$k$ variants are derived from the same training trajectory and
+% checkpoint set. Therefore, the compared methods differ only in their
+% post-training model-selection rule. Results are reported as mean $\pm$
+% standard deviation across the five runs.
+
+\section{Experiments and Results}
+\label{sec:ExpandResults}
+
+\subsection{Training Configuration}
+
+All architectures are instantiated using the \texttt{timm}
+library~\cite{rw2019timm}, from which the corresponding pretrained
+weights are obtained. The training pipeline---including the optimizer, learning-rate schedule, early stopping, and total epochs---is kept identical between the baseline and the proposed method. All models utilize a Linear Warmup followed by Cosine Annealing. Checkpoints and their corresponding validation losses are recorded at the end of each epoch, and the aggregation is applied strictly post-training.
+
+Settings that are shared by every model--dataset configuration are stated once
+here rather than repeated per row. All models are optimized with
+Adam and a cross-entropy objective with label smoothing $0.1$, at an input
+resolution of $224\times224$. The learning-rate schedule is a linear warmup
+over the first $6\%$ of the scheduled epochs followed by cosine annealing to
+$\eta_{\min}=1\times10^{-6}$. Each backbone is fitted with the same classifier
+head---two hidden layers of 256 and 128 units with dropout $0.5$---and weight
+decay is $1\times10^{-6}$ for all models except ViT-Base, which uses
+$1\times10^{-7}$. Table~\ref{tab:training_configs} therefore lists only the
+four quantities that actually vary across configurations: batch size, epoch
+budget, peak learning rate, and early-stopping patience. Reported epoch
+budgets are the scheduled maxima; early stopping frequently terminates a run
+before that budget is reached, and the number of checkpoints actually produced
+is reported in Section~\ref{sec:selection_geometry}.
+
+Each model--dataset configuration is trained independently using five random
+seeds: 1, 10, 42, 100, and 500. For each seed, the single-checkpoint baseline
+and all Top-$k$ variants are derived from the same training trajectory and
+completed checkpoint set. Therefore, they differ only in the post-training
+checkpoint-selection rule. Results are reported as mean $\pm$ standard
+deviation across the five runs. Unless stated otherwise, ``final evaluation''
+refers to the official test split for CIFAR-100 and the held-out 15\% test
+split for the three agricultural datasets; for Tiny ImageNet it refers to the
+official validation split, and the corresponding numbers are reported as
+validation metrics (Section~\ref{sec:data_description}).
+{%
+  \small
+  \setlength{\tabcolsep}{5pt} % Giảm nhẹ một chút để fit chuẩn form canh giữa
+  \renewcommand{\arraystretch}{1.2}
+
+  % Định nghĩa lại toàn bộ cột: Căn giữa theo cả chiều dọc (m) và chiều ngang (centering)
+  \newcolumntype{D}{>{\centering\arraybackslash}m{2.5cm}}
+  \newcolumntype{M}{>{\centering\arraybackslash}m{2.7cm}}
+
+  % Định nghĩa các cột số phía sau cũng dùng kiểu 'm' căn giữa đồng bộ
+  \newcolumntype{B}{>{\centering\arraybackslash}m{1.2cm}} % Batch
+  \newcolumntype{E}{>{\centering\arraybackslash}m{1.2cm}} % Epochs
+  \newcolumntype{L}{>{\centering\arraybackslash}m{1.5cm}} % LR
+  \newcolumntype{P}{>{\centering\arraybackslash}m{1.4cm}} % Patience
+
+  \begin{longtable}{@{} D M B E L P @{}}
+
+    \caption{Model-specific training configurations across all evaluated datasets. \textit{Patience} denotes the early-stopping epochs.}
+    \label{tab:training_configs}\\[-4pt]
+
+    %% First-page header
+    \toprule
+    \rowcolor{rowalt}
+    \textbf{Dataset} &
+    \textbf{Model}   &
+    \textbf{Batch}   &
+    \textbf{Epochs}  &
+    \textbf{LR}      &
+    \textbf{Patience}\\[3pt]
+    \midrule
+    \endfirsthead
+
+    %% Continuation header
+    \multicolumn{6}{@{}l}{%
+      \footnotesize\itshape
+    \tablename~\thetable{} --- continued from previous page}\\[4pt]
+    \toprule
+    \rowcolor{rowalt}
+    \textbf{Dataset} &
+    \textbf{Model}   &
+    \textbf{Batch}   &
+    \textbf{Epochs}  &
+    \textbf{LR}      &
+    \textbf{Patience}\\[3pt]
+    \midrule
+    \endhead
+
+    %% Continuation footer
+    \midrule
+    \multicolumn{6}{r@{}}{%
+    \footnotesize\itshape Continued on next page\ldots}\\
+    \endfoot
+
+    %% Last footer
+    \bottomrule
+    \endlastfoot
+
+    % TOMATO LEAF
+    & ViT-Base       & 32  & 50  & $9{\times}10^{-7}$   & 10 \\*
+    \rowcolor{stripe}
+    & VGG16          & 64  & 150 & $5{\times}10^{-4}$   & 15 \\*
+    & ResNet101      & 64  & 150 & $5{\times}10^{-4}$   & 15 \\*
+    \rowcolor{stripe}
+    & MobileNetV2    & 32  & 150 & $1.5{\times}10^{-4}$ & 15 \\*
+    & DenseNet121    & 64  & 100 & $1.5{\times}10^{-5}$ & 10 \\*
+    \rowcolor{stripe}
+    \multirow{-6}{*}{\textbf{Tomato Leaf}}
+    & EfficientNetB0 & 64  & 150 & $5{\times}10^{-4}$   & 15 \\
+    \midrule
+
+    % BURMESE GRAPE
+    & ViT-Base       & 64  & 50  & $2{\times}10^{-5}$   & 10 \\*
+    \rowcolor{stripe}
+    & VGG16          & 16  & 100 & $2{\times}10^{-5}$   & 15 \\*
+    & ResNet101      & 64  & 50  & $2{\times}10^{-5}$   & 10 \\*
+    \rowcolor{stripe}
+    & MobileNetV2    & 64  & 100 & $1{\times}10^{-3}$   & 20 \\*
+    & DenseNet121    & 64  & 100 & $1{\times}10^{-5}$   & 15 \\*
+    \rowcolor{stripe}
+    \multirow{-6}{*}{\makecell{\textbf{Burmese}\\\textbf{Grape}}}
+    & EfficientNetB0 & 64  & 100 & $2{\times}10^{-3}$   & 15 \\
+    \midrule
+
+    % POTATO LEAF
+    & ViT-Base       & 64  & 50  & $2{\times}10^{-5}$   & 10 \\*
+    \rowcolor{stripe}
+    & VGG16          & 32  & 70  & $5{\times}10^{-4}$   & 10 \\*
+    & ResNet101      & 64  & 50  & $6{\times}10^{-4}$   & 10 \\*
+    \rowcolor{stripe}
+    & MobileNetV2    & 32  & 150 & $1.5{\times}10^{-4}$ & 15 \\*
+    & DenseNet121    & 32  & 50  & $5{\times}10^{-4}$   & 10 \\*
+    \rowcolor{stripe}
+    \multirow{-6}{*}{\textbf{Potato Leaf}}
+    & EfficientNetB0 & 64  & 50  & $6{\times}10^{-4}$   & 10 \\
+    \midrule
+
+    % CIFAR-100
+    & ViT-Base       & 64  & 40  & $2{\times}10^{-5}$   &  8 \\*
+    \rowcolor{stripe}
+    & VGG16          & 64  & 100 & $5{\times}10^{-5}$   & 12 \\*
+    & ResNet101      & 128 & 60  & $3{\times}10^{-4}$   & 12 \\*
+    \rowcolor{stripe}
+    & MobileNetV2    & 128 & 60  & $3{\times}10^{-4}$   & 12 \\*
+    & DenseNet121    & 128 & 60  & $3{\times}10^{-4}$   & 12 \\*
+    \rowcolor{stripe}
+    \multirow{-6}{*}{\textbf{CIFAR-100}}
+    & EfficientNetB0 & 128 & 60  & $5{\times}10^{-4}$   & 12 \\
+    \midrule
+
+    % TINY IMAGENET
+    & ViT-Base       & 1024 & 60 & $2{\times}10^{-4}$   & 10 \\*
+    \rowcolor{stripe}
+    & VGG16          & 1024 & 50 & $1{\times}10^{-4}$   & 10 \\*
+    & ResNet101      & 1024 & 70 & $2{\times}10^{-4}$   & 10 \\*
+    \rowcolor{stripe}
+    & MobileNetV2    & 1024 & 60 & $2{\times}10^{-4}$   & 10 \\*
+    & DenseNet121    & 1024 & 60 & $2{\times}10^{-4}$   & 10 \\*
+    \rowcolor{stripe}
+    \multirow{-6}{*}{\textbf{Tiny ImageNet}}
+    & EfficientNetB0 & 1024 & 60 & $2{\times}10^{-4}$   & 10 \\
+
+  \end{longtable}
+}%
+
+%
+
+\subsection{Performance of the Proposed Strategy}
+\label{sec:main_results}
+Tables~\ref{tab:results-cifar100}--\ref{tab:results-potato} report
+final-evaluation accuracy and macro-F1 for six architectures across five
+datasets; for Tiny ImageNet these are validation metrics, as explained in
+Section~\ref{sec:data_description}. At least one Top-$k$ setting improves mean
+accuracy over the single-checkpoint baseline for every model--dataset
+configuration. Furthermore, the common $k=5$ setting improves both mean
+accuracy and macro-F1 across all 30 configurations. Macro-precision,
+macro-recall, and AUC were also recorded; because they follow the same trend
+as accuracy and macro-F1 in every configuration, they are summarised in
+aggregate in Table~\ref{tab:aggregate_k_results} rather than repeated in the
+per-dataset tables.
+
+\paragraph{General trend.}
+The effect of $k$ is not uniformly monotonic. While many configurations
+continue to improve through $k=4$ or $k=5$, others saturate earlier or
+exhibit small decreases after an intermediate optimum. The highest observed
+accuracy occurs at $k=4$ or $k=5$ in 25 of the 30 configurations, suggesting
+that these values provide a useful practical range rather than a universally
+optimal choice.
+
+\paragraph{General-purpose benchmarks.}
+On the two general-purpose benchmarks, CIFAR-100 (Table~\ref{tab:results-cifar100}), ViT-Base achieves the
+strongest absolute performance, reaching $89.64\pm0.28\%$ accuracy at $k{=}5$
+versus $87.19\pm0.65\%$ at baseline—an improvement of 2.45 percentage points
+accompanied by a reduction in variance.
+EfficientNetB0 gains 4.39 percentage points ($76.76 \to 81.15\%$), the largest absolute
+accuracy improvement among the CNNs on this dataset.
+On Tiny ImageNet (Table~\ref{tab:results-tiny-imagenet}), whose entries are
+validation metrics because the benchmark releases no labelled test split,
+ResNet101 exhibits the most pronounced gain: $77.50 \to 81.34\%$ validation
+accuracy (+3.84 percentage points at $k{=}5$),
+while ViT-Base advances from $89.68$ to $91.53\%$ with markedly reduced
+standard deviation ($0.34 \to 0.12$), indicating greater run-to-run stability.
+
+\paragraph{Agricultural datasets.}
+On the three domain-specific benchmarks
+(Tables~\ref{tab:results-burmese-grape}--\ref{tab:results-potato}), the
+magnitude of the gain varies more substantially across architectures, and
+the run-to-run standard deviations are generally larger than on the two
+general-purpose benchmarks.
+On Tomato Leaf, ResNet101 shows the largest improvement: $81.84 \to 87.52\%$
+accuracy (+5.68 percentage points) and $84.48 \to 90.01\%$ macro-F1 (+5.53 percentage points), both at $k{=}4$.
+On Potato Leaf, DenseNet121 improves from $86.79$ to $90.26\%$ (+3.47 percentage points),
+and ViT-Base reaches $90.90\%$ accuracy at $k{=}4$ with the lowest
+standard deviation among the six model-specific peak-accuracy entries
+($\pm0.49$).
+Burmese Grape yields smaller and more architecture-dependent gains;
+MobileNetV2 nonetheless
+improves from $83.89$ to $87.19\%$ (+3.30 percentage points) at $k{=}4$.
+
+\paragraph{Run-to-run variability.}
+Checkpoint aggregation frequently, but not universally, reduces run-to-run
+variability. At $k=5$, the accuracy standard deviation is lower than that of
+the baseline in 25 of the 30 configurations, and the macro-F1 standard
+deviation is lower in 23 configurations. Averaged over all 30 configurations,
+the across-seed standard deviation falls from $1.43$ to $1.11$ percentage
+points for accuracy ($-22.3\%$) and from $1.45$ to $1.11$ for macro-F1
+($-23.5\%$); the reduction is largest on the two general-purpose benchmarks
+($-46\%$ on CIFAR-100 and $-56\%$ on Tiny ImageNet) and smallest on Tomato
+Leaf ($-8\%$), the dataset with the fewest images and the noisiest baseline.
+Notable individual reductions include
+Potato--ViT-Base ($1.51\rightarrow0.40$), Burmese Grape--VGG16
+($2.04\rightarrow0.98$), and CIFAR-100--ResNet101
+($1.54\rightarrow0.53$). Several configurations exhibit small increases,
+so variance reduction should be interpreted as a general empirical tendency
+rather than a guaranteed property.
+% ── CIFAR-100 ────────────────────────────────────────────────────
+\begin{table}[htbp]
+  \centering
+  \caption{Results on CIFAR-100 (mean $\pm$ standard deviation).
+  Bold gray cells indicate the highest mean.}
+  \label{tab:results-cifar100}
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{1.16}
+  \scriptsize
+  \begin{tabular}{@{}ll KKKKKK@{}}
+    \toprule
+    \textbf{Metric} & \textbf{$k$}
+    & \textbf{VGG16}
+    & \makecell{\textbf{Dense}\\\textbf{Net121}}
+    & \makecell{\textbf{Efficient}\\\textbf{NetB0}}
+    & \makecell{\textbf{Mobile}\\\textbf{NetV2}}
+    & \makecell{\textbf{ResNet}\\\textbf{101}}
+    & \makecell{\textbf{ViT}\\\textbf{Base}} \\
+    \midrule
+
+    \multirow{5}{*}{\textbf{Accuracy}}
+    & 1 & \ms{71.57}{0.41} & \ms{75.39}{0.20} & \ms{76.76}{0.51}
+    & \ms{73.23}{0.41} & \ms{75.84}{1.54} & \ms{87.19}{0.65} \\
+    & 2 & \ms{72.10}{0.45} & \ms{78.10}{0.20} & \ms{79.85}{0.31}
+    & \ms{74.24}{0.22} & \ms{78.08}{0.28} & \ms{88.68}{0.28} \\
+    & 3 & \ms{72.34}{0.40} & \ms{78.73}{0.12} & \ms{80.51}{0.06}
+    & \ms{74.68}{0.24} & \ms{78.60}{0.36} & \ms{89.12}{0.59} \\
+    & 4 & \bestms{72.48}{0.47} & \ms{78.93}{0.18} & \ms{80.92}{0.22}
+    & \ms{74.92}{0.18} & \bestms{78.82}{0.48} & \ms{89.39}{0.36} \\
+    & 5 & \ms{72.46}{0.43} & \bestms{79.23}{0.30} & \bestms{81.15}{0.31}
+    & \bestms{75.06}{0.15} & \ms{78.80}{0.53} & \bestms{89.64}{0.28} \\
+
+    \midrule
+
+    \multirow{5}{*}{\textbf{Macro-F1}}
+    & 1 & \ms{71.59}{0.42} & \ms{75.41}{0.28} & \ms{76.75}{0.52}
+    & \ms{73.25}{0.50} & \ms{75.92}{1.52} & \ms{87.01}{0.69} \\
+    & 2 & \ms{72.11}{0.46} & \ms{78.09}{0.22} & \ms{79.82}{0.31}
+    & \ms{74.27}{0.22} & \ms{78.15}{0.26} & \ms{88.52}{0.32} \\
+    & 3 & \ms{72.36}{0.42} & \ms{78.72}{0.16} & \ms{80.46}{0.08}
+    & \ms{74.71}{0.24} & \ms{78.67}{0.35} & \ms{88.95}{0.65} \\
+    & 4 & \bestms{72.50}{0.48} & \ms{78.92}{0.19} & \ms{80.88}{0.25}
+    & \ms{74.95}{0.20} & \bestms{78.87}{0.43} & \ms{89.25}{0.39} \\
+    & 5 & \ms{72.48}{0.45} & \bestms{79.21}{0.28} & \bestms{81.10}{0.34}
+    & \bestms{75.04}{0.18} & \bestms{78.87}{0.50} & \bestms{89.52}{0.30} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ── Tiny ImageNet ─────────────────────────────────────────────────
+\begin{table}[htbp]
+  \centering
+  \caption{Results on Tiny ImageNet (mean $\pm$ standard deviation). Because
+    the test labels of this benchmark are not publicly available, the official
+    validation split is used as the held-out evaluation set and all entries are
+    validation metrics~\cite{abai2019densenet,huynh2022vision}. Bold gray cells
+  indicate the highest mean.}
+  \label{tab:results-tiny-imagenet}
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{1.16}
+  \scriptsize
+  \begin{tabular}{@{}ll KKKKKK@{}}
+    \toprule
+    \textbf{Metric} & \textbf{$k$}
+    & \textbf{VGG16}
+    & \makecell{\textbf{Dense}\\\textbf{Net121}}
+    & \makecell{\textbf{Efficient}\\\textbf{NetB0}}
+    & \makecell{\textbf{Mobile}\\\textbf{NetV2}}
+    & \makecell{\textbf{ResNet}\\\textbf{101}}
+    & \makecell{\textbf{ViT}\\\textbf{Base}} \\
+    \midrule
+
+    \multirow{5}{*}{\makecell{\textbf{Validation}\\\textbf{Accuracy}}}
+    & 1 & \ms{67.54}{0.85} & \ms{76.82}{0.61} & \ms{80.32}{0.32}
+    & \ms{72.90}{0.54} & \ms{77.50}{0.60} & \ms{89.68}{0.34} \\
+    & 2 & \ms{68.04}{0.46} & \ms{77.74}{0.11} & \ms{80.64}{0.25}
+    & \ms{73.39}{0.38} & \ms{80.41}{0.10} & \ms{90.96}{0.15} \\
+    & 3 & \ms{68.12}{0.43} & \ms{77.88}{0.13} & \ms{80.72}{0.26}
+    & \ms{73.40}{0.31} & \ms{80.86}{0.13} & \ms{91.31}{0.10} \\
+    & 4 & \bestms{68.35}{0.38} & \bestms{78.06}{0.15} & \bestms{80.81}{0.19}
+    & \ms{73.46}{0.23} & \ms{81.23}{0.14} & \ms{91.43}{0.10} \\
+    & 5 & \ms{68.34}{0.35} & \ms{78.04}{0.22} & \ms{80.78}{0.20}
+    & \bestms{73.53}{0.21} & \bestms{81.34}{0.32} & \bestms{91.53}{0.12} \\
+
+    \midrule
+
+    \multirow{5}{*}{\makecell{\textbf{Validation}\\\textbf{Macro-F1}}}
+    & 1 & \ms{67.36}{0.87} & \ms{76.81}{0.59} & \ms{80.25}{0.32}
+    & \ms{72.74}{0.54} & \ms{77.58}{0.51} & \ms{89.69}{0.33} \\
+    & 2 & \ms{67.85}{0.48} & \ms{77.73}{0.10} & \ms{80.58}{0.26}
+    & \ms{73.24}{0.38} & \ms{80.41}{0.10} & \ms{90.96}{0.15} \\
+    & 3 & \ms{67.91}{0.46} & \ms{77.85}{0.13} & \ms{80.66}{0.27}
+    & \ms{73.25}{0.32} & \ms{80.85}{0.16} & \ms{91.31}{0.10} \\
+    & 4 & \bestms{68.14}{0.42} & \bestms{78.03}{0.16} & \bestms{80.75}{0.19}
+    & \ms{73.31}{0.23} & \ms{81.23}{0.15} & \ms{91.43}{0.10} \\
+    & 5 & \ms{68.13}{0.39} & \ms{78.01}{0.21} & \ms{80.72}{0.21}
+    & \bestms{73.38}{0.21} & \bestms{81.34}{0.34} & \bestms{91.52}{0.12} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ── Burmese Grape ────────────────────────────────────────────────
+\begin{table}[htbp]
+  \centering
+  \caption{Results on Burmese Grape (mean $\pm$ standard deviation).
+  Bold gray cells indicate the highest mean.}
+  \label{tab:results-burmese-grape}
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{1.16}
+  \scriptsize
+  \begin{tabular}{@{}ll KKKKKK@{}}
+    \toprule
+    \textbf{Metric} & \textbf{$k$}
+    & \textbf{VGG16}
+    & \makecell{\textbf{Dense}\\\textbf{Net121}}
+    & \makecell{\textbf{Efficient}\\\textbf{NetB0}}
+    & \makecell{\textbf{Mobile}\\\textbf{NetV2}}
+    & \makecell{\textbf{ResNet}\\\textbf{101}}
+    & \makecell{\textbf{ViT}\\\textbf{Base}} \\
+    \midrule
+
+    \multirow{5}{*}{\textbf{Accuracy}}
+    & 1 & \ms{83.76}{2.04} & \ms{84.62}{1.62} & \ms{82.74}{2.09}
+    & \ms{83.89}{1.54} & \ms{85.38}{0.94} & \ms{86.98}{1.92} \\
+    & 2 & \ms{85.30}{1.39} & \ms{84.96}{1.34} & \ms{85.56}{1.27}
+    & \ms{85.94}{2.28} & \ms{85.13}{1.49} & \ms{86.58}{2.18} \\
+    & 3 & \ms{85.43}{0.84} & \ms{85.00}{1.50} & \ms{85.77}{0.74}
+    & \ms{86.67}{1.53} & \ms{85.17}{1.61} & \bestms{87.05}{1.44} \\
+    & 4 & \ms{85.77}{0.93} & \ms{84.96}{1.40} & \bestms{86.54}{1.05}
+    & \bestms{87.19}{1.54} & \bestms{85.68}{1.41} & \ms{86.79}{1.47} \\
+    & 5 & \bestms{85.94}{0.98} & \bestms{85.17}{1.50} & \ms{86.45}{1.15}
+    & \ms{87.01}{1.67} & \ms{85.60}{1.28} & \ms{87.01}{1.50} \\
+
+    \midrule
+
+    \multirow{5}{*}{\textbf{Macro-F1}}
+    & 1 & \ms{81.83}{3.42} & \ms{82.44}{1.46} & \ms{81.17}{2.70}
+    & \ms{81.85}{1.62} & \ms{84.21}{1.17} & \ms{84.85}{1.49} \\
+    & 2 & \ms{83.97}{1.68} & \ms{83.01}{1.25} & \ms{84.39}{1.65}
+    & \ms{84.55}{1.79} & \ms{84.02}{1.82} & \ms{85.70}{2.57} \\
+    & 3 & \ms{83.69}{1.80} & \ms{83.01}{1.32} & \ms{84.84}{0.70}
+    & \ms{85.42}{1.18} & \ms{84.08}{1.24} & \bestms{86.00}{1.87} \\
+    & 4 & \ms{84.08}{1.67} & \ms{82.84}{1.29} & \ms{85.49}{0.84}
+    & \ms{85.64}{1.24} & \bestms{84.54}{1.24} & \ms{85.66}{1.75} \\
+    & 5 & \bestms{84.41}{1.42} & \bestms{83.06}{1.39} & \bestms{85.51}{0.90}
+    & \bestms{86.08}{1.39} & \ms{84.40}{1.07} & \ms{85.89}{2.17} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ── Tomato Leaf ──────────────────────────────────────────────────
+\begin{table}[htbp]
+  \centering
+  \caption{Results on Tomato Leaf (mean $\pm$ standard deviation).
+  Bold gray cells indicate the highest mean.}
+  \label{tab:results-tomato}
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{1.16}
+  \scriptsize
+  \begin{tabular}{@{}ll KKKKKK@{}}
+    \toprule
+    \textbf{Metric} & \textbf{$k$}
+    & \textbf{VGG16}
+    & \makecell{\textbf{Dense}\\\textbf{Net121}}
+    & \makecell{\textbf{Efficient}\\\textbf{NetB0}}
+    & \makecell{\textbf{Mobile}\\\textbf{NetV2}}
+    & \makecell{\textbf{ResNet}\\\textbf{101}}
+    & \makecell{\textbf{ViT}\\\textbf{Base}} \\
+    \midrule
+
+    \multirow{5}{*}{\textbf{Accuracy}}
+    & 1 & \ms{82.08}{2.79} & \ms{84.08}{2.50} & \ms{83.20}{2.46}
+    & \ms{83.04}{3.92} & \ms{81.84}{2.62} & \ms{83.12}{2.93} \\
+    & 2 & \ms{83.36}{2.46} & \bestms{84.56}{2.32} & \ms{84.96}{2.81}
+    & \ms{84.40}{2.34} & \ms{85.36}{1.74} & \ms{83.52}{2.86} \\
+    & 3 & \bestms{84.00}{2.56} & \ms{84.48}{2.66} & \ms{85.20}{2.96}
+    & \ms{85.12}{2.45} & \ms{86.64}{1.94} & \bestms{83.92}{1.87} \\
+    & 4 & \bestms{84.00}{2.10} & \ms{84.48}{2.53} & \ms{85.52}{2.55}
+    & \ms{85.92}{3.44} & \bestms{87.52}{2.57} & \ms{83.68}{2.34} \\
+    & 5 & \ms{83.20}{2.68} & \ms{84.40}{2.29} & \bestms{85.60}{2.30}
+    & \bestms{86.64}{3.51} & \ms{87.12}{2.56} & \ms{83.68}{2.43} \\
+
+    \midrule
+
+    \multirow{5}{*}{\textbf{Macro-F1}}
+    & 1 & \ms{84.71}{2.67} & \ms{87.52}{1.94} & \ms{86.19}{2.21}
+    & \ms{86.78}{3.99} & \ms{84.48}{1.92} & \ms{86.71}{2.77} \\
+    & 2 & \ms{86.04}{2.34} & \bestms{87.98}{1.88} & \ms{88.52}{2.42}
+    & \ms{87.84}{2.22} & \ms{88.08}{0.57} & \ms{87.23}{2.83} \\
+    & 3 & \ms{86.87}{2.23} & \ms{87.91}{2.25} & \ms{88.58}{2.42}
+    & \ms{88.56}{1.75} & \ms{89.38}{0.95} & \bestms{87.37}{2.03} \\
+    & 4 & \bestms{86.96}{1.91} & \ms{87.94}{2.21} & \ms{88.78}{2.24}
+    & \ms{88.93}{2.52} & \bestms{90.01}{1.84} & \ms{87.21}{2.67} \\
+    & 5 & \ms{86.43}{1.96} & \ms{87.95}{1.94} & \bestms{88.99}{1.70}
+    & \bestms{89.70}{2.80} & \ms{89.91}{1.58} & \ms{87.26}{2.65} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% ── Potato Leaf ──────────────────────────────────────────────────
+\begin{table}[htbp]
+  \centering
+  \caption{Results on Potato Leaf (mean $\pm$ standard deviation).
+  Bold gray cells indicate the highest mean.}
+  \label{tab:results-potato}
+  \setlength{\tabcolsep}{3pt}
+  \renewcommand{\arraystretch}{1.16}
+  \scriptsize
+  \begin{tabular}{@{}ll KKKKKK@{}}
+    \toprule
+    \textbf{Metric} & \textbf{$k$}
+    & \textbf{VGG16}
+    & \makecell{\textbf{Dense}\\\textbf{Net121}}
+    & \makecell{\textbf{Efficient}\\\textbf{NetB0}}
+    & \makecell{\textbf{Mobile}\\\textbf{NetV2}}
+    & \makecell{\textbf{ResNet}\\\textbf{101}}
+    & \makecell{\textbf{ViT}\\\textbf{Base}} \\
+    \midrule
+
+    \multirow{5}{*}{\textbf{Accuracy}}
+    & 1 & \ms{86.03}{1.67} & \ms{86.79}{1.88} & \ms{85.94}{0.76}
+    & \ms{87.09}{1.67} & \ms{86.20}{1.02} & \ms{90.30}{1.51} \\
+    & 2 & \ms{87.18}{1.08} & \ms{89.10}{1.65} & \ms{88.12}{1.33}
+    & \ms{88.03}{0.80} & \ms{88.42}{1.14} & \ms{90.30}{0.82} \\
+    & 3 & \bestms{88.08}{1.03} & \ms{89.66}{1.34} & \ms{88.46}{0.97}
+    & \ms{88.29}{0.87} & \ms{88.89}{1.42} & \ms{90.43}{0.51} \\
+    & 4 & \ms{87.61}{1.38} & \bestms{90.26}{2.01} & \ms{88.68}{0.74}
+    & \ms{88.50}{1.22} & \ms{88.76}{0.96} & \bestms{90.90}{0.49} \\
+    & 5 & \ms{87.78}{1.26} & \ms{90.00}{2.15} & \bestms{88.97}{0.69}
+    & \bestms{88.76}{0.72} & \bestms{89.10}{0.79} & \ms{90.60}{0.40} \\
+
+    \midrule
+
+    \multirow{5}{*}{\textbf{Macro-F1}}
+    & 1 & \ms{84.52}{2.20} & \ms{84.90}{1.90} & \ms{84.67}{0.94}
+    & \ms{85.52}{1.94} & \ms{84.84}{0.68} & \ms{88.06}{1.31} \\
+    & 2 & \ms{86.07}{1.09} & \ms{87.18}{1.61} & \ms{86.80}{1.85}
+    & \ms{86.89}{0.87} & \ms{87.53}{1.92} & \ms{88.29}{1.19} \\
+    & 3 & \bestms{87.19}{1.23} & \ms{87.64}{1.44} & \ms{87.13}{1.66}
+    & \ms{86.92}{1.13} & \ms{87.23}{2.54} & \ms{88.53}{0.83} \\
+    & 4 & \ms{86.68}{1.52} & \bestms{88.53}{2.22} & \ms{87.29}{1.29}
+    & \ms{87.21}{1.19} & \ms{87.50}{1.70} & \bestms{89.15}{1.21} \\
+    & 5 & \ms{86.88}{1.75} & \ms{88.38}{2.41} & \bestms{87.57}{1.04}
+    & \bestms{87.51}{0.81} & \bestms{87.59}{1.55} & \ms{88.94}{1.14} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\FloatBarrier
+\subsection{Sensitivity to the Aggregation Size}
+\label{sec:k_sensitivity}
+
+The effect of the aggregation size is architecture- and dataset-dependent.
+Across the 30 model--dataset configurations, the highest observed mean
+accuracy is obtained at $k=5$ in 14 configurations, at $k=4$ in 11,
+at $k=3$ in four, and at $k=2$ in one. Thus, $k\in\{4,5\}$ accounts for
+25 of the 30 accuracy-maximizing configurations. A similar pattern is
+observed for macro-F1: the highest mean is achieved at $k=5$ in 16
+configurations, at $k=4$ in ten, at $k=3$ in three, and at $k=2$ in one.
+
+Nevertheless, performance is not uniformly monotonic as $k$ increases.
+Mean accuracy is non-decreasing from $k=1$ to $k=5$ in 12 of the 30
+configurations, while macro-F1 is non-decreasing in 14 configurations.
+Several models therefore saturate at $k=3$ or $k=4$ and exhibit small
+decreases when an additional checkpoint is included. Examples include
+VGG16 and ResNet101 on CIFAR-100; VGG16, DenseNet121, and EfficientNetB0
+on Tiny ImageNet; and multiple architectures on the agricultural datasets.
+
+Despite these configuration-specific variations, the common $k=5$
+setting improves mean accuracy and macro-F1 over the single-checkpoint
+baseline in all 30 configurations. Table~\ref{tab:aggregate_k_results}
+summarizes the equally weighted mean performance across all evaluated
+model--dataset configurations.
+
+% Per-dataset sensitivity curves (accuracy and macro-F1 vs. k, all six
+% architectures). These duplicate Tables~3--7 in graphical form; uncomment the
+% line below to include all five figures, or copy individual figure blocks out
+% of sensitivity_figures.tex if page budget is tight.
+% \input{sensitivity_figures}
+
+\begin{table}[H]
+  \centering
+  \caption{Equally weighted mean performance across the 30 model--dataset
+    configurations. Each cell reports the aggregate mean in percent, with the
+    absolute improvement over the single-checkpoint baseline at $k=1$, in
+  percentage points, in parentheses.}
+  \label{tab:aggregate_k_results}
+  \small
+  \setlength{\tabcolsep}{4.5pt}
+  \begin{tabular}{lccccc}
+    \toprule
+    $k$ & Accuracy & Macro-F1 & \makecell{Macro\\Precision}
+    & \makecell{Macro\\Recall} & AUC$^{\dagger}$ \\
+    \midrule
+    1 (Baseline) & 81.73 & 81.65 & 82.58 & 81.58 & 97.77 \\
+    2 & 83.10\,{\scriptsize(+1.37)} & 83.19\,{\scriptsize(+1.54)}
+    & 83.94\,{\scriptsize(+1.37)} & 83.06\,{\scriptsize(+1.47)}
+    & 98.05\,{\scriptsize(+0.28)} \\
+    3 & 83.48\,{\scriptsize(+1.76)} & 83.53\,{\scriptsize(+1.88)}
+    & 84.17\,{\scriptsize(+1.60)} & 83.44\,{\scriptsize(+1.86)}
+    & 98.12\,{\scriptsize(+0.35)} \\
+    4 & 83.72\,{\scriptsize(+1.99)} & 83.76\,{\scriptsize(+2.10)}
+    & 84.38\,{\scriptsize(+1.80)} & 83.70\,{\scriptsize(+2.11)}
+    & 98.15\,{\scriptsize(+0.38)} \\
+    5 & \textbf{83.76}\,{\scriptsize(\textbf{+2.04})}
+    & \textbf{83.86}\,{\scriptsize(\textbf{+2.21})}
+    & \textbf{84.42}\,{\scriptsize(\textbf{+1.85})}
+    & \textbf{83.80}\,{\scriptsize(\textbf{+2.22})}
+    & \textbf{98.16}\,{\scriptsize(\textbf{+0.39})} \\
+    \bottomrule
+    \multicolumn{6}{@{}l}{\footnotesize $^{\dagger}$Averaged over the 24
+    configurations for which AUC was recorded (all datasets except Tiny}\\
+    \multicolumn{6}{@{}l}{\footnotesize \phantom{$^{\dagger}$}ImageNet); the
+    other columns average all 30.}
+  \end{tabular}
+\end{table}
+
+When the configurations are weighted equally, aggregate mean accuracy
+increases monotonically from 81.73\% at $k=1$ to 83.76\% at $k=5$,
+while aggregate mean macro-F1 increases from 81.65\% to 83.86\%.
+These changes correspond to average gains of 2.04 percentage points
+in accuracy and 2.21 percentage points in macro-F1. The same monotonic
+pattern holds for the remaining metrics: macro-precision gains 1.85
+percentage points, macro-recall 2.22, and AUC 0.39. The gain in recall
+exceeding the gain in precision indicates that the aggregated model recovers
+comparatively more of the under-represented classes, which is consistent with
+macro-F1 improving slightly more than accuracy overall. The AUC increase is
+small in absolute terms because the baseline already exceeds 97.7\%, yet it is
+positive in 23 of the 24 configurations in which AUC is available, indicating
+that averaging improves the ranking quality of the predicted scores and not
+only the arg-max decision. Thus, although
+individual configurations may saturate or decline slightly as $k$
+increases, the gains are sufficiently consistent to produce a monotonic
+aggregate trend. These results support $k\in\{4,5\}$ as a practical
+operating range, although neither value is universally optimal. The
+reported aggregates are descriptive macro-averages across heterogeneous
+configurations rather than pooled estimates over individual
+final-evaluation examples.
+
+All values of $k$ are reported as a sensitivity analysis. The highest
+observed results are descriptive and are not used to select $k$ using
+the final evaluation sets.
+
+% ── Which checkpoints does the criterion actually select? ────────────────
+\FloatBarrier
+\subsection{Which Checkpoints Does the Criterion Select?}
+\label{sec:selection_geometry}
+
+Sections~\ref{sec:related_work} and~\ref{sec:methodology} distinguish the
+proposed criterion from temporal-window averaging on the grounds that a
+validation-ranked set need not be contiguous nor confined to the final epochs.
+This subsection examines whether that distinction is realised in practice. We
+inspect the selected epoch indices for the CIFAR-100 runs, for which the
+per-seed selection records are available: six architectures $\times$ five
+seeds $=30$ completed runs, and hence 150 selected checkpoints at $k=5$.
+Table~\ref{tab:selection_geometry} summarises their positions.
+
+\begin{table}[htbp]
+  \centering
+  \caption{Position of the selected checkpoints on CIFAR-100, averaged over
+    the five seeds. $T$ is the number of epochs actually completed (early
+    stopping frequently ends a run before its scheduled budget), $t^{*}$ the
+    baseline's single best epoch, and $S_5$ the top-5 validation-ranked set.
+    \emph{Span} is $\max S_5-\min S_5+1$, so a purely contiguous selection
+    would span exactly 5. \emph{Non-contig.}\ counts seeds whose $S_5$ is not
+    a block of consecutive epochs, and the last column counts how many members
+  of $S_5$ fall inside the final five epochs of the run.}
+  \label{tab:selection_geometry}
+  \small
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{lccccc}
+    \toprule
+    Model & $T$ & $t^{*}$ & Span of $S_5$
+    & \makecell{Non-contig.\\(of 5 seeds)}
+    & $|S_5\cap\text{last-5}|$ \\
+    \midrule
+    VGG16          & 75.8 & 63.8 & 17.6 & 5 & 1.0 \\
+    DenseNet121    & 37.2 & 25.2 & 10.0 & 5 & 0.2 \\
+    EfficientNetB0 & 23.8 & 11.8 &  9.0 & 5 & 0.2 \\
+    MobileNetV2    & 50.0 & 38.0 & 16.0 & 5 & 0.4 \\
+    ResNet101      & 46.6 & 34.6 & 14.4 & 5 & 1.6 \\
+    ViT-Base       & 14.2 &  6.2 &  5.0 & 0 & 0.0 \\
+    \midrule
+    All            & 41.3 & 30.0 & 12.0 & 25 & 0.6 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\paragraph{The selected set is rarely a temporal window.}
+A block of five consecutive epochs would have a span of exactly 5. The
+observed mean span is 12.0 epochs, and only 5 of the 30 runs---all of them
+ViT-Base---produce a contiguous set. In the remaining 25 runs the criterion
+skips intervening epochs, with a mean largest internal gap of 5.0 epochs and a
+maximum of 10. ViT-Base is the informative exception rather than a
+counterexample: it early-stops after roughly 14 epochs, so its five best
+checkpoints have little room to be anything other than adjacent. The longer a
+run is, the further the selection departs from a window; VGG16, which trains
+for 75.8 epochs on average, spreads its five checkpoints over 17.6.
+
+\paragraph{The selected set is not concentrated at the end of training.}
+Only 17 of the 150 selected checkpoints ($11.3\%$) lie within the final five
+epochs of their run, and in 20 of the 30 runs $S_5$ is entirely disjoint from
+that window. On average, the earliest selected checkpoint precedes the end of
+training by 16.4 epochs, and the baseline's own best epoch $t^{*}$ sits at
+roughly $66\%$ of the completed trajectory rather than at its end---a direct
+consequence of combining early stopping with a patience of 8--12 epochs. A
+last-$k$ average computed on the same runs would therefore aggregate a set
+that is largely disjoint from the one selected here, which is the concrete
+sense in which the two criteria differ.
+
+\paragraph{The selection is nested in $k$.}
+Because the criterion ranks a fixed set of checkpoints by validation loss,
+$S_{k-1}\subset S_k$ holds by construction, and this is confirmed in all 30
+runs: increasing $k$ only ever admits an additional checkpoint and never
+replaces one. The aggregated model at $k$ is thus a refinement of the model at
+$k-1$ rather than a different point in weight space, which explains why the
+aggregate curves in Table~\ref{tab:aggregate_k_results} move smoothly rather
+than erratically with $k$, even though individual configurations may peak at
+an intermediate $k$.
+
+\paragraph{Storage cost.}
+The runs retain on average 41.3 checkpoints, since candidates must be kept
+until training terminates. This is the method's only material overhead: no
+additional optimization is performed, the number of training epochs is
+unchanged by construction, and the final model is a single set of averaged
+parameters. Retention can be bounded in practice by keeping a running set of
+the $k$ best checkpoints observed so far, which requires storing $k+1$ rather
+than $T$ states and yields the same result as ranking the full set offline.
+
+\FloatBarrier
+\section{Discussion}
+\label{sec:discussion}
+
+The matched-trajectory design is central to the interpretation of the
+results. For each seed, the single-checkpoint baseline and all Top-$k$
+variants are derived from the same completed training run and checkpoint
+set. Their differences can therefore be attributed to the post-training
+checkpoint-selection rule rather than to changes in architecture,
+initialization, optimizer, learning-rate schedule, or training duration.
+At the common $k=5$ setting, higher mean accuracy and macro-F1 are observed
+in all 30 model--dataset configurations.
+
+A plausible explanation is that validation-guided aggregation reduces
+dependence on a single checkpoint whose apparent advantage may partly
+reflect temporary variation along the training trajectory. Instead, the
+proposed method combines several checkpoints that all achieve comparatively
+low validation loss. The consistent gains across convolutional, residual,
+densely connected, lightweight, and transformer-based architectures suggest
+that the benefit is not restricted to one model family. Because no
+additional training or prediction-time ensemble is introduced, the
+improvement is obtained entirely at the model-selection stage while
+retaining single-model inference cost.
+
+The aggregate and configuration-specific results provide complementary
+views of the effect of $k$. As shown in
+Table~\ref{tab:aggregate_k_results}, equally weighted mean performance
+increases monotonically from $k=1$ to $k=5$, reaching average gains of
+2.04 percentage points in accuracy and 2.21 percentage points in macro-F1.
+However, individual configurations may saturate or decline slightly after
+an intermediate value of $k$. Although $k=4$ or $k=5$ yields the highest
+mean accuracy in 25 of the 30 configurations, the remaining five peak at
+smaller values. Thus, $k\in\{4,5\}$ represents a useful practical range
+rather than a universally optimal choice. If $k$ is tuned for a particular
+application, it should be selected using validation data without reference
+to the final evaluation results.
+
+Checkpoint aggregation also frequently improves run-to-run stability. At
+$k=5$, the accuracy standard deviation is lower than that of the baseline
+in 25 of the 30 configurations, and the mean across-seed standard deviation
+falls by $22.3\%$ for accuracy and $23.5\%$ for macro-F1. Because several
+configurations show small increases, variance reduction should be interpreted
+as a general empirical tendency rather than a guaranteed outcome.
+
+The selection analysis in Section~\ref{sec:selection_geometry} clarifies what
+the criterion contributes beyond the act of averaging itself. The selected
+checkpoints are neither contiguous nor concentrated at the end of training:
+only 5 of 30 runs yield a contiguous set, and just $11.3\%$ of the selected
+checkpoints fall in the final five epochs. A temporal window of the same size
+would therefore aggregate a largely different set of weights on these runs.
+This establishes that the two criteria are structurally distinct, but it does
+not by itself establish that the validation-ranked set is the better of the
+two, since both were not evaluated under a matched protocol here.
+
+The main limitation is that the current experiments establish an advantage
+over conventional single-checkpoint selection but do not directly establish
+superiority over alternative aggregation strategies such as last-$k$
+temporal averaging, EMA, SWA or post-hoc SWA, and prediction ensembling.
+Moreover, the evaluation is limited to image classification, so it remains
+unclear whether the observed benefits extend to other tasks and modalities,
+such as semantic segmentation and natural language processing. The method
+also requires candidate checkpoints to be retained until training is
+complete, introducing additional storage but no inference-time overhead.
+Future work should include controlled comparisons with alternative
+aggregation strategies, evaluation on additional tasks and modalities,
+adaptive validation-based selection of $k$, diversity-aware aggregation,
+and assessment under distribution shifts and input corruptions.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+This study presented a post-training checkpoint aggregation strategy that
+ranks epoch checkpoints by validation loss and uniformly averages the
+trainable parameters of the top-$k$ candidates. The method operates on a
+completed standard training run, requires no secondary optimization phase,
+and preserves single-model inference cost.
+
+Across six architectures, five image-classification datasets, and five
+random seeds, the common $k=5$ setting achieves higher mean accuracy and
+macro-F1 than the single-checkpoint baseline in all 30 model--dataset
+configurations. When the configurations are weighted equally, mean accuracy
+increases from 81.73\% to 83.76\%, while mean macro-F1 increases from
+81.65\% to 83.86\%, corresponding to gains of 2.04 and 2.21 percentage
+points, respectively. Checkpoint aggregation also frequently reduces
+run-to-run variability.
+
+Although $k=4$ or $k=5$ produces the highest mean accuracy in most
+configurations, the effect of the aggregation size is not universally
+monotonic. The main empirical finding is therefore not that increasing $k$
+always improves performance, but that replacing winner-takes-all checkpoint
+selection with a small validation-ranked checkpoint set can provide a more
+effective and frequently more stable final model without additional
+inference-time complexity. Future work should compare the method directly
+with alternative checkpoint-averaging strategies, evaluate its applicability
+to other tasks and modalities such as semantic segmentation and natural
+language processing, and investigate adaptive or diversity-aware aggregation
+under distribution shifts.
+
+\bibliographystyle{splncs04}
+\bibliography{Strategy2}
+
+\end{document}
+
+% As shown in the results, validation-loss–guided post-training averaging
+% consistently improves classification accuracy across all evaluated architectures.
+% On the Tomato dataset, VGG16 achieves an absolute improvement of \textbf{4.0\%}.
+% On the Burmese dataset, VGG16 and MobileNetV2 improve by \textbf{3.20\%} and
+% \textbf{2.56\%}, respectively, demonstrating the robustness of the proposed
+% selection strategy under diverse training configurations.
+
+% \begin{table}[!ht]
+% \centering
+% \caption{Hyperparameter Configurations for Tomato Classification Models (Validation-loss based)}
+% \label{tab:tomato_configs}
+
+% \renewcommand{\arraystretch}{1.3}
+
+% \resizebox{\textwidth}{!}{%
+% \begin{tabular}{|l|c|c|c|c|c|}
+% \hline
+% \textbf{Parameter}
+% & \textbf{VGG16}
+% & \textbf{ResNet101}
+% & \textbf{DenseNet121}
+% & \textbf{EfficientNetB0}
+% & \textbf{MobileNetV2} \\ \hline
+
+% Batch Size
+% & 32
+% & 128
+% & 32
+% & 32
+% & 32 \\ \hline
+
+% Num Epochs
+% & 200
+% & 50
+% & 200
+% & 200
+% & 200 \\ \hline
+
+% Learning Rate
+% & $5 \times 10^{-4}$
+% & $4 \times 10^{-3}$
+% & $5 \times 10^{-4}$
+% & $5 \times 10^{-4}$
+% & $5 \times 10^{-4}$ \\ \hline
+
+% Weight Decay
+% & $5 \times 10^{-4}$
+% & $1 \times 10^{-7}$
+% & $5 \times 10^{-4}$
+% & $5 \times 10^{-4}$
+% & $5 \times 10^{-4}$ \\ \hline
+
+% Scheduler
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{Cosine\\Annealing}
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{ReduceLR\\OnPlateau} \\ \hline
+
+% Warmup Strategy
+% & X
+% & \shortstack{Linear\\Warmup}
+% & X
+% & X
+% & X \\ \hline
+
+% Warmup Epochs
+% & X
+% & 4
+% & X
+% & X
+% & X \\ \hline
+
+% Early Stopping
+% & 15
+% & 15
+% & 15
+% & 15
+% & 15 \\ \hline
+
+% LR Decay Patience
+% & 5
+% & X
+% & 5
+% & 5
+% & 5 \\ \hline
+
+% LR Decay Factor
+% & 0.5
+% & X
+% & 0.5
+% & 0.5
+% & 0.5 \\ \hline
+
+% ETA Min
+% & X
+% & $1 \times 10^{-6}$
+% & X
+% & X
+% & X \\ \hline
+
+% Dropout Rate
+% & 0.5
+% & 0.5
+% & 0.5
+% & 0.5
+% & 0.5 \\ \hline
+
+% Classifier Config
+% & [256, 128]
+% & [256, 128]
+% & [256, 128]
+% & [256, 128]
+% & [256, 128] \\ \hline
+% \end{tabular}%
+% }
+% \end{table}
+
+% \begin{table}[!ht]
+% \centering
+% \caption{Hyperparameter Configurations for Burmese Dataset Models (Validation-loss based)}
+% \label{tab:burmese_model_configs}
+
+% \renewcommand{\arraystretch}{1.3}
+
+% \resizebox{\textwidth}{!}{%
+% \begin{tabular}{|l|c|c|c|c|c|}
+% \hline
+% \textbf{Parameter}
+% & \textbf{VGG16}
+% & \textbf{ResNet101}
+% & \textbf{MobileNetV2}
+% & \textbf{EfficientNetB0}
+% & \textbf{DenseNet121} \\ \hline
+
+% Batch Size
+% & 32
+% & 16
+% & 64
+% & 32
+% & 64 \\ \hline
+
+% Num Epochs
+% & 200
+% & 200
+% & 250
+% & 300
+% & 250 \\ \hline
+
+% Learning Rate
+% & $5 \times 10^{-4}$
+% & $4 \times 10^{-4}$
+% & $5 \times 10^{-4}$
+% & $1 \times 10^{-4}$
+% & $5 \times 10^{-4}$ \\ \hline
+
+% Weight Decay
+% & $5 \times 10^{-4}$
+% & $1 \times 10^{-5}$
+% & $5 \times 10^{-4}$
+% & $1 \times 10^{-4}$
+% & $5 \times 10^{-4}$ \\ \hline
+
+% Scheduler
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{Cosine\\Annealing}
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{ReduceLR\\OnPlateau}
+% & \shortstack{ReduceLR\\OnPlateau} \\ \hline
+
+% Warmup Strategy
+% & X
+% & \shortstack{Linear\\Warmup}
+% & X
+% & X
+% & X \\ \hline
+
+% Warmup Epochs
+% & X
+% & 10
+% & X
+% & X
+% & X \\ \hline
+
+% Early Stopping
+% & 15
+% & 20
+% & 15
+% & 15
+% & 15 \\ \hline
+
+% LR Decay Patience
+% & 5
+% & X
+% & 5
+% & 5
+% & 5 \\ \hline
+
+% LR Decay Factor
+% & 0.5
+% & X
+% & 0.5
+% & 0.5
+% & 0.5 \\ \hline
+
+% ETA Min
+% & X
+% & $1 \times 10^{-7}$
+% & X
+% & X
+% & X \\ \hline
+
+% Dropout Rate
+% & 0.5
+% & 0.4
+% & 0.3
+% & 0.5
+% & 0.3 \\ \hline
+
+% Classifier Config
+% & [256, 128]
+% & [512, 128]
+% & [512, 256]
+% & [256, 128]
+% & [512, 256] \\ \hline
+% \end{tabular}%
+% }
+% \end{table}
+\FloatBarrier
+% TABLE 3: TOMATO CONFIGS (TRANSPOSED)
