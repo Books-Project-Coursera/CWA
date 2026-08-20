@@ -5,6 +5,7 @@ import os
 import time
 import json
 import csv
+import inspect
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -296,6 +297,80 @@ def validate(model, val_loader, criterion, device):
     return epoch_loss, epoch_acc
 
 
+OPTIMIZER_CLASSES = {
+    "adamw": optim.AdamW,
+    "adam": optim.Adam,
+    "sgd": optim.SGD,
+    "rmsprop": optim.RMSprop,
+}
+
+
+def build_optimizer(model, device):
+    """Build the optimizer selected by ``Config.OPTIMIZER``.
+
+    Weight decay always goes through timm's parameter groups, so biases and
+    1D/norm parameters stay undecayed no matter which optimizer is chosen.
+    Note that AdamW decouples weight decay while Adam/SGD/RMSprop apply it as
+    classic L2 on the gradients, so the same WEIGHT_DECAY value is not
+    equivalent across optimizers.
+
+    Args:
+        model: Model whose parameters are optimized
+        device: Device used for training (fused kernels need CUDA)
+
+    Returns:
+        torch.optim.Optimizer
+    """
+    from timm.optim import param_groups_weight_decay
+
+    name = Config.OPTIMIZER.lower()
+    optimizer_cls = OPTIMIZER_CLASSES.get(name)
+    if optimizer_cls is None:
+        raise ValueError(
+            f"Unsupported OPTIMIZER '{Config.OPTIMIZER}'. "
+            f"Choose one of: {', '.join(sorted(OPTIMIZER_CLASSES))}"
+        )
+
+    parameter_groups = param_groups_weight_decay(
+        model,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    optimizer_kwargs = {"lr": Config.LEARNING_RATE}
+    if name in ("adamw", "adam"):
+        optimizer_kwargs["betas"] = Config.OPTIMIZER_BETAS
+        optimizer_kwargs["eps"] = Config.OPTIMIZER_EPS
+        extra = f"betas={Config.OPTIMIZER_BETAS}, eps={Config.OPTIMIZER_EPS}"
+    elif name == "sgd":
+        optimizer_kwargs["momentum"] = Config.SGD_MOMENTUM
+        optimizer_kwargs["nesterov"] = Config.SGD_NESTEROV
+        extra = f"momentum={Config.SGD_MOMENTUM}, nesterov={Config.SGD_NESTEROV}"
+    else:  # rmsprop
+        optimizer_kwargs["momentum"] = Config.SGD_MOMENTUM
+        optimizer_kwargs["alpha"] = Config.RMSPROP_ALPHA
+        optimizer_kwargs["eps"] = Config.OPTIMIZER_EPS
+        extra = f"momentum={Config.SGD_MOMENTUM}, alpha={Config.RMSPROP_ALPHA}"
+
+    # Fused kernels only exist for some optimizers and only on CUDA.
+    fused_supported = "fused" in inspect.signature(optimizer_cls).parameters
+    fused_enabled = (
+        Config.USE_FUSED_OPTIMIZER and device.type == "cuda" and fused_supported
+    )
+    if fused_enabled:
+        optimizer_kwargs["fused"] = True
+    elif Config.USE_FUSED_OPTIMIZER and device.type == "cuda" and not fused_supported:
+        print(f"  Note: {optimizer_cls.__name__} has no fused implementation, using the default one")
+
+    optimizer = optimizer_cls(parameter_groups, **optimizer_kwargs)
+    print(
+        f"  Optimizer: {optimizer_cls.__name__}(lr={Config.LEARNING_RATE}, "
+        f"weight_decay={Config.WEIGHT_DECAY}, {extra}, fused={fused_enabled})"
+    )
+    if name != "adamw":
+        print("    Weight decay is coupled (classic L2) for this optimizer, not decoupled as in AdamW")
+    return optimizer
+
+
 def train_model(model_name, train_loader, val_loader, num_classes, device, class_names=None, test_loader=None, train_labels=None, save_dir=None, checkpoints_dir=None):
     """
     Train a single model
@@ -390,25 +465,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
             f"prob={Config.MIXUP_PROB}, "
             f"switch_prob={Config.MIXUP_SWITCH_PROB}"
         )
-    optimizer_kwargs = {
-        "lr": Config.LEARNING_RATE,
-        "betas": Config.OPTIMIZER_BETAS,
-        "eps": Config.OPTIMIZER_EPS,
-    }
-    fused_enabled = Config.USE_FUSED_OPTIMIZER and device.type == "cuda"
-    if fused_enabled:
-        optimizer_kwargs["fused"] = True
-    from timm.optim import param_groups_weight_decay
-
-    parameter_groups = param_groups_weight_decay(
-        model,
-        weight_decay=Config.WEIGHT_DECAY,
-    )
-    optimizer = optim.AdamW(parameter_groups, **optimizer_kwargs)
-    print(
-        f"  Optimizer: AdamW(lr={Config.LEARNING_RATE}, "
-        f"weight_decay={Config.WEIGHT_DECAY}, fused={fused_enabled})"
-    )
+    optimizer = build_optimizer(model, device)
     print(
         f"  Precision: {'BF16 AMP' if Config.USE_AMP and device.type == 'cuda' else 'FP32'}"
     )

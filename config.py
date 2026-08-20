@@ -34,10 +34,17 @@ class Config:
     SCHEDULER = "linear_warmup_cosine"
 
     # Optimizer
+    # Chọn 1 trong SUPPORTED_OPTIMIZERS, hoặc override khi chạy: --optimizer adam
+    # Lưu ý: chỉ AdamW dùng decoupled weight decay; adam/sgd/rmsprop dùng L2
+    # cổ điển nên cùng WEIGHT_DECAY sẽ KHÔNG cho hiệu quả tương đương.
+    SUPPORTED_OPTIMIZERS = ("adamw", "adam", "sgd", "rmsprop")  # khớp với OPTIMIZER_CLASSES trong train.py
     OPTIMIZER = "adamw"
-    OPTIMIZER_BETAS = (0.9, 0.999)
-    OPTIMIZER_EPS = 1e-8
-    USE_FUSED_OPTIMIZER = True
+    OPTIMIZER_BETAS = (0.9, 0.999)  # adam / adamw
+    OPTIMIZER_EPS = 1e-8            # adam / adamw / rmsprop
+    SGD_MOMENTUM = 0.9              # sgd / rmsprop
+    SGD_NESTEROV = True             # sgd
+    RMSPROP_ALPHA = 0.99            # rmsprop
+    USE_FUSED_OPTIMIZER = True      # tự bỏ qua nếu optimizer không có fused kernel
     GRAD_CLIP_NORM = 1.0
 
     # H100 execution settings
@@ -197,10 +204,17 @@ class Config:
         if cls.AMP_DTYPE != "bfloat16":
             raise ValueError("This H100 pipeline currently supports AMP_DTYPE='bfloat16'")
 
-        if cls.OPTIMIZER.lower() != "adamw":
-            raise ValueError("This training pipeline currently supports OPTIMIZER='adamw'")
+        if cls.OPTIMIZER.lower() not in cls.SUPPORTED_OPTIMIZERS:
+            raise ValueError(
+                f"Unsupported OPTIMIZER '{cls.OPTIMIZER}'. "
+                f"Choose one of: {', '.join(cls.SUPPORTED_OPTIMIZERS)}"
+            )
+
+        if cls.OPTIMIZER.lower() == "sgd" and cls.SGD_NESTEROV and cls.SGD_MOMENTUM <= 0:
+            raise ValueError("SGD_NESTEROV=True requires SGD_MOMENTUM > 0")
         
         print("[OK] Config validated successfully")
         print(f"  Dataset: {cls.DATASET_NAME} (root={cls.DATA_ROOT})")
         print(f"  Number of classes: {cls.get_num_classes()}")
+        print(f"  Optimizer: {cls.OPTIMIZER}")
         print(f"  Models to train: {len(cls.MODELS)}")

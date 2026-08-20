@@ -69,6 +69,10 @@ Mở `config.py`, chỉnh các biến cần thiết:
 | | `DROPOUT_RATE` | Dropout rate cho classifier |
 | **Training** | `BATCH_SIZE`, `NUM_EPOCHS`, `LEARNING_RATE` | Hyperparameters cơ bản |
 | | `WEIGHT_DECAY` | L2 regularization |
+| **Optimizer** | `OPTIMIZER` | `adamw` (mặc định), `adam`, `sgd`, `rmsprop` — hoặc chạy `--optimizer adam` |
+| | `OPTIMIZER_BETAS`, `OPTIMIZER_EPS` | Params cho adam/adamw |
+| | `SGD_MOMENTUM`, `SGD_NESTEROV`, `RMSPROP_ALPHA` | Params cho sgd/rmsprop (`--momentum`, `--no-nesterov`) |
+| | `USE_FUSED_OPTIMIZER` | Fused kernel trên CUDA, tự bỏ qua nếu optimizer không hỗ trợ (`--no-fused-optimizer`) |
 | | `EARLY_STOPPING_PATIENCE` | Dừng sớm nếu val_loss không giảm sau N epochs |
 | **Loss** | `LOSS_FUNCTION` | `'cross_entropy'` hoặc `'poly_focal'` |
 | | `label_smoothing` | Label smoothing (chỉ cho CrossEntropy) |

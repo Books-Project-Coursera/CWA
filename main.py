@@ -160,6 +160,26 @@ def parse_args():
     )
     parser.add_argument("--lr", type=float, help="Override Config.LEARNING_RATE.")
     parser.add_argument("--weight-decay", type=float, help="Override Config.WEIGHT_DECAY.")
+    parser.add_argument(
+        "--optimizer",
+        choices=Config.SUPPORTED_OPTIMIZERS,
+        help="Override Config.OPTIMIZER.",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        help="Override Config.SGD_MOMENTUM (used by sgd and rmsprop).",
+    )
+    parser.add_argument(
+        "--no-nesterov",
+        action="store_true",
+        help="Disable Nesterov momentum for --optimizer sgd.",
+    )
+    parser.add_argument(
+        "--no-fused-optimizer",
+        action="store_true",
+        help="Disable fused optimizer kernels even on CUDA.",
+    )
     parser.add_argument("--cv", action="store_true", help="Enable cross-validation.")
     parser.add_argument("--no-cv", action="store_true", help="Disable cross-validation.")
     parser.add_argument("--cv-splits", type=int, help="Override Config.CV_N_SPLITS.")
@@ -200,6 +220,8 @@ def apply_cli_overrides(args):
         ("RANDOM_SEED", args.seed),
         ("LEARNING_RATE", args.lr),
         ("WEIGHT_DECAY", args.weight_decay),
+        ("OPTIMIZER", args.optimizer),
+        ("SGD_MOMENTUM", args.momentum),
         ("CV_N_SPLITS", args.cv_splits),
     ]
     for attr, value in overrides:
@@ -208,6 +230,12 @@ def apply_cli_overrides(args):
 
     if args.fc_layers is not None:
         Config.CLASSIFIER_CONFIG = args.fc_layers
+
+    if args.no_nesterov:
+        Config.SGD_NESTEROV = False
+
+    if args.no_fused_optimizer:
+        Config.USE_FUSED_OPTIMIZER = False
 
     if args.dataset_stats:
         Config.PRINT_DATASET_STATS = True
@@ -497,10 +525,15 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("gradient_clip_norm", Config.GRAD_CLIP_NORM),
     ]
 
+    is_adam_family = Config.OPTIMIZER.lower() in ("adam", "adamw")
     optimizer_scheduler_rows = [
         ("optimizer", Config.OPTIMIZER),
-        ("optimizer_betas", str(Config.OPTIMIZER_BETAS)),
-        ("optimizer_epsilon", Config.OPTIMIZER_EPS),
+        ("optimizer_betas", str(Config.OPTIMIZER_BETAS) if is_adam_family else "N/A"),
+        ("optimizer_epsilon", Config.OPTIMIZER_EPS if Config.OPTIMIZER.lower() != "sgd" else "N/A"),
+        ("sgd_momentum", Config.SGD_MOMENTUM if not is_adam_family else "N/A"),
+        ("sgd_nesterov", Config.SGD_NESTEROV if Config.OPTIMIZER.lower() == "sgd" else "N/A"),
+        ("rmsprop_alpha", Config.RMSPROP_ALPHA if Config.OPTIMIZER.lower() == "rmsprop" else "N/A"),
+        ("weight_decay_mode", "decoupled (AdamW)" if Config.OPTIMIZER.lower() == "adamw" else "coupled L2"),
         ("fused_optimizer_requested", Config.USE_FUSED_OPTIMIZER),
         ("fused_optimizer_effective", Config.USE_FUSED_OPTIMIZER and cuda_available),
         ("learning_rate", Config.LEARNING_RATE),
