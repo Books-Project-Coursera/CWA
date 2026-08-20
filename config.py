@@ -15,9 +15,9 @@ class Config:
     VALIDATION_RATIO = 0.1  # Stratified holdout from official train: 45,000 / 5,000
         
     # ===================== Training Configuration =====================
-    BATCH_SIZE = 1024               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
+    BATCH_SIZE = 128               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
     NUM_EPOCHS = 60
-    LEARNING_RATE = 2e-4            # THAY ĐỔI: 1e-4 → 2e-4
+    LEARNING_RATE = 1e-4            # THAY ĐỔI: 1e-4 → 2e-4
                                     # Linear scaling rule: LR tỉ lệ với batch size
                                     # 1e-4 × (1200/512) ≈ 2.34e-4, làm tròn xuống 2e-4
                                     # (conservative hơn vì ViT nhạy cảm với LR lớn)
@@ -38,7 +38,7 @@ class Config:
     # Lưu ý: chỉ AdamW dùng decoupled weight decay; adam/sgd/rmsprop dùng L2
     # cổ điển nên cùng WEIGHT_DECAY sẽ KHÔNG cho hiệu quả tương đương.
     SUPPORTED_OPTIMIZERS = ("adamw", "adam", "sgd", "rmsprop")  # khớp với OPTIMIZER_CLASSES trong train.py
-    OPTIMIZER = "adamw"
+    OPTIMIZER = "adam"
     OPTIMIZER_BETAS = (0.9, 0.999)  # adam / adamw
     OPTIMIZER_EPS = 1e-8            # adam / adamw / rmsprop
     SGD_MOMENTUM = 0.9              # sgd / rmsprop
@@ -64,7 +64,7 @@ class Config:
     PRINT_DATASET_STATS = False
     
     # Early Stopping
-    EARLY_STOPPING_PATIENCE = 10
+    EARLY_STOPPING_PATIENCE = 12
     
     # Learning Rate Decay
     LR_DECAY_PATIENCE = 5
