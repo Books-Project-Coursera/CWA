@@ -86,8 +86,7 @@ class Config:
 
     # ===================== Model Configuration =====================
     MODELS = [
-        'vit_base_patch16_224'
-    ]
+    'vgg16']
     PRETRAINED = True
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
