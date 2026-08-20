@@ -5,11 +5,14 @@ import os
 
 class Config:
 
-    # Hugging Face Tiny ImageNet. The official `valid` split is kept as test.
-    DATASET_NAME = "zh-plus/tiny-imagenet"
-    HF_TRAIN_SPLIT = "train"
-    HF_TEST_SPLIT = "valid"
-    VALIDATION_RATIO = 0.1  # Stratified holdout from the official train split
+    # torchvision CIFAR-100. The official `test` split (10,000 images) is kept
+    # untouched as the final test set; validation comes from the official train.
+    DATASET_NAME = "cifar100"
+    DATA_ROOT = "/lustre/fsmisc/dataset"  # torchvision looks for <root>/cifar-100-python
+    DOWNLOAD_DATASET = False              # Dataset is pre-staged on the server
+    OFFICIAL_TRAIN_SPLIT = "train"        # 50,000 images
+    OFFICIAL_TEST_SPLIT = "test"          # 10,000 images, never split
+    VALIDATION_RATIO = 0.1  # Stratified holdout from official train: 45,000 / 5,000
         
     # ===================== Training Configuration =====================
     BATCH_SIZE = 1024               # THAY ĐỔI: 512 → 1200 (H100 có đủ VRAM)
@@ -23,12 +26,15 @@ class Config:
                                     # Batch lớn hơn → ít steps/epoch hơn (90k/1200 = 75 steps)
                                     # so với trước (90k/512 = 175 steps), cần thêm epoch warmup
                                     # để đủ số warmup steps bảo vệ backbone
+                                    # LƯU Ý (CIFAR-100): train pool chỉ 45,000 ảnh →
+                                    # 45k/1024 ≈ 43 steps/epoch, ít hơn Tiny ImageNet.
+                                    # Cân nhắc tăng WARMUP_EPOCHS nếu backbone bị lệch sớm.
     WARMUP_START_FACTOR = 0.01      # Bắt đầu từ LR=2e-6, gentle với pretrained backbone
     ETA_MIN = 1e-6
     SCHEDULER = "linear_warmup_cosine"
 
     # Optimizer
-    OPTIMIZER = "adam"
+    OPTIMIZER = "adamw"
     OPTIMIZER_BETAS = (0.9, 0.999)
     OPTIMIZER_EPS = 1e-8
     USE_FUSED_OPTIMIZER = True
@@ -79,7 +85,7 @@ class Config:
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
     CLASSIFIER_CONFIG = [512,256]       # THAY ĐỔI: [512, 256] → [256]
-                                    # Head [512, 256] quá lớn cho TinyImageNet 200 classes.
+                                    # Head [512, 256] quá lớn cho CIFAR-100 100 classes.
                                     # Head phức tạp → gradient lớn → destabilize backbone.
                                     # [256] đủ capacity mà ít noise hơn khi fine-tune
     DROPOUT_RATE = 0.3
@@ -136,14 +142,25 @@ class Config:
     
     @classmethod
     def get_num_classes(cls):
-        """Return the known number of Tiny ImageNet classes."""
-        return 200
+        """Return the known number of CIFAR-100 (fine label) classes."""
+        return 100
     
     @classmethod
     def validate_config(cls):
         """Validate configuration"""
         if not cls.DATASET_NAME:
             raise ValueError("DATASET_NAME must not be empty")
+
+        if not cls.DATA_ROOT:
+            raise ValueError("DATA_ROOT must not be empty")
+
+        if not cls.DOWNLOAD_DATASET and not os.path.isdir(
+            os.path.join(cls.DATA_ROOT, "cifar-100-python")
+        ):
+            raise ValueError(
+                f"CIFAR-100 not found at {os.path.join(cls.DATA_ROOT, 'cifar-100-python')}. "
+                "Set DATA_ROOT to the folder that contains 'cifar-100-python'."
+            )
 
         if not 0.0 < cls.VALIDATION_RATIO < 1.0:
             raise ValueError("VALIDATION_RATIO must be strictly between 0 and 1")
@@ -184,6 +201,6 @@ class Config:
             raise ValueError("This training pipeline currently supports OPTIMIZER='adamw'")
         
         print("[OK] Config validated successfully")
-        print(f"  Dataset: {cls.DATASET_NAME}")
+        print(f"  Dataset: {cls.DATASET_NAME} (root={cls.DATA_ROOT})")
         print(f"  Number of classes: {cls.get_num_classes()}")
         print(f"  Models to train: {len(cls.MODELS)}")

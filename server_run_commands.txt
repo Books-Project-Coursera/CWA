@@ -1,5 +1,7 @@
 # Server run commands
 # Notes:
+# - Dataset: CIFAR-100 read from Config.DATA_ROOT (/lustre/fsmisc/dataset), never downloaded.
+#   Override with "--data-root /path/that/contains/cifar-100-python" if it moves.
 # - Do not pass --gpu unless you explicitly want to override the scheduler.
 # - Each command runs the default seeds: 1, 10, 100, 500.
 # - Add "--seed 1" or another seed value to run only one seed for testing.

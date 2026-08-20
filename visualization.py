@@ -14,8 +14,8 @@ def print_dataset_statistics(image_data, labels, class_names):
     Print comprehensive dataset statistics including image counts and sizes
     
     Args:
-        image_data: Hugging Face Dataset with an ``image`` column, or a list
-            of image file paths for backward compatibility
+        image_data: Dataset split with an ``image`` column, or a list of
+            image file paths for backward compatibility
         labels: List of corresponding labels
         class_names: List of class names
     """

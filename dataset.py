@@ -1,12 +1,14 @@
-"""Tiny ImageNet loading, preprocessing, and PyTorch DataLoaders."""
+"""CIFAR-100 loading, preprocessing, and PyTorch DataLoaders."""
 
 import random
 
+import numpy as np
 import torch
-from datasets import Dataset as HFDataset
-from datasets import load_dataset as load_hf_dataset
+from PIL import Image
+from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import transforms
+from torchvision.datasets import CIFAR100
 from torchvision.transforms import InterpolationMode
 
 from config import Config
@@ -18,15 +20,66 @@ def worker_init_fn_seed(worker_id):
     random.seed(worker_seed + worker_id)
 
 
-class HFImageDataset(Dataset):
-    def __init__(self, hf_dataset, transform=None):
-        self.dataset = hf_dataset
+class ImageArraySplit:
+    """In-memory image/label split backed by a uint8 numpy array.
+
+    Exposes the small read-only API the rest of the pipeline expects from a
+    split (``len``, ``split["image"]`` / ``split["label"]`` column access,
+    integer indexing, and ``select``) so training, cross-validation and the
+    statistics helpers stay unchanged.
+    """
+
+    def __init__(self, images, labels):
+        self.images = np.asarray(images)
+        self.labels = [int(label) for label in labels]
+        if len(self.images) != len(self.labels):
+            raise ValueError("images and labels must have the same length")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def _to_pil(self, index):
+        return Image.fromarray(self.images[index])
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key == "image":
+                return [self._to_pil(idx) for idx in range(len(self))]
+            if key == "label":
+                return list(self.labels)
+            raise KeyError(f"Unknown column: {key}")
+
+        index = int(key)
+        return {"image": self._to_pil(index), "label": self.labels[index]}
+
+    def select(self, indices):
+        """Return a new split containing only ``indices`` (used by K-Fold CV)."""
+        indices = [int(idx) for idx in indices]
+        return ImageArraySplit(
+            self.images[indices],
+            [self.labels[idx] for idx in indices],
+        )
+
+
+def concatenate_datasets(splits):
+    """Concatenate ``ImageArraySplit`` objects into a single split."""
+    splits = list(splits)
+    if not splits:
+        raise ValueError("concatenate_datasets requires at least one split")
+
+    images = np.concatenate([split.images for split in splits], axis=0)
+    labels = [label for split in splits for label in split.labels]
+    return ImageArraySplit(images, labels)
+
+
+class CachedImageDataset(Dataset):
+    def __init__(self, split, transform=None):
+        self.dataset = split
         self.transform = transform
-        self.labels = [int(label) for label in hf_dataset["label"]]
+        self.labels = [int(label) for label in split["label"]]
         # Cache ảnh dạng PIL vào RAM ngay khi init
         print("Caching images to RAM...")
-        # Tốt hơn nhiều - batch access
-        all_images = hf_dataset["image"]  # Arrow đọc toàn bộ column một lần
+        all_images = split["image"]
         self._cache = [img.convert("RGB") for img in all_images]
     def __len__(self):
         return len(self._cache)
@@ -39,7 +92,11 @@ class HFImageDataset(Dataset):
 
 
 def get_transforms(split="train"):
-    """Build full-image 224px transforms for ImageNet-pretrained models."""
+    """Build full-image 224px transforms for ImageNet-pretrained models.
+
+    CIFAR-100 images are 32x32, so the resize upsamples them to the resolution
+    the pretrained backbones expect.
+    """
     common = [
         transforms.Resize(
             (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
@@ -79,59 +136,66 @@ def get_transforms(split="train"):
     )
 
 
-def load_dataset(dataset_name, val_ratio=0.1, random_seed=42):
-    """Load Tiny ImageNet and reserve the official validation split for testing.
+def load_dataset(dataset_name, val_ratio=0.1, random_seed=42, data_root=None):
+    """Load CIFAR-100 and reserve the official test split for testing.
 
-    The Hugging Face dataset contains 100,000 labelled training images and 10,000
-    labelled validation images. We stratify the official training split into
-    90,000 training and 10,000 validation samples, while leaving the official
-    validation split untouched as the final test set.
+    torchvision ships 50,000 labelled training images and 10,000 labelled test
+    images. We stratify the official training split into 45,000 training and
+    5,000 validation samples, while leaving the official test split untouched
+    as the final test set. The dataset is read from disk only
+    (``download=False``): torchvision expects ``<data_root>/cifar-100-python``.
     """
     if not 0.0 < val_ratio < 1.0:
         raise ValueError("val_ratio must be strictly between 0 and 1")
 
-    print(f"\nLoading Hugging Face dataset: {dataset_name}")
-    dataset = load_hf_dataset(dataset_name)
-
-    required_splits = {Config.HF_TRAIN_SPLIT, Config.HF_TEST_SPLIT}
-    missing_splits = required_splits.difference(dataset.keys())
-    if missing_splits:
+    normalized_name = dataset_name.lower().replace("-", "").replace("_", "")
+    if normalized_name != "cifar100":
         raise ValueError(
-            f"Dataset is missing required split(s): {sorted(missing_splits)}"
+            f"This pipeline is configured for CIFAR-100, got '{dataset_name}'"
         )
 
-    official_train = dataset[Config.HF_TRAIN_SPLIT]
-    official_test = dataset[Config.HF_TEST_SPLIT]
-    required_columns = {"image", "label"}
-    for split_name, split_dataset in (
-        (Config.HF_TRAIN_SPLIT, official_train),
-        (Config.HF_TEST_SPLIT, official_test),
-    ):
-        missing_columns = required_columns.difference(split_dataset.column_names)
-        if missing_columns:
-            raise ValueError(
-                f"Split '{split_name}' is missing column(s): {sorted(missing_columns)}"
-            )
-
-    split = official_train.train_test_split(
-        test_size=val_ratio,
-        stratify_by_column="label",
-        seed=random_seed,
+    root = data_root or Config.DATA_ROOT
+    print(f"\nLoading torchvision CIFAR-100 from: {root}")
+    official_train = CIFAR100(
+        root=root, train=True, download=Config.DOWNLOAD_DATASET
     )
-    train_data = split["train"]
-    val_data = split["test"]
-    test_data = official_test
+    official_test = CIFAR100(
+        root=root, train=False, download=Config.DOWNLOAD_DATASET
+    )
 
-    label_feature = official_train.features["label"]
-    class_names = list(label_feature.names)
-    train_labels = [int(label) for label in train_data["label"]]
-    val_labels = [int(label) for label in val_data["label"]]
-    test_labels = [int(label) for label in test_data["label"]]
+    class_names = list(official_train.classes)
+    official_train_labels = [int(label) for label in official_train.targets]
+    test_labels = [int(label) for label in official_test.targets]
+
+    # Fixed, stratified holdout so every seed/model sees the same 45k/5k split
+    # for a given random_seed.
+    train_idx, val_idx = train_test_split(
+        np.arange(len(official_train_labels)),
+        test_size=val_ratio,
+        stratify=official_train_labels,
+        random_state=random_seed,
+        shuffle=True,
+    )
+    train_idx = np.sort(train_idx)
+    val_idx = np.sort(val_idx)
+
+    train_data = ImageArraySplit(
+        official_train.data[train_idx],
+        [official_train_labels[idx] for idx in train_idx],
+    )
+    val_data = ImageArraySplit(
+        official_train.data[val_idx],
+        [official_train_labels[idx] for idx in val_idx],
+    )
+    test_data = ImageArraySplit(official_test.data, test_labels)
+
+    train_labels = list(train_data.labels)
+    val_labels = list(val_data.labels)
 
     print("\nDataset split (stratified):")
     print(f"  Train: {len(train_data):,} images")
     print(f"  Val:   {len(val_data):,} images (from official train)")
-    print(f"  Test:  {len(test_data):,} images (official valid, held out)")
+    print(f"  Test:  {len(test_data):,} images (official test, held out)")
     print(f"  Classes: {len(class_names)}")
     print(f"  Random seed: {random_seed}")
 
@@ -156,10 +220,10 @@ def create_dataloaders(
     batch_size,
     num_workers=4,
 ):
-    """Create reproducible PyTorch DataLoaders from Hugging Face splits."""
-    train_dataset = HFImageDataset(train_data, transform=get_transforms("train"))
-    val_dataset = HFImageDataset(val_data, transform=get_transforms("val"))
-    test_dataset = HFImageDataset(test_data, transform=get_transforms("test"))
+    """Create reproducible PyTorch DataLoaders from the CIFAR-100 splits."""
+    train_dataset = CachedImageDataset(train_data, transform=get_transforms("train"))
+    val_dataset = CachedImageDataset(val_data, transform=get_transforms("val"))
+    test_dataset = CachedImageDataset(test_data, transform=get_transforms("test"))
 
     sampler = None
     use_shuffle = True

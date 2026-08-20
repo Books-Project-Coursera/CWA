@@ -574,7 +574,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
 if __name__ == "__main__":
     # Test training
     from config import Config
-    from datasets import concatenate_datasets
+    from dataset import concatenate_datasets
     
     Config.validate_config()
     

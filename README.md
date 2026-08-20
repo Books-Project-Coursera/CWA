@@ -2,6 +2,10 @@
 
 Pipeline tự động train & evaluate pretrained models cho bài toán image classification.
 
+**Dataset: CIFAR-100** (`torchvision.datasets.CIFAR100`, `download=False`).
+Official train 50,000 ảnh được chia stratified thành **45,000 train / 5,000 validation**;
+official test **10,000 ảnh giữ nguyên**, chỉ dùng làm test set cuối cùng.
+
 ## Cấu trúc Project
 
 ```
@@ -57,8 +61,9 @@ Mở `config.py`, chỉnh các biến cần thiết:
 
 | Nhóm | Biến quan trọng | Mô tả |
 |------|-----------------|-------|
-| **Dataset** | `DATASET_NAME` | Hugging Face dataset ID, mặc định `zh-plus/tiny-imagenet` |
-| | `VALIDATION_RATIO` | Tỉ lệ validation lấy stratified từ official train (mặc định 0.1) |
+| **Dataset** | `DATA_ROOT` | Thư mục chứa `cifar-100-python`, mặc định `/lustre/fsmisc/dataset` |
+| | `DOWNLOAD_DATASET` | `False` — dataset đã có sẵn trên server, không tải lại |
+| | `VALIDATION_RATIO` | Tỉ lệ validation lấy stratified từ official train (mặc định 0.1 → 45,000 train / 5,000 val) |
 | **Model** | `MODELS` | List model cần train (comment/uncomment để chọn) |
 | | `CLASSIFIER_CONFIG` | Hidden layers của classifier head, VD: `[512]` |
 | | `DROPOUT_RATE` | Dropout rate cho classifier |
@@ -122,7 +127,7 @@ Kết quả bao gồm cả **per-class breakdown** (Precision, Recall, F1, Speci
 ## Reproduce kết quả
 
 1. Set `RANDOM_SEED = 42` (mặc định) — đảm bảo cùng data split, cùng weight init
-2. Kiểm tra `DATASET_NAME` (dataset sẽ tự tải/cache qua Hugging Face)
+2. Kiểm tra `DATA_ROOT` (torchvision đọc `<DATA_ROOT>/cifar-100-python`, `download=False`)
 3. Chọn model trong `MODELS`
 4. Chạy `python main.py`
 
@@ -262,7 +267,7 @@ Code này được thiết kế để:
 - Export kết quả professional
 - Tái sử dụng cho nhiều experiments
 
-Chỉ cần kiểm tra `DATASET_NAME` trong `config.py` và chạy `python main.py`!
+Chỉ cần kiểm tra `DATA_ROOT` trong `config.py` và chạy `python main.py`!
 
 ## 📝 Citation
 
@@ -275,8 +280,8 @@ Nếu sử dụng code này cho research, vui lòng ghi nguồn phù hợp.
 - Giảm `NUM_WORKERS`
 
 ### Lỗi không tìm thấy dataset:
-- Kiểm tra `DATASET_NAME` và kết nối/cache Hugging Face
-- Đảm bảo folder structure đúng format (classes trong subfolder)
+- Kiểm tra `DATA_ROOT` phải là thư mục **cha** của `cifar-100-python`
+- Có thể override khi chạy: `python main.py --data-root /lustre/fsmisc/dataset`
 
 ### Model không train:
 - Kiểm tra GPU/CUDA availability

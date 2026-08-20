@@ -29,11 +29,10 @@ import torch
 import numpy as np
 import pandas as pd
 from datetime import datetime
-from datasets import concatenate_datasets
 from sklearn.model_selection import StratifiedKFold
 
 from config import Config
-from dataset import load_dataset, create_dataloaders
+from dataset import load_dataset, create_dataloaders, concatenate_datasets
 from train import train_model, CheckpointManager
 from evaluate import evaluate_all_strategies, export_results_to_excel, create_performance_charts, save_confusion_matrices
 from visualization import print_dataset_statistics
@@ -109,10 +108,13 @@ def parse_args():
         help="Model(s) to run. Use a space-separated list, comma-separated list, or 'all'.",
     )
     parser.add_argument(
-        "--dataset-name",
+        "--data-root",
         "--dataset-path",
-        dest="dataset_name",
-        help="Hugging Face dataset identifier. Overrides Config.DATASET_NAME.",
+        dest="data_root",
+        help=(
+            "Folder that contains 'cifar-100-python'. Overrides Config.DATA_ROOT. "
+            "The dataset is never downloaded."
+        ),
     )
     parser.add_argument("--results-dir", "--output-dir", dest="results_dir", help="Base directory for run outputs.")
     parser.add_argument(
@@ -184,7 +186,7 @@ def apply_cli_overrides(args):
         Config.MODELS = models
 
     overrides = [
-        ("DATASET_NAME", args.dataset_name),
+        ("DATA_ROOT", args.data_root),
         ("RESULTS_DIR", args.results_dir),
         ("CHECKPOINTS_DIR", args.checkpoints_dir),
         ("BATCH_SIZE", args.batch_size),
@@ -425,7 +427,6 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         train_count, val_count, test_count: Số lượng ảnh mỗi split
     """
     import platform
-    import datasets as hf_datasets
     import timm
     import torchvision
 
@@ -459,8 +460,10 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
 
     dataset_rows = [
         ("dataset_name", Config.DATASET_NAME),
-        ("official_train_split", Config.HF_TRAIN_SPLIT),
-        ("official_test_split", Config.HF_TEST_SPLIT),
+        ("data_root", Config.DATA_ROOT),
+        ("dataset_source", "torchvision.datasets.CIFAR100 (download=False)"),
+        ("official_train_split", Config.OFFICIAL_TRAIN_SPLIT),
+        ("official_test_split", Config.OFFICIAL_TEST_SPLIT),
         ("num_classes", num_classes),
         ("class_names", ", ".join(class_names) if class_names else ""),
         ("validation_ratio_from_official_train", Config.VALIDATION_RATIO),
@@ -553,7 +556,7 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("use_cross_validation", Config.USE_CROSS_VALIDATION),
         ("cv_n_splits", Config.CV_N_SPLITS if Config.USE_CROSS_VALIDATION else 0),
         ("cv_pool", "official train only" if Config.USE_CROSS_VALIDATION else "N/A"),
-        ("external_test", f"official {Config.HF_TEST_SPLIT}"),
+        ("external_test", f"official {Config.OFFICIAL_TEST_SPLIT}"),
     ]
 
     eval_rows = [
@@ -577,7 +580,6 @@ def export_run_config(run_folder, num_classes=None, class_names=None,
         ("torch_version", torch.__version__),
         ("torchvision_version", torchvision.__version__),
         ("timm_version", timm.__version__),
-        ("datasets_version", hf_datasets.__version__),
         ("cuda_available", cuda_available),
         ("cuda_runtime_version", torch.version.cuda or "N/A"),
         ("cudnn_version", torch.backends.cudnn.version() or "N/A"),
@@ -738,7 +740,7 @@ def main():
         all_labels = train_labels + val_labels
         
         print(f"  CV pool: {len(all_data)} official-train images")
-        print(f"  External test: {len(test_data)} official-valid images")
+        print(f"  External test: {len(test_data)} official-test images")
         
         skf = StratifiedKFold(
             n_splits=Config.CV_N_SPLITS, 

@@ -1,26 +1,35 @@
-"""Validate that all cached Hugging Face Tiny ImageNet images can be decoded."""
+"""Validate that the on-disk CIFAR-100 splits can be read and decoded."""
 
 from collections import Counter
 
-from datasets import load_dataset as load_hf_dataset
+from torchvision.datasets import CIFAR100
 from tqdm import tqdm
 
 from config import Config
 
 
-def check_dataset(dataset_name):
+def check_dataset(data_root=None):
     """Decode every image and report split/class/size consistency."""
-    dataset = load_hf_dataset(dataset_name)
+    root = data_root or Config.DATA_ROOT
     failures = []
 
-    for split_name in (Config.HF_TRAIN_SPLIT, Config.HF_TEST_SPLIT):
-        split = dataset[split_name]
-        label_counts = Counter(int(label) for label in split["label"])
+    splits = {
+        Config.OFFICIAL_TRAIN_SPLIT: CIFAR100(
+            root=root, train=True, download=Config.DOWNLOAD_DATASET
+        ),
+        Config.OFFICIAL_TEST_SPLIT: CIFAR100(
+            root=root, train=False, download=Config.DOWNLOAD_DATASET
+        ),
+    }
+
+    for split_name, split in splits.items():
+        label_counts = Counter(int(label) for label in split.targets)
         image_sizes = Counter()
 
         for idx in tqdm(range(len(split)), desc=f"Checking {split_name}"):
             try:
-                image = split[idx]["image"].convert("RGB")
+                image, _ = split[idx]
+                image = image.convert("RGB")
                 image.load()
                 image_sizes[image.size] += 1
             except Exception as exc:
@@ -42,4 +51,4 @@ def check_dataset(dataset_name):
 
 if __name__ == "__main__":
     Config.validate_config()
-    check_dataset(Config.DATASET_NAME)
+    check_dataset(Config.DATA_ROOT)
