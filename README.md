@@ -1,189 +1,307 @@
-# AgriKD: Cross-Architecture Knowledge Distillation for Efficient Leaf Disease Classification
+# Baseline Research - Pretrained Models Evaluation
 
-> Official implementation of the paper **"AgriKD: Cross-Architecture Knowledge Distillation for Efficient Leaf Disease Classification"**
+Pipeline tự động train & evaluate pretrained models cho bài toán image classification.
 
----
+**Dataset: CIFAR-100** (`torchvision.datasets.CIFAR100`, `download=False`).
+Official train 50,000 ảnh được chia stratified thành **45,000 train / 5,000 validation**;
+official test **10,000 ảnh giữ nguyên**, chỉ dùng làm test set cuối cùng.
 
-## Baseline Model Selection
-
-Before distillation, candidate teacher and student architectures were benchmarked on each dataset. That pipeline is available on a dedicated branch of this repository:
-
-**[`baseline/teacher-student-selection`](../../tree/baseline/teacher-student-selection)** — benchmarks pretrained models (ViT, ResNet, MobileNet, EfficientNet, …) and exports F1/accuracy/AUC results to Excel.
-
-The experiments there led to selecting **ViT-B/16 as the teacher** and **truncated MobileNetV2 (Bottleneck 1–5) as the student** for AgriKD.
-
----
-
-## Overview
-
-AgriKD adapts cross-architecture knowledge distillation (Liu et al., 2022) for agricultural leaf disease diagnosis. A large **ViT-B/16 teacher** transfers rich global attention knowledge to a lightweight **truncated MobileNetV2 student** via two trainable projectors, enabling high-accuracy inference at a fraction of the teacher's computational cost.
-
-The student retains only Bottleneck stages 1–5 (output: 14 × 14 × 96), making it suitable for edge deployment while achieving competitive classification performance through five complementary supervision signals.
-
----
-
-## Pipeline
-
-![AgriKD Pipeline](assets/pipeline.png)
-
-
-
-The distillation framework comprises:
-
-| Component | Role |
-|---|---|
-| **Teacher** ViT-B/16 | Frozen; provides QKV attention maps, CLS token features, and soft logits |
-| **Student** Truncated MobileNetV2 | Trained end-to-end; Bottleneck 1–5, 14×14×96 output |
-| **Projector 1** — PCAttentionProjector | Maps student features → teacher attention space (L_proj1) |
-| **Projector 2** — GWLinearProjector | Maps student features → teacher feature space pixel-by-pixel (L_proj2) |
-| **L_KL** | Hinton KD logits distillation at temperature T |
-| **L_Rel** | DIST relational loss |
-| **L_CE** | Cross-entropy with label smoothing |
-
----
-
-## Loss Function
-
-The total training objective is:
-
-$$\mathcal{L} = \lambda_{CE}\,\mathcal{L}_{CE} + \lambda_{proj1}\,\mathcal{L}_{proj1} + \lambda_{proj2}\,\mathcal{L}_{proj2} + \lambda_{KL}\,\mathcal{L}_{KL} + \lambda_{Rel}\,\mathcal{L}_{Rel}$$
-
-### Loss Weight Initialisation
-
-Dataset-specific λ values are computed via a **heuristic single-loss evaluation** (§ Loss Weight Initialisation in the paper). Each loss component is trained in isolation on 70 % of the data and evaluated on a fixed 15 % held-out validation set (the 15 % test set is never touched). Contribution F1-scores are then normalised to produce the final λ coefficients.
-
-Across all three evaluated datasets, **L_KL and L_Rel consistently receive the largest weights (λ ≈ 0.30–0.33)**, while the two projection losses receive auxiliary weights (λ ≈ 0.01–0.06).
-
-To run the heuristic weight initialisation:
-
-```python
-# config.py
-HEURISTIC_WEIGHT_INIT_MODE = True
-```
-
-Results are exported to `checkpoints/ablation_weight_summary.xlsx`.
-
----
-
-## Repository Structure
+## Cấu trúc Project
 
 ```
-Capstone_KD/
-├── config.py                  # All hyperparameters — edit here
-├── main.py                    # Training pipeline + heuristic weight init
-├── dataset.py                 # DatasetHandler with stratified CV splits
-├── Teacher_extraction.py      # ViT-B/16 feature & QKV extractor
-├── Student_extraction.py      # Truncated MobileNetV2 backbone
-├── PCA_projector.py           # Partially Cross-Attention Projector (Proj1)
-├── GWLinear_projector.py      # Group-Wise Linear Projector (Proj2)
-├── loss_functions.py          # ProjectionLoss, LogitsKDLoss, DIST, FocalLoss
-├── visualization.py           # Training curve plots
-├── compared_projectors.py     # Projector comparison utilities
-└── requirements.txt
+├── config.py          # Toàn bộ cấu hình (dataset, training, loss, sampler, CV, ...)
+├── main.py            # Main pipeline - chạy file này
+├── train.py           # Training loop, early stopping, checkpoint management
+├── evaluate.py        # 2 chiến thuật đánh giá + export Excel
+├── models.py          # Pretrained models với custom classifier head
+├── dataset.py         # Data loading, augmentation, WeightedRandomSampler
+├── losses.py          # PolyFocalLoss + class weight computation
+├── visualization.py   # Training curves, dataset statistics
+├── requirements.txt   # Dependencies
+└── results/           # Kết quả tự động lưu theo từng lần chạy (results/1/, results/2/, ...)
 ```
 
----
-
-## Installation
+## Cài đặt
 
 ```bash
 pip install -r requirements.txt
 ```
 
-**Key dependencies:** PyTorch ≥ 2.0, torchvision, timm, scikit-learn, openpyxl, pandas, matplotlib
-
----
-
-## Reproducibility
-
-### 1. Prepare the dataset
-
-Organise images in `ImageFolder` format:
-
-```
-data/
-└── ProcessedOriginal/
-    ├── class_0/
-    ├── class_1/
-    └── ...
-```
-
-### 2. Configure
-
-Edit `config.py`:
-
-```python
-DATA_DIR           = "/path/to/ProcessedOriginal"
-TEACHER_CHECKPOINT = "/path/to/teacher.pth"
-NUM_CLASSES        = 5          # adjust per dataset
-RANDOM_SEED        = 42
-```
-
-### 3. (Optional) Heuristic Loss Weight Initialisation
-
-```python
-HEURISTIC_WEIGHT_INIT_MODE = True   # runs 5 single-loss experiments
-```
-
-```bash
-python main.py
-# Outputs: checkpoints/ablation_weight_summary.xlsx
-```
-
-Copy the resulting λ values into `config.py` and set `HEURISTIC_WEIGHT_INIT_MODE = False`.
-
-### 4. Train (single split)
-
-```python
-USE_CROSS_VALIDATION = False
-```
+## Cách chạy
 
 ```bash
 python main.py
 ```
 
-### 5. Train (5-fold cross-validation)
-
-```python
-USE_CROSS_VALIDATION = True
-CV_N_SPLITS          = 5
-# For per-fold teacher checkpoints (imbalanced datasets):
-# CV_TEACHER_CHECKPOINTS = ["/fold1.pth", ..., "/fold5.pth"]
-```
+CLI overrides are available, so you do not need to edit `config.py` for every server run:
 
 ```bash
-python main.py
-# Outputs: checkpoints/run_N/cv_summary_results.xlsx
+python main.py --model resnet18 --run-name resnet18
+python main.py --model resnet18 --seed 100 --run-name resnet18_seed100
+python main.py --model vit_base --batch-size 64 --epochs 50 --lr 2e-5 --fc-layers 256 128 --dropout 0.5
+python main.py --model resnet18,densenet121 --results-dir /scratch/$USER/potato_results
 ```
 
----
+`argparse` is part of the Python standard library, so no extra package is needed in `requirements.txt`.
 
-## Results
+For concurrent terminals, every run creates an isolated folder under `results/` (or `--results-dir`). Training checkpoints are also isolated per run, so two terminals running the same model will not overwrite each other.
 
-> Detailed per-dataset results and λ weight tables are reported in the paper.
+By default, `python main.py --model <name>` runs the configured seeds `1, 10, 100, 500` sequentially. Use `--seed <value>` to run only one seed in a terminal.
 
-Key findings:
-- L_KL and L_Rel dominate across all datasets (λ ≈ 0.30–0.33), confirming their role as primary distillation objectives.
-- L_proj1 and L_proj2 act as auxiliary feature-alignment terms (λ ≈ 0.01–0.06).
-- AgriKD achieves competitive F1 scores with a student model significantly smaller than the ViT-B/16 teacher.
+Pipeline tự động: Validate config → Load dataset → Train từng model → Evaluate 2 strategies → Export Excel + Charts.
 
----
+Kết quả mỗi lần chạy lưu riêng tại `results/<run_number>/` gồm:
+- `run_config.xlsx` — toàn bộ config của lần chạy
+- `all_models_results.xlsx` — bảng so sánh tất cả model
+- `<model_name>/` — kết quả chi tiết, confusion matrix, training curves
 
-## Configuration Reference
+## Cấu hình (`config.py`)
 
-| Parameter | Default | Description |
-|---|---|---|
-| `TEACHER_CHECKPOINT` | — | Path to pre-trained ViT-B/16 weights |
-| `EPOCHS` | 150 | Total training epochs |
-| `LR_STUDENT` | 5e-3 | Initial student learning rate |
-| `TEMPERATURE` | 4.0 | Hinton KD temperature |
-| `LAMBDA_CE / PROJ1 / PROJ2 / LOGITS / DIST` | 1.0 | Loss weights λ₁…λ₅ |
-| `USE_CROSS_VALIDATION` | False | Enable 5-fold stratified CV |
-| `CV_TEACHER_CHECKPOINTS` | None | Per-fold teacher paths (imbalanced data) |
-| `USE_WEIGHTED_SAMPLER` | False | Inverse-frequency weighted sampling |
-| `USE_FOCAL_LOSS` | False | PolyFocalLoss instead of CE |
-| `HEURISTIC_WEIGHT_INIT_MODE` | False | Run λ heuristic initialisation experiments |
+Mở `config.py`, chỉnh các biến cần thiết:
 
+| Nhóm | Biến quan trọng | Mô tả |
+|------|-----------------|-------|
+| **Dataset** | `DATA_ROOT` | Thư mục chứa `cifar-100-python`, mặc định `/lustre/fsmisc/dataset` |
+| | `DOWNLOAD_DATASET` | `False` — dataset đã có sẵn trên server, không tải lại |
+| | `VALIDATION_RATIO` | Tỉ lệ validation lấy stratified từ official train (mặc định 0.1 → 45,000 train / 5,000 val) |
+| **Model** | `MODELS` | List model cần train (comment/uncomment để chọn) |
+| | `CLASSIFIER_CONFIG` | Hidden layers của classifier head, VD: `[512]` |
+| | `DROPOUT_RATE` | Dropout rate cho classifier |
+| **Training** | `BATCH_SIZE`, `NUM_EPOCHS`, `LEARNING_RATE` | Hyperparameters cơ bản |
+| | `WEIGHT_DECAY` | L2 regularization |
+| **Optimizer** | `OPTIMIZER` | `adamw` (mặc định), `adam`, `sgd`, `rmsprop` — hoặc chạy `--optimizer adam` |
+| | `OPTIMIZER_BETAS`, `OPTIMIZER_EPS` | Params cho adam/adamw |
+| | `SGD_MOMENTUM`, `SGD_NESTEROV`, `RMSPROP_ALPHA` | Params cho sgd/rmsprop (`--momentum`, `--no-nesterov`) |
+| | `USE_FUSED_OPTIMIZER` | Fused kernel trên CUDA, tự bỏ qua nếu optimizer không hỗ trợ (`--no-fused-optimizer`) |
+| | `EARLY_STOPPING_PATIENCE` | Dừng sớm nếu val_loss không giảm sau N epochs |
+| **Loss** | `LOSS_FUNCTION` | `'cross_entropy'` hoặc `'poly_focal'` |
+| | `label_smoothing` | Label smoothing (chỉ cho CrossEntropy) |
+| | `FOCAL_GAMMA`, `POLY_EPSILON` | Params cho PolyFocalLoss |
+| **Sampler** | `USE_WEIGHTED_SAMPLER` | `True/False` — bật WeightedRandomSampler xử lý class imbalance |
+| **Cross-Val** | `USE_CROSS_VALIDATION` | `True/False` — bật Stratified K-Fold CV |
+| | `CV_N_SPLITS` | Số fold (mặc định 5) |
+| **Output** | `AUTO_DELETE_CHECKPOINTS` | Tự xóa checkpoints sau evaluate để tiết kiệm disk |
 
+## Models hỗ trợ
 
+Uncomment trong `Config.MODELS`:
 
+```python
+MODELS = [
+    'vgg16',
+    'resnet18',
+    'resnet101',
+    'mobilenet_v2',
+    'densenet121',
+    'efficientnet_b0',
+    'vit_base_patch16_224',
+]
+```
+
+## 2 Chiến thuật Đánh giá
+
+| Strategy | Mô tả |
+|----------|-------|
+| **Strategy 1 — Best Checkpoint** | Checkpoint có val_loss thấp nhất (tie → chọn epoch mới hơn) |
+| **Strategy 2 — Top-K Average** | Trung bình weights của K checkpoint tốt nhất **trong candidate pool** (K = 2,3,4,5) |
+
+### Candidate pool của Strategy 2
+
+Pool chỉ nhận những epoch **phá kỷ lục val_loss** (best-so-far) tại thời điểm nó xuất hiện:
+
+- `val_loss < best-so-far` → epoch được **thêm** vào pool, counter reset.
+- `val_loss == best-so-far` → **thay thế** epoch đang giữ kỷ lục bằng epoch mới (epoch sau hội tụ hơn), counter reset.
+- `val_loss > best-so-far` → không vào pool, counter tăng. Khi counter chạm `STRATEGY2_POOL_PATIENCE`
+  (mặc định 10) thì pool bị **khóa vĩnh viễn** — mọi epoch sau đó bị loại, kể cả khi val_loss thấp hơn.
+
+Nhờ vậy một epoch chỉ tình cờ thấp hơn vài epoch cũ (nhưng chưa từng phá kỷ lục) sẽ không bao giờ
+lọt vào top-K. Checkpoint của mọi epoch trong pool luôn được giữ trên đĩa, không bị cleanup xóa.
+
+## Cross-Validation
+
+Khi `USE_CROSS_VALIDATION = True`:
+- Data `train + val` gộp thành CV pool
+- `test` giữ nguyên làm hold-out
+- Dùng `StratifiedKFold` (sklearn) chia K fold, giữ tỉ lệ class
+- Kết quả cuối: **mean ± std** qua K fold → lưu vào `cv_summary_results.xlsx`
+
+## Metrics
+
+Tất cả metrics dùng **Macro averaging** (trung bình đều giữa các class):
+
+| Metric | Cách tính |
+|--------|-----------|
+| Accuracy | Overall correct / total |
+| Precision | Macro average |
+| Recall | Macro average |
+| F1-Score | Macro average |
+| AUC | Macro average, one-vs-rest |
+
+Kết quả bao gồm cả **per-class breakdown** (Precision, Recall, F1, Specificity, AUC, Support).
+
+## Reproduce kết quả
+
+1. Set `RANDOM_SEED = 42` (mặc định) — đảm bảo cùng data split, cùng weight init
+2. Kiểm tra `DATA_ROOT` (torchvision đọc `<DATA_ROOT>/cifar-100-python`, `download=False`)
+3. Chọn model trong `MODELS`
+4. Chạy `python main.py`
+
+Seed cố định cho: `random`, `numpy`, `torch`, `CUDA`. Thêm `--deterministic` nếu cần bật deterministic CUDA/cuBLAS.
+
+## Ghi chú
+
+- **WRS + Focal Loss đồng thời**: Không lỗi code, nhưng có thể double-correct class imbalance. Cân nhắc chỉ bật 1 trong 2.
+- **LR Scheduler**: Linear Warmup → Cosine Annealing
+- **Data Augmentation** (chỉ train): resize bicubic 224, horizontal flip,
+  Mixup/CutMix kiểu DeiT và Random Erasing
+
+## 💾 Checkpoints
+
+Training checkpoints are temporary by default. They are written during training/evaluation, then deleted after evaluation because `AUTO_DELETE_CHECKPOINTS=True`. Strategy checkpoints are not saved because `SAVE_STRATEGY_CHECKPOINTS=False`.
+
+```
+results/<run_number>/
+├── training_checkpoints/
+│   └── <model_name>/
+│       ├── epoch_001_val_loss_0.xxxx.pth
+│       ├── best_checkpoint.pth
+│       └── checkpoint_info.json
+└── <model_name>/
+    ├── checkpoints/
+    ├── training_curves/
+    └── <model_name>_results.xlsx
+```
+
+If you pass `--checkpoints-dir /scratch/...`, the code still creates a per-run subfolder inside that directory. Use `--keep-checkpoints` only when you explicitly need checkpoint files for later debugging.
+
+## 🔧 Tùy chỉnh
+
+### Thay đổi learning rate decay:
+
+Trong `config.py`:
+
+```python
+LR_DECAY_PATIENCE = 5  # Giảm LR sau 5 epochs val_loss không cải thiện
+LR_DECAY_FACTOR = 0.5  # Nhân LR với 0.5
+```
+
+### Thay đổi custom classifier:
+
+Trong `config.py`:
+
+```python
+CLASSIFIER_CONFIG = [256, 128, 64]  # 3 hidden layers
+DROPOUT_RATE = 0.5
+```
+
+### Thay đổi data augmentation:
+
+Trong `dataset.py`, function `get_transforms()`:
+
+```python
+transform = transforms.Compose([
+    transforms.Resize(
+        (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+        interpolation=InterpolationMode.BICUBIC,
+    ),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    transforms.RandomErasing(p=0.25),
+])
+```
+
+### Thêm/bớt models:
+
+Trong `config.py`:
+
+```python
+MODELS = [
+    'vgg16',
+    'resnet101',
+    # Thêm/bớt models ở đây
+]
+```
+
+## High-Compute Server Notes
+
+Run one model per terminal or one model per scheduler job:
+
+```bash
+python main.py --model resnet18 --run-name resnet18
+python main.py --model densenet121 --run-name densenet121
+python main.py --model vit_base_patch16_224 --run-name vit_b16
+```
+
+On SLURM-style systems, prefer the scheduler GPU assignment:
+
+```bash
+srun --gres=gpu:1 --cpus-per-task=8 python main.py --model resnet18 --num-workers 8 --results-dir $SCRATCH/potato_results
+```
+
+Use `--deterministic` only when exact reproducibility is more important than speed. That flag sets `CUBLAS_WORKSPACE_CONFIG`; without it, the code uses faster cuDNN benchmarking. There is no separate `culabs` package to install.
+
+## H100 profile
+
+The default profile targets one H100:
+
+- batch 512 for training, validation, and testing;
+- BF16 autocast, fused AdamW, and `torch.compile(mode="max-autotune")`;
+- 16 DataLoader workers with pinned memory and persistent workers;
+- learning rate 5e-5 at batch 512, automatically scaled with batch size;
+- linear warmup for 5 epochs followed by cosine decay to 1e-6.
+
+Run the default batch-512 profile:
+
+```bash
+python main.py --model vit_base_patch16_224 --seed 1
+```
+
+Run batch 1024; LR is automatically scaled to 1e-4 unless `--lr` is given:
+
+```bash
+python main.py --model vit_base_patch16_224 --seed 1 --batch-size 1024
+```
+
+Every run writes dataset, model, optimizer, scheduler, augmentation, precision,
+DataLoader, evaluation, and runtime environment settings to `run_config.xlsx`.
+
+## 📋 Requirements
+
+- Python >= 3.8
+- PyTorch >= 2.0.0
+- CUDA (recommended) hoặc CPU
+- RAM: >= 8GB
+- GPU: >= 6GB VRAM (recommended)
+
+## 🎓 Sử dụng cho Research
+
+Code này được thiết kế để:
+- Dễ dàng thay đổi dataset
+- Tự động hóa toàn bộ pipeline
+- Export kết quả professional
+- Tái sử dụng cho nhiều experiments
+
+Chỉ cần kiểm tra `DATA_ROOT` trong `config.py` và chạy `python main.py`!
+
+## 📝 Citation
+
+Nếu sử dụng code này cho research, vui lòng ghi nguồn phù hợp.
+
+## 🐛 Troubleshooting
+
+### Lỗi out of memory:
+- Giảm `BATCH_SIZE` trong `config.py`
+- Giảm `NUM_WORKERS`
+
+### Lỗi không tìm thấy dataset:
+- Kiểm tra `DATA_ROOT` phải là thư mục **cha** của `cifar-100-python`
+- Có thể override khi chạy: `python main.py --data-root /lustre/fsmisc/dataset`
+
+### Model không train:
+- Kiểm tra GPU/CUDA availability
+- Kiểm tra dependencies đã cài đủ chưa
+
+## 📧 Support
+
+Nếu có vấn đề, vui lòng mở issue hoặc liên hệ.

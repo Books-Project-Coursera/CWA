@@ -1,9 +1,32 @@
-# Ignore all .pth files everywhere in the repo
-*.pth
-
-# Ignore the checkpoints directory
-checkpoints/
-
-# Ignore Python cache
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Dataset
+MorningaLeaf_Dataset/
+TomatoDataset/
+dataset/
+*.zip
+
+# Results
+checkpoints/
+# results/
+
+# Document
+Document/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

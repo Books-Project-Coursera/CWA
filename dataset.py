@@ -1,329 +1,307 @@
-import torch
-from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
-from torchvision import transforms
-from torchvision.datasets import ImageFolder
-from sklearn.model_selection import train_test_split
-import numpy as np
+"""CIFAR-100 loading, preprocessing, and PyTorch DataLoaders."""
+
 import random
-import os
 
-# =========================
-# GLOBAL SEED FUNCTION
-# =========================
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
-    
-    # Deterministic settings
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    
-    # Chỉ bật nếu CUDA hỗ trợ
-    try:
-        torch.use_deterministic_algorithms(True)
-    except Exception:
-        pass
+import numpy as np
+import torch
+from PIL import Image
+from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
+from torchvision import transforms
+from torchvision.datasets import CIFAR100
+from torchvision.transforms import InterpolationMode
 
-# =========================
-# WORKER SEED FUNCTION
-# =========================
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+from config import Config
 
-class DatasetHandler:
+
+def worker_init_fn_seed(worker_id):
+    """Seed Python's RNG independently in every DataLoader worker."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed + worker_id)
+
+
+class ImageArraySplit:
+    """In-memory image/label split backed by a uint8 numpy array.
+
+    Exposes the small read-only API the rest of the pipeline expects from a
+    split (``len``, ``split["image"]`` / ``split["label"]`` column access,
+    integer indexing, and ``select``) so training, cross-validation and the
+    statistics helpers stay unchanged.
     """
-    Handle dataset loading, augmentation, and splitting (70/15/15)
+
+    def __init__(self, images, labels):
+        self.images = np.asarray(images)
+        self.labels = [int(label) for label in labels]
+        if len(self.images) != len(self.labels):
+            raise ValueError("images and labels must have the same length")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def _to_pil(self, index):
+        return Image.fromarray(self.images[index])
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key == "image":
+                return [self._to_pil(idx) for idx in range(len(self))]
+            if key == "label":
+                return list(self.labels)
+            raise KeyError(f"Unknown column: {key}")
+
+        index = int(key)
+        return {"image": self._to_pil(index), "label": self.labels[index]}
+
+    def select(self, indices):
+        """Return a new split containing only ``indices`` (used by K-Fold CV)."""
+        indices = [int(idx) for idx in indices]
+        return ImageArraySplit(
+            self.images[indices],
+            [self.labels[idx] for idx in indices],
+        )
+
+
+def concatenate_datasets(splits):
+    """Concatenate ``ImageArraySplit`` objects into a single split."""
+    splits = list(splits)
+    if not splits:
+        raise ValueError("concatenate_datasets requires at least one split")
+
+    images = np.concatenate([split.images for split in splits], axis=0)
+    labels = [label for split in splits for label in split.labels]
+    return ImageArraySplit(images, labels)
+
+
+class CachedImageDataset(Dataset):
+    def __init__(self, split, transform=None):
+        self.dataset = split
+        self.transform = transform
+        self.labels = [int(label) for label in split["label"]]
+        # Cache ảnh dạng PIL vào RAM ngay khi init
+        print("Caching images to RAM...")
+        all_images = split["image"]
+        self._cache = [img.convert("RGB") for img in all_images]
+    def __len__(self):
+        return len(self._cache)
+    def __getitem__(self, idx):
+        image = self._cache[idx]  # O(1), không cần đọc file
+        label = self.labels[idx]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+
+def get_transforms(split="train"):
+    """Build full-image 224px transforms for ImageNet-pretrained models.
+
+    CIFAR-100 images are 32x32, so the resize upsamples them to the resolution
+    the pretrained backbones expect.
     """
-    
-    def __init__(
-        self,
-        root_dir,
-        image_size=224,
-        batch_size=32,
-        num_workers=4,
-        train_ratio=0.70,
-        val_ratio=0.15,
-        test_ratio=0.15,
-        random_seed=42,
-        use_weighted_sampler=False,
-        fold_indices=None,
-        heuristic_weight_init_mode=False
-    ):
-        self.root_dir = root_dir
-        self.image_size = image_size
-        self.batch_size = batch_size
-        self.num_workers = num_workers
-        self.train_ratio = train_ratio
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
-        self.random_seed = random_seed
-        self.use_weighted_sampler = use_weighted_sampler
-        self.fold_indices = fold_indices  # (train_idx, val_idx, test_idx) for CV
-        self.heuristic_weight_init_mode = heuristic_weight_init_mode
-        
-        # ===== SET GLOBAL SEED =====
-        set_seed(self.random_seed)
-        
-        # Cache split indices để đảm bảo consistency
-        self._cached_indices = None
-        
-        # Augmentation transforms
-        self.train_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=15),
-            transforms.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.1
-            ),
-            transforms.RandomAffine(
-                degrees=0,
-                translate=(0.1, 0.1),
-                scale=(0.9, 1.1)
-            ),
+    common = [
+        transforms.Resize(
+            (Config.IMAGE_SIZE, Config.IMAGE_SIZE),
+            interpolation=InterpolationMode.BICUBIC,
+            antialias=True,
+        ),
+    ]
+
+    if split == "train":
+        return transforms.Compose(
+            common
+            + [
+                transforms.RandomHorizontalFlip(p=Config.HORIZONTAL_FLIP_PROB),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=Config.IMAGE_MEAN,
+                    std=Config.IMAGE_STD,
+                ),
+                transforms.RandomErasing(
+                    p=Config.RANDOM_ERASING_PROB,
+                    scale=Config.RANDOM_ERASING_SCALE,
+                    ratio=Config.RANDOM_ERASING_RATIO,
+                    value=Config.RANDOM_ERASING_VALUE,
+                ),
+            ]
+        )
+
+    return transforms.Compose(
+        common
+        + [
             transforms.ToTensor(),
             transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-        
-        self.val_test_transform = transforms.Compose([
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
-    
-    def _split_indices(self, dataset):
-        """
-        Split dataset indices into train/val/test (70/15/15)
-        Stratified split to maintain class balance.
-        If fold_indices is provided (CV mode), use those directly.
-        """
-        # Sử dụng fold_indices nếu có (Cross-Validation mode)
-        if self.fold_indices is not None:
-            return self.fold_indices
-
-        # Sử dụng cache để đảm bảo consistency
-        if self._cached_indices is not None:
-            return self._cached_indices
-        
-        # Reset seed trước khi split
-        set_seed(self.random_seed)
-        
-        targets = np.array(dataset.targets)
-        indices = np.arange(len(dataset))
-        
-        # First split: train (70%) vs temp (30%)
-        train_indices, temp_indices = train_test_split(
-            indices,
-            test_size=(self.val_ratio + self.test_ratio),
-            stratify=targets,
-            random_state=self.random_seed
-        )
-        
-        # Second split: val (15%) vs test (15%) from temp (30%)
-        temp_targets = targets[temp_indices]
-        val_ratio_adjusted = self.val_ratio / (self.val_ratio + self.test_ratio)
-        
-        val_indices, test_indices = train_test_split(
-            temp_indices,
-            test_size=(1 - val_ratio_adjusted),
-            stratify=temp_targets,
-            random_state=self.random_seed
-        )
-        
-        # Cache indices
-        self._cached_indices = (train_indices, val_indices, test_indices)
-        
-        return train_indices, val_indices, test_indices
-    
-    def get_datasets(self):
-        """
-        Returns train, val, test datasets
-        """
-        # Load full dataset without transform first (for splitting)
-        full_dataset = ImageFolder(root=self.root_dir)
-        
-        # Get split indices
-        train_indices, val_indices, test_indices = self._split_indices(full_dataset)
-        
-        # Create datasets with appropriate transforms
-        train_dataset = ImageFolder(root=self.root_dir, transform=self.train_transform)
-        val_dataset = ImageFolder(root=self.root_dir, transform=self.val_test_transform)
-        test_dataset = ImageFolder(root=self.root_dir, transform=self.val_test_transform)
-        
-        # Create subsets
-        train_subset = Subset(train_dataset, train_indices)
-        val_subset = Subset(val_dataset, val_indices)
-        test_subset = Subset(test_dataset, test_indices)
-        
-        return train_subset, val_subset, test_subset
-    
-    def get_train_labels(self):
-        """
-        Returns labels for the training split.
-        """
-        full_dataset = ImageFolder(root=self.root_dir)
-        train_indices, _, _ = self._split_indices(full_dataset)
-        return [full_dataset.targets[i] for i in train_indices]
-    
-    def get_dataloaders(self):
-        """
-        Returns train, val, test dataloaders.
-
-        In heuristic_weight_init_mode (§ Loss Weight Initialisation):
-          - train_loader = original 70% train indices
-          - val_loader   = original 15% val indices (fixed eval set)
-          - test_loader  = original 15% val indices (same as val_loader)
-          The original 15% test is NEVER touched → no data leakage.
-
-        In normal mode:
-          - train_loader = 70% train
-          - val_loader   = 15% val
-          - test_loader  = 15% test
-        """
-        train_subset, val_subset, test_subset = self.get_datasets()
-
-        if self.heuristic_weight_init_mode:
-            eval_subset = val_subset
-            print(f"\U0001f52c HEURISTIC WEIGHT INIT: train={len(train_subset)}, "
-                  f"eval={len(eval_subset)} (original val set)")
-            print(f"   \u26a0\ufe0f  Original test set ({len(test_subset)} samples) is HELD OUT.")
-        
-        # Generator cho reproducibility
-        g = torch.Generator()
-        g.manual_seed(self.random_seed)
-
-        sampler = None
-        shuffle = True
-
-        if self.use_weighted_sampler:
-            # Compute class weights from training labels
-            train_labels = self.get_train_labels()
-            class_sample_counts = torch.bincount(torch.tensor(train_labels))
-            weights = 1.0 / class_sample_counts.float()
-            samples_weights = weights[torch.tensor(train_labels)]
-            sampler = WeightedRandomSampler(
-                weights=samples_weights.double(),
-                num_samples=len(samples_weights),
-                replacement=True
-            )
-            shuffle = False
-            print(f"\u2705 WeightedRandomSampler enabled (class counts: {class_sample_counts.tolist()})")
-
-        train_loader = DataLoader(
-            train_subset,
-            batch_size=self.batch_size,
-            shuffle=shuffle if sampler is None else False,
-            sampler=sampler,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn,
-            generator=g if sampler is None else None,
-            drop_last=False,
-            persistent_workers=True if self.num_workers > 0 else False
-        )
-        
-        val_loader = DataLoader(
-            eval_subset if self.heuristic_weight_init_mode else val_subset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn,
-            drop_last=False,
-            persistent_workers=True if self.num_workers > 0 else False
-        )
-        
-        test_loader = DataLoader(
-            eval_subset if self.heuristic_weight_init_mode else test_subset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            worker_init_fn=worker_init_fn,
-            drop_last=False,
-            persistent_workers=True if self.num_workers > 0 else False
-        )
-        
-        return train_loader, val_loader, test_loader
-    
-    def get_class_names(self):
-        """
-        Returns list of class names
-        """
-        dataset = ImageFolder(root=self.root_dir)
-        return dataset.classes
-    
-    def get_num_classes(self):
-        """
-        Returns number of classes
-        """
-        return len(self.get_class_names())
-    
-    def verify_split_consistency(self):
-        """
-        Verify that split is consistent across multiple calls
-        """
-        # Get indices twice
-        full_dataset = ImageFolder(root=self.root_dir)
-        
-        self._cached_indices = None
-        train1, val1, test1 = self._split_indices(full_dataset)
-        
-        self._cached_indices = None
-        train2, val2, test2 = self._split_indices(full_dataset)
-        
-        print(f"Train consistent: {np.array_equal(train1, train2)}")
-        print(f"Val consistent: {np.array_equal(val1, val2)}")
-        print(f"Test consistent: {np.array_equal(test1, test2)}")
-        print(f"Test indices (first 10): {test1[:10]}")
-        
-        return np.array_equal(test1, test2)
-    
-# ===== Test =====
-if __name__ == "__main__":
-    # Example usage
-    root_dir = r"/home/student/kaggle/working/ProcessedOriginal"  # Change to your data path
-    
-    handler = DatasetHandler(
-        root_dir=root_dir,
-        image_size=224,
-        batch_size=32,
-        num_workers=0  # Set to 0 for Windows debugging
+                mean=Config.IMAGE_MEAN,
+                std=Config.IMAGE_STD,
+            ),
+        ]
     )
-    
-    # Get dataloaders
-    train_loader, val_loader, test_loader = handler.get_dataloaders()
-    
-    print(f"Number of classes: {handler.get_num_classes()}")
-    print(f"Class names: {handler.get_class_names()}")
-    print(f"\nTrain samples: {len(train_loader.dataset)}")
-    print(f"Val samples: {len(val_loader.dataset)}")
-    print(f"Test samples: {len(test_loader.dataset)}")
-    print(f"\nTrain batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
-    print(f"Test batches: {len(test_loader)}")
-    
-    # Test one batch
-    for images, labels in train_loader:
-        print(f"\nBatch shape: {images.shape}")  # [B, 3, 224, 224]
-        print(f"Labels shape: {labels.shape}")
-        break
 
-# for nw in [4, 8, 4]:
-#     handler = DatasetHandler(root_dir, num_workers=nw)
-#     train_loader, _, _ = handler.get_dataloaders()
-#     images, labels = next(iter(train_loader))
-#     print(nw, images.mean().item())
+
+def load_dataset(dataset_name, val_ratio=0.1, random_seed=42, data_root=None):
+    """Load CIFAR-100 and reserve the official test split for testing.
+
+    torchvision ships 50,000 labelled training images and 10,000 labelled test
+    images. We stratify the official training split into 45,000 training and
+    5,000 validation samples, while leaving the official test split untouched
+    as the final test set. The dataset is read from disk only
+    (``download=False``): torchvision expects ``<data_root>/cifar-100-python``.
+    """
+    if not 0.0 < val_ratio < 1.0:
+        raise ValueError("val_ratio must be strictly between 0 and 1")
+
+    normalized_name = dataset_name.lower().replace("-", "").replace("_", "")
+    if normalized_name != "cifar100":
+        raise ValueError(
+            f"This pipeline is configured for CIFAR-100, got '{dataset_name}'"
+        )
+
+    root = data_root or Config.DATA_ROOT
+    print(f"\nLoading torchvision CIFAR-100 from: {root}")
+    official_train = CIFAR100(
+        root=root, train=True, download=Config.DOWNLOAD_DATASET
+    )
+    official_test = CIFAR100(
+        root=root, train=False, download=Config.DOWNLOAD_DATASET
+    )
+
+    class_names = list(official_train.classes)
+    official_train_labels = [int(label) for label in official_train.targets]
+    test_labels = [int(label) for label in official_test.targets]
+
+    # Fixed, stratified holdout so every seed/model sees the same 45k/5k split
+    # for a given random_seed.
+    train_idx, val_idx = train_test_split(
+        np.arange(len(official_train_labels)),
+        test_size=val_ratio,
+        stratify=official_train_labels,
+        random_state=random_seed,
+        shuffle=True,
+    )
+    train_idx = np.sort(train_idx)
+    val_idx = np.sort(val_idx)
+
+    train_data = ImageArraySplit(
+        official_train.data[train_idx],
+        [official_train_labels[idx] for idx in train_idx],
+    )
+    val_data = ImageArraySplit(
+        official_train.data[val_idx],
+        [official_train_labels[idx] for idx in val_idx],
+    )
+    test_data = ImageArraySplit(official_test.data, test_labels)
+
+    train_labels = list(train_data.labels)
+    val_labels = list(val_data.labels)
+
+    print("\nDataset split (stratified):")
+    print(f"  Train: {len(train_data):,} images")
+    print(f"  Val:   {len(val_data):,} images (from official train)")
+    print(f"  Test:  {len(test_data):,} images (official test, held out)")
+    print(f"  Classes: {len(class_names)}")
+    print(f"  Random seed: {random_seed}")
+
+    return (
+        train_data,
+        train_labels,
+        val_data,
+        val_labels,
+        test_data,
+        test_labels,
+        class_names,
+    )
+
+
+def create_dataloaders(
+    train_data,
+    train_labels,
+    val_data,
+    val_labels,
+    test_data,
+    test_labels,
+    batch_size,
+    num_workers=4,
+):
+    """Create reproducible PyTorch DataLoaders from the CIFAR-100 splits."""
+    train_dataset = CachedImageDataset(train_data, transform=get_transforms("train"))
+    val_dataset = CachedImageDataset(val_data, transform=get_transforms("val"))
+    test_dataset = CachedImageDataset(test_data, transform=get_transforms("test"))
+
+    sampler = None
+    use_shuffle = True
+    if Config.USE_WEIGHTED_SAMPLER:
+        class_sample_counts = torch.bincount(torch.tensor(train_labels))
+        if torch.any(class_sample_counts == 0):
+            raise ValueError("Weighted sampler cannot handle a class with zero samples")
+        class_weights = 1.0 / class_sample_counts.float()
+        sample_weights = class_weights[torch.tensor(train_labels)]
+        sampler = WeightedRandomSampler(
+            weights=sample_weights.double(),
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+        use_shuffle = False
+        print("  WeightedRandomSampler: ENABLED")
+    else:
+        print("  WeightedRandomSampler: DISABLED (dataset is balanced)")
+
+    use_cuda = torch.cuda.is_available()
+    use_persistent = Config.PERSISTENT_WORKERS and num_workers > 0
+    generator = torch.Generator().manual_seed(Config.RANDOM_SEED)
+
+    common_loader_args = {
+        "num_workers": num_workers,
+        "pin_memory": Config.PIN_MEMORY and use_cuda,
+        "persistent_workers": use_persistent,
+    }
+    if num_workers > 0:
+        common_loader_args["prefetch_factor"] = Config.PREFETCH_FACTOR
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        shuffle=use_shuffle,
+        drop_last=Config.TRAIN_DROP_LAST,
+        worker_init_fn=worker_init_fn_seed,
+        generator=generator,
+        **common_loader_args,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        **common_loader_args,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        **common_loader_args,
+    )
+
+    return train_loader, val_loader, test_loader
+
+
+if __name__ == "__main__":
+    Config.validate_config()
+    loaded = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
+        Config.RANDOM_SEED,
+    )
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, _ = loaded
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_data,
+        train_labels,
+        val_data,
+        val_labels,
+        test_data,
+        test_labels,
+        Config.BATCH_SIZE,
+        Config.NUM_WORKERS,
+    )
+    images, labels = next(iter(train_loader))
+    print("\nDataset loaded successfully")
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Val batches: {len(val_loader)}")
+    print(f"  Test batches: {len(test_loader)}")
+    print(f"  First batch: images={tuple(images.shape)}, labels={tuple(labels.shape)}")

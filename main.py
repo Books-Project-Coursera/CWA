@@ -1,1744 +1,897 @@
+"""
+Main script to run complete baseline research pipeline
+"""
 import os
-import copy
-import json
-import time
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+
+
+def _preparse_environment_args():
+    """Apply CUDA-related CLI args before torch is imported."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--gpu", "--cuda-visible-devices", dest="cuda_visible_devices")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--cublas-workspace-config", default=":4096:8")
+    args, _ = parser.parse_known_args()
+
+    if args.cuda_visible_devices is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+
+    if args.deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", args.cublas_workspace_config)
+
+
+_preparse_environment_args()
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-from tqdm import tqdm
 import numpy as np
 import pandas as pd
-from sklearn.metrics import (classification_report, confusion_matrix,
-                            accuracy_score, precision_score, recall_score,
-                            f1_score, roc_auc_score)
+from datetime import datetime
+from sklearn.model_selection import StratifiedKFold
 
-# Import các module đã tạo
-from Teacher_extraction import TeacherExtractor
-from Student_extraction import StudentExtractor
-from PCA_projector import PCAttentionProjector
-from GWLinear_projector import GWLinearProjector
-from loss_functions import ProjectionLoss, LogitsKDLoss, DIST, PolyFocalLoss, compute_class_weights
-from dataset import DatasetHandler, set_seed
-from visualization import plot_training_curves
-torch.use_deterministic_algorithms(True, warn_only=True)
-
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-# DynamicWeightAveraging removed — using fixed static loss weights
+from config import Config
+from dataset import load_dataset, create_dataloaders, concatenate_datasets
+from train import train_model, CheckpointManager
+from evaluate import evaluate_all_strategies, export_results_to_excel, create_performance_charts, save_confusion_matrices
+from visualization import print_dataset_statistics
 
 
-class StudentWithHead(nn.Module):
-    """
-    Student model với classification head
-    """
-    def __init__(self, num_classes, pretrained=True, feature_dim=96,
-                 fc_hidden=None, fc_dropout=0.7):
-        super().__init__()
-        if fc_hidden is None:
-            fc_hidden = [512, 256]
-        self.backbone = StudentExtractor(pretrained=pretrained)
-        
-        # Classification head: Global Average Pooling + MLP
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        layers = []
-        in_dim = feature_dim
-        for h in fc_hidden:
-            layers += [nn.Linear(in_dim, h), nn.ReLU(), nn.Dropout(fc_dropout)]
-            in_dim = h
-        layers.append(nn.Linear(in_dim, num_classes))
-        self.classifier = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        """
-        Returns:
-            feat_map: [B, 1024, 14, 14] - for distillation
-            logits: [B, num_classes] - for classification
-        """
-        feat_map = self.backbone(x)  # [B, 1024, 14, 14]
-        
-        # Classification
-        pooled = self.gap(feat_map)  # [B, 1024, 1, 1]
-        pooled = pooled.flatten(1)   # [B, 1024]
-        logits = self.classifier(pooled)  # [B, num_classes]
-        
-        return feat_map, logits
+SUPPORTED_MODELS = [
+    "vgg16",
+    "resnet18",
+    "resnet101",
+    "mobilenet_v2",
+    "densenet121",
+    "efficientnet_b0",
+    "convnext_tiny",
+    "vit_base_patch16_224",
+    "swin_tiny_patch4_window7_224",
+    "convit_tiny",
+]
+
+MODEL_ALIASES = {
+    "vit_base": "vit_base_patch16_224",
+    "vit_b16": "vit_base_patch16_224",
+    "efficientnet_b0": "efficientnet_b0",
+    "efficientnet-b0": "efficientnet_b0",
+    "mobilenetv2": "mobilenet_v2",
+    "mobilenet_v2": "mobilenet_v2",
+}
 
 
-# =============================================================================
-# CheckpointManager: keep last N + top K best checkpoints
-# =============================================================================
-class CheckpointManager:
-    def __init__(self, save_dir, keep_last_n=10, keep_top_k=5):
-        self.save_dir = save_dir
-        os.makedirs(self.save_dir, exist_ok=True)
-        self.checkpoints = []  # List of (epoch, val_loss, path)
-        self.best_val_loss = float('inf')
-        self.best_epoch = 0
-        self.keep_last_n = keep_last_n
-        self.keep_top_k = keep_top_k
-
-    def save(self, student_state_dict, optimizer_state_dict, scheduler_state_dict,
-             epoch, val_loss, val_acc, pca_projector_state_dict=None, gl_projector_state_dict=None):
-        checkpoint = {
-            'epoch': epoch,
-            'student_state_dict': student_state_dict,
-            'optimizer_student_state_dict': optimizer_state_dict,
-            'scheduler_student_state_dict': scheduler_state_dict,
-            'val_loss': val_loss,
-            'val_acc': val_acc
-        }
-        path = os.path.join(self.save_dir, f'epoch_{epoch:03d}_val_loss_{val_loss:.4f}.pth')
-        torch.save(checkpoint, path)
-
-        self.checkpoints.append({
-            'epoch': epoch, 'val_loss': val_loss, 'path': path
-        })
-
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self.best_epoch = epoch
-            best_path = os.path.join(self.save_dir, 'best.pth')
-            torch.save(checkpoint, best_path)
-            if pca_projector_state_dict is not None:
-                torch.save(pca_projector_state_dict, os.path.join(self.save_dir, 'best_pca_projector.pth'))
-            if gl_projector_state_dict is not None:
-                torch.save(gl_projector_state_dict, os.path.join(self.save_dir, 'best_gl_projector.pth'))
-            print(f"\U0001f4be Best model saved (epoch {epoch}, val_loss: {val_loss:.4f}, val_acc: {val_acc:.2f}%)")
-
-        self._cleanup()
-        return path
-
-    def _cleanup(self):
-        if len(self.checkpoints) <= self.keep_last_n + self.keep_top_k:
-            return
-        sorted_by_epoch = sorted(self.checkpoints, key=lambda x: x['epoch'])
-        last_n = set(cp['epoch'] for cp in sorted_by_epoch[-self.keep_last_n:])
-        sorted_by_loss = sorted(self.checkpoints, key=lambda x: x['val_loss'])
-        top_k = set(cp['epoch'] for cp in sorted_by_loss[:self.keep_top_k])
-        keep_epochs = last_n | top_k
-        to_keep = []
-        for cp in self.checkpoints:
-            if cp['epoch'] in keep_epochs:
-                to_keep.append(cp)
-            else:
-                p = cp['path']
-                try:
-                    if os.path.exists(p): os.remove(p)
-                except Exception: pass
-        self.checkpoints = to_keep
-
-    def get_best_checkpoint(self):
-        if not self.checkpoints:
-            return None
-        cp = min(self.checkpoints, key=lambda x: x['val_loss'])
-        return (cp['epoch'], cp['val_loss'], cp['path'])
-
-    def get_top_k_checkpoints(self, k):
-        return [(cp['epoch'], cp['val_loss'], cp['path']) for cp in sorted(self.checkpoints, key=lambda x: x['val_loss'])[:k]]
-
-    def get_last_n_checkpoints(self, n):
-        return [(cp['epoch'], cp['val_loss'], cp['path']) for cp in sorted(self.checkpoints, key=lambda x: x['epoch'])[-n:]]
-
-    def save_info(self):
-        info = {'checkpoints': self.checkpoints}
-        with open(os.path.join(self.save_dir, 'checkpoint_info.json'), 'w') as f:
-            json.dump(info, f, indent=4)
+def sanitize_run_name(value):
+    """Return a filesystem-safe run name."""
+    value = value.strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value.strip("._-") or "run"
 
 
-# =============================================================================
-# Helper functions for checkpoint averaging
-# =============================================================================
-def average_student_weights(checkpoint_paths, device):
-    """Average student model weights, skip BN running stats"""
-    if not checkpoint_paths:
+def parse_model_list(values):
+    """Parse repeated, space-separated, or comma-separated model args."""
+    if not values:
         return None
-    if len(checkpoint_paths) == 1:
-        cp = torch.load(checkpoint_paths[0], map_location=device)
-        return cp['student_state_dict']
 
-    first = torch.load(checkpoint_paths[0], map_location=device)
-    averaged = copy.deepcopy(first['student_state_dict'])
+    models = []
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if item:
+                models.append(MODEL_ALIASES.get(item, item))
 
-    keys_to_avg = []
-    keys_to_keep = []
-    for key in averaged.keys():
-        if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-            keys_to_keep.append(key)
-        else:
-            keys_to_avg.append(key)
+    if any(model.lower() == "all" for model in models):
+        return SUPPORTED_MODELS.copy()
 
-    for path in checkpoint_paths[1:]:
-        cp = torch.load(path, map_location=device)
-        sd = cp['student_state_dict']
-        for key in keys_to_avg:
-            averaged[key] = averaged[key] + sd[key]
-
-    n = len(checkpoint_paths)
-    for key in keys_to_avg:
-        averaged[key] = averaged[key] / n
-
-    return averaged
-
-
-def update_bn_stats(model, train_loader, device, num_batches=100):
-    """
-    Update BatchNorm running statistics after loading averaged weights.
-    
-    IMPORTANT: For frozen backbone models, we should NOT update the backbone BN layers
-    because they already have good statistics from ImageNet pretraining.
-    We only update BN layers that are in trainable (unfrozen) parts.
-    """
-    # Identify which BN layers are in trainable parts
-    trainable_bn_layers = []
-    for name, module in model.named_modules():
-        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            has_trainable = False
-            for param in module.parameters():
-                if param.requires_grad:
-                    has_trainable = True
-                    break
-            if has_trainable:
-                trainable_bn_layers.append((name, module))
-
-    if not trainable_bn_layers:
-        print("      (No trainable BN layers found, skipping BN update)")
-        return
-
-    print(f"      (Found {len(trainable_bn_layers)} trainable BN layers to update)")
-
-    # Set model to eval mode first
-    model.eval()
-
-    # Only set trainable BN layers to train mode and reset their statistics
-    for name, module in trainable_bn_layers:
-        module.train()
-        module.momentum = None  # Use cumulative moving average
-        module.reset_running_stats()
-
-    # Forward pass to accumulate BN statistics (no gradient computation)
-    with torch.no_grad():
-        for batch_idx, (images, _) in enumerate(train_loader):
-            if batch_idx >= num_batches:
-                break
-            images = images.to(device)
-            _ = model(images)
-
-    # Set everything back to eval mode
-    model.eval()
-
-
-class DistillationPipeline:
-    def __init__(
-        self,
-        data_dir,
-        num_classes,
-        batch_size=32,
-        num_workers=16,
-        lr_student=1e-4,
-        # lr_teacher=1e-4,
-        epochs=120,
-        warmup_epochs_student=5,
-        # warmup_epochs_teacher=5,
-        device="cuda",
-        save_dir="checkpoints",
-        loss_lambdas=None,  # list of 5 static loss weights [CE, Proj1, Proj2, Logits, DIST]
-        patience=15,  # early stopping patience
-        start_factor_student=1e-8,
-        # start_factor_teacher=1e-8,  # warmup start factor
-        eta_min_student=1e-7,
-        block_ids=[11,10,9,8,7],
-        block_qkv_id=11,
-        temperature=4.0,
-        dist_beta=2.0,
-        dist_gamma=2.0,
-        last_n_epochs=10,
-        keep_last_n=10,
-        keep_top_k=5,
-        # eta_min_teacher=1e-7,  # cosine annealing min lr
-        teacher_checkpoint=None,
-        student_fc_dropout=0.7,
-        student_fc_hidden=None,
-        pca_dropout=0.5,
-        pca_partial_p=0.5,
-        gw_drop_p=0.4,
-        label_smoothing=0.1,
-        use_projection=True,  # ablation: set False to skip PCA/GL projectors
-        # --- Ablation: individual loss flags ---
-        use_ce=True,      # Cross-Entropy loss
-        use_proj1=True,   # L_proj1 PCA projection loss
-        use_proj2=True,   # L_proj2 GWLinear projection loss
-        use_logits=True,  # L_logits Hinton KD logits loss
-        use_dist=True,    # L_dist DIST relational loss
-        # --- Random seed ---
-        random_seed=42,
-        # --- Weighted sampler & Focal loss ---
-        use_weighted_sampler=False,
-        use_focal_loss=False,
-        focal_gamma=2.0,
-        poly_epsilon=1.0,
-        class_weight_method='inverse_freq',
-        # --- Cross-Validation ---
-        fold_indices=None,       # (train_idx, val_idx, test_idx) for CV fold
-        fold_save_dir=None,      # Override save_dir for CV fold
-        # --- Unused CV params (kept for unpacking compatibility) ---
-        use_cross_validation=False,
-        cv_n_splits=5,
-        heuristic_weight_init_mode=False,
-    ):
-        # ===== SET GLOBAL SEED FIRST (before any model/data init) =====
-        self.random_seed = random_seed
-        set_seed(self.random_seed)
-        print(f"🌱 Global random seed set to: {self.random_seed}")
-
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        self.epochs = epochs
-        self.warmup_epochs_student = warmup_epochs_student
-        # self.warmup_epochs_teacher = warmup_epochs_teacher
-        self.save_dir = save_dir
-        self.temperature = temperature
-        self.patience = patience
-        self.start_factor_student = start_factor_student
-        # self.start_factor_teacher = start_factor_teacher
-        self.eta_min_student = eta_min_student
-        self.dist_beta = dist_beta
-        self.dist_gamma = dist_gamma
-        self.use_projection = use_projection
-        # --- Ablation flags ---
-        self.use_ce     = use_ce
-        self.use_proj1  = use_proj1 and use_projection  # proj1 requires use_projection
-        self.use_proj2  = use_proj2 and use_projection  # proj2 requires use_projection
-        self.use_logits = use_logits
-        self.use_dist   = use_dist
-        # --- Fixed static loss weights ---
-        _default_lambdas = [1.0, 1.0, 1.0, 1.0, 1.0]
-        _raw = loss_lambdas if loss_lambdas is not None else _default_lambdas
-        _flags = [use_ce, use_proj1 and use_projection, use_proj2 and use_projection, use_logits, use_dist]
-        _active = [lam for flag, lam in zip(_flags, _raw) if flag]
-        self.loss_weights = torch.tensor(_active, dtype=torch.float32)
-        self.loss_lambdas_raw = _raw  # full 5-element list for config export [CE, Proj1, Proj2, Logits, DIST]
-        # --- Weighted sampler & Focal loss ---
-        self.use_weighted_sampler = use_weighted_sampler
-        self.use_focal_loss = use_focal_loss
-        self.focal_gamma = focal_gamma
-        self.poly_epsilon = poly_epsilon
-        self.class_weight_method = class_weight_method
-        self.heuristic_weight_init_mode = heuristic_weight_init_mode
-        if not self.use_ce:
-            print("\u26a0\ufe0f  WARNING: USE_CE=False. CE loss is disabled — classification may fail!")
-        # self.eta_min_teacher = eta_min_teacher,
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Auto-detect experiment run number (skip if fold_save_dir provided)
-        if fold_save_dir is not None:
-            self.save_dir = fold_save_dir
-            os.makedirs(self.save_dir, exist_ok=True)
-            print(f"📂 CV fold saving to: {self.save_dir}")
-        else:
-            run_number = 1
-            while os.path.exists(os.path.join(save_dir, f"run_{run_number}")):
-                run_number += 1
-            self.save_dir = os.path.join(save_dir, f"run_{run_number}")
-            os.makedirs(self.save_dir, exist_ok=True)
-            print(f"📂 Experiment run #{run_number}, saving to: {self.save_dir}")
-        
-        # ===== Dataset =====
-        print("Loading dataset...")
-        self.data_handler = DatasetHandler(
-            root_dir=data_dir,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            use_weighted_sampler=use_weighted_sampler,
-            random_seed=self.random_seed,
-            fold_indices=fold_indices,
-            heuristic_weight_init_mode=self.heuristic_weight_init_mode
+    invalid = [model for model in models if model not in SUPPORTED_MODELS]
+    if invalid:
+        raise ValueError(
+            "Unsupported model(s): "
+            + ", ".join(invalid)
+            + ". Supported models: "
+            + ", ".join(SUPPORTED_MODELS)
         )
-        self.train_loader, self.val_loader, self.test_loader = self.data_handler.get_dataloaders()
-        
-        print(f"Train samples: {len(self.train_loader.dataset)}")
-        print(f"Val samples: {len(self.val_loader.dataset)}")
-        print(f"Test samples: {len(self.test_loader.dataset)}")
-        print(f"Num classes: {num_classes}")
-        
-        # ===== Models =====
-        print("\nInitializing models...")
-        
-        # Teacher (frozen, inference only)
-        self.teacher = TeacherExtractor(pretrained=False,
-                                        checkpoint_path=teacher_checkpoint,
-                                        block_ids=block_ids,
-                                        block_qkv_id=block_qkv_id)
-        self.teacher.to(self.device)
-        print("✅ Teacher (ViT-B/16) loaded and frozen")
-        
-        # Student with classification head
-        self.student_fc_dropout = student_fc_dropout
-        self.student_fc_hidden = student_fc_hidden if student_fc_hidden else [512, 256]
-        self.student = StudentWithHead(
-            num_classes=num_classes, pretrained=True,
-            fc_hidden=self.student_fc_hidden, fc_dropout=self.student_fc_dropout
-        )
-        self.student = self.student.to(self.device)
-        print("✅ Student (ResNet-50) loaded")
-        
-        # # Teacher Head (trainable)
-        # self.teacher_head = TeacherHead(num_classes=num_classes, embed_dim=768)
-        # self.teacher_head = self.teacher_head.to(self.device)
-        # print("✅ Teacher Head (trainable) loaded")
-        
-        # Projectors (only created when use_projection=True)
-        self.pca_dropout = pca_dropout
-        self.pca_partial_p = pca_partial_p
-        self.gw_drop_p = gw_drop_p
-        if self.use_projection:
-            self.pca_projector = PCAttentionProjector(
-                in_channels=96, embed_dim=768,
-                p=self.pca_partial_p, dropout=self.pca_dropout
-            )
-            self.pca_projector = self.pca_projector.to(self.device)
-            print("✅ PCA Projector loaded")
-            
-            self.gl_projector = GWLinearProjector(in_dim=96, out_dim=768, drop_p=self.gw_drop_p)
-            self.gl_projector = self.gl_projector.to(self.device)
-            print("✅ GL Projector loaded")
-        else:
-            self.pca_projector = None
-            self.gl_projector = None
-            print("⏭️  Projectors skipped (use_projection=False)")
-        
-        # ===== Loss functions =====
-        self.label_smoothing = label_smoothing
-        self.kd_loss_fn = ProjectionLoss() if self.use_projection else None
-        if self.use_focal_loss:
-            # Compute class weights from training data
-            train_labels = self.data_handler.get_train_labels()
-            class_weights = compute_class_weights(train_labels, method=self.class_weight_method)
-            self.ce_loss_fn = PolyFocalLoss(
-                gamma=self.focal_gamma,
-                epsilon=self.poly_epsilon,
-                alpha=class_weights
-            )
-            print(f"\u2705 PolyFocalLoss enabled (gamma={self.focal_gamma}, epsilon={self.poly_epsilon}, method={self.class_weight_method})")
-        else:
-            self.ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
-        self.logits_loss = LogitsKDLoss(temperature=temperature)
-        self.dist_loss_fn = DIST(beta=dist_beta, gamma=dist_gamma)
-        # ===== Optimizer (chỉ train student + projectors nếu có) =====
-        trainable_params = list(self.student.parameters())
-        if self.use_projection:
-            trainable_params += list(self.pca_projector.parameters()) + \
-                                list(self.gl_projector.parameters())
-        # self.optimizer_teacher = optim.Adam(self.teacher_head.parameters(), lr=lr_teacher)
-        self.optimizer_student = optim.Adam(trainable_params, lr=lr_student)
-        
-        # ===== Scheduler: Linear warmup + Cosine Annealing (epoch-level) =====
-        self.scheduler_student = self._get_scheduler()
-        
-        # Store for evaluation strategies
-        self.num_classes = num_classes
-        self.last_n_epochs = last_n_epochs
-        
-        # Checkpoint Manager (keeps last N + top K best checkpoints)
-        self.checkpoint_manager = CheckpointManager(
-            save_dir=self.save_dir,
-            keep_last_n=keep_last_n,
-            keep_top_k=keep_top_k
-        )
-        
-        print(f"\n✅ Pipeline initialized on {self.device}")
 
-        # ===== Export config to Excel =====
-        self._export_config_to_excel()
-    
-    def _export_config_to_excel(self):
-        """
-        Xuất toàn bộ hyperparameters và config của run hiện tại
-        ra file Excel (config_run_<N>.xlsx) trong self.save_dir.
-
-        Gồm 2 sheet:
-          - "Config"         : tất cả hyperparameters
-          - "Ablation Flags" : các flag bật/tắt loss
-        """
-        import datetime
-
-        run_name = os.path.basename(self.save_dir)   # e.g. "run_3"
-        excel_path = os.path.join(self.save_dir, f"config_{run_name}.xlsx")
-
-        # ── Sheet 1: all hyperparameters ─────────────────────────────
-        config_rows = [
-            # ── Dataset ──
-            {"Group": "Dataset",   "Parameter": "data_dir",              "Value": getattr(self.data_handler, 'root_dir', 'N/A')},
-            {"Group": "Dataset",   "Parameter": "num_classes",           "Value": self.num_classes},
-            {"Group": "Dataset",   "Parameter": "batch_size",            "Value": self.data_handler.batch_size
-                                                                                   if hasattr(self.data_handler, 'batch_size') else 'N/A'},
-            # ── Training ──
-            {"Group": "Training",  "Parameter": "epochs",               "Value": self.epochs},
-            {"Group": "Training",  "Parameter": "lr_student",           "Value": self.optimizer_student.param_groups[0]['lr']},
-            {"Group": "Training",  "Parameter": "warmup_epochs_student","Value": self.warmup_epochs_student},
-            {"Group": "Training",  "Parameter": "start_factor_student", "Value": self.start_factor_student},
-            {"Group": "Training",  "Parameter": "eta_min_student",      "Value": self.eta_min_student},
-            {"Group": "Training",  "Parameter": "patience",             "Value": self.patience},
-            {"Group": "Training",  "Parameter": "label_smoothing",      "Value": self.label_smoothing},
-            # ── Loss weights (static λ) ──
-            {"Group": "Loss Weights", "Parameter": "lambda_CE",     "Value": self.loss_lambdas_raw[0]},
-            {"Group": "Loss Weights", "Parameter": "lambda_Proj1",  "Value": self.loss_lambdas_raw[1]},
-            {"Group": "Loss Weights", "Parameter": "lambda_Proj2",  "Value": self.loss_lambdas_raw[2]},
-            {"Group": "Loss Weights", "Parameter": "lambda_Logits", "Value": self.loss_lambdas_raw[3]},
-            {"Group": "Loss Weights", "Parameter": "lambda_DIST",   "Value": self.loss_lambdas_raw[4]},
-            # ── Logits KD ──
-            {"Group": "KD",        "Parameter": "temperature (Hinton)", "Value": self.temperature},
-            # ── DIST ──
-            {"Group": "DIST",      "Parameter": "dist_beta",            "Value": self.dist_beta},
-            {"Group": "DIST",      "Parameter": "dist_gamma",           "Value": self.dist_gamma},
-            # ── Projectors ──
-            {"Group": "Projector", "Parameter": "use_projection",       "Value": self.use_projection},
-            {"Group": "Projector", "Parameter": "pca_dropout",          "Value": self.pca_dropout},
-            {"Group": "Projector", "Parameter": "pca_partial_p",        "Value": self.pca_partial_p},
-            {"Group": "Projector", "Parameter": "gw_drop_p",            "Value": self.gw_drop_p},
-            # ── Student ──
-            {"Group": "Student",   "Parameter": "fc_dropout",           "Value": self.student_fc_dropout},
-            {"Group": "Student",   "Parameter": "fc_hidden",            "Value": str(self.student_fc_hidden)},
-            # ── Checkpoint ──
-            {"Group": "Checkpoint","Parameter": "save_dir",             "Value": self.save_dir},
-            {"Group": "Checkpoint","Parameter": "keep_last_n",          "Value": self.checkpoint_manager.keep_last_n},
-            {"Group": "Checkpoint","Parameter": "keep_top_k",           "Value": self.checkpoint_manager.keep_top_k},
-            {"Group": "Checkpoint","Parameter": "last_n_epochs",        "Value": self.last_n_epochs},
-            # ── Meta ──
-            {"Group": "Meta",      "Parameter": "device",               "Value": str(self.device)},
-            {"Group": "Meta",      "Parameter": "random_seed",          "Value": self.random_seed},
-            {"Group": "Meta",      "Parameter": "timestamp",            "Value": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-            {"Group": "Meta",      "Parameter": "run",                  "Value": run_name},
-        ]
-
-        # ── Sheet 2: ablation flags ───────────────────────────────────
-        ablation_rows = [
-            {"Loss": "CE",     "Flag": "use_ce",     "Enabled": self.use_ce},
-            {"Loss": "Proj1",  "Flag": "use_proj1",  "Enabled": self.use_proj1},
-            {"Loss": "Proj2",  "Flag": "use_proj2",  "Enabled": self.use_proj2},
-            {"Loss": "Logits", "Flag": "use_logits", "Enabled": self.use_logits},
-            {"Loss": "DIST",   "Flag": "use_dist",   "Enabled": self.use_dist},
-        ]
-
-        df_config   = pd.DataFrame(config_rows)
-        df_ablation = pd.DataFrame(ablation_rows)
-
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            df_config.to_excel(writer,   sheet_name="Config",         index=False)
-            df_ablation.to_excel(writer, sheet_name="Ablation Flags", index=False)
-
-        print(f"📋 Config exported to: {excel_path}")
-
-    def _get_scheduler(self):
-        """
-        Linear warmup + Cosine annealing scheduler using SequentialLR (epoch-level)
-        Tạo scheduler riêng cho teacher và student
-        """
-        warmup_epochs_student = self.warmup_epochs_student
-        cosine_epochs_student = self.epochs - self.warmup_epochs_student
-        # warmup_epochs_teacher = self.warmup_epochs_teacher
-        # cosine_epochs_teacher = self.epochs - self.warmup_epochs_teacher 
-    
-        # ===== SCHEDULER CHO STUDENT =====
-        warmup_scheduler_student = LinearLR(
-            self.optimizer_student,
-            start_factor=self.start_factor_student,
-            end_factor=1.0,
-            total_iters=self.warmup_epochs_student
-        )
-        
-        cosine_scheduler_student = CosineAnnealingLR(
-            self.optimizer_student,
-            T_max=cosine_epochs_student,
-            eta_min=self.eta_min_student
-        )
-        
-        scheduler_student = SequentialLR(
-            self.optimizer_student,
-            schedulers=[warmup_scheduler_student, cosine_scheduler_student],
-            milestones=[warmup_epochs_student]
-        )
-        
-        # # ===== SCHEDULER CHO TEACHER HEAD =====
-        # warmup_scheduler_teacher = LinearLR(
-        #     self.optimizer_teacher,
-        #     start_factor=self.start_factor_teacher,
-        #     end_factor=1.0,
-        #     total_iters=self.warmup_epochs_teacher
-        # )
-        
-        # cosine_scheduler_teacher = CosineAnnealingLR(
-        #     self.optimizer_teacher,
-        #     T_max=cosine_epochs_teacher,
-        #     eta_min=self.eta_min_teacher
-        # )
-        
-        # scheduler_teacher = SequentialLR(
-        #     self.optimizer_teacher,
-        #     schedulers=[warmup_scheduler_teacher, cosine_scheduler_teacher],
-        #     milestones=[warmup_epochs_teacher]
-        # )
-        
-        return scheduler_student
-    
-    def train_one_epoch(self, epoch):
-        """Train for one epoch."""
-        # Use fixed static loss weights (no dynamic adjustment)
-        current_lambdas = self.loss_weights.to(self.device)
-
-        self.student.train()
-        if self.use_projection:
-            self.pca_projector.train()
-            self.gl_projector.train()
-
-        total_loss = 0.0
-        total_kd_loss = 0.0
-        total_logits_loss = 0.0
-        total_ce_loss_s = 0.0
-        total_l1 = 0.0
-        total_l2 = 0.0
-        total_dist_loss = 0.0
-        correct = 0
-        total = 0
-        
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.epochs} [Train]")
-        
-        for images, labels in pbar:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            
-            # ===== Teacher forward (no grad) =====
-            with torch.no_grad():
-                teacher_out = self.teacher.extract(images)
-            logit_t = teacher_out["logits"]
-            if self.use_projection:
-                Q_t = teacher_out["Q_t"]
-                K_t = teacher_out["K_t"]
-                V_t = teacher_out["V_t"]
-                Attn_t = teacher_out["Attn_t"]
-                h_t = teacher_out["block_mean"]  # [B, 196, 768]
-            
-            # ===== Student forward =====
-            feat_map, logit_s = self.student(images)
-
-            # ===== PCA & GL Projectors =====
-            if self.use_projection:
-                pca_out = self.pca_projector(feat_map, Q_t, K_t, V_t)
-                PCAttn_s = pca_out["PCAttnS"]
-                V_s = pca_out["VS"]
-                h_s_proj = self.gl_projector(feat_map)
-                l_proj1, l_proj2 = self.kd_loss_fn(Attn_t, PCAttn_s, V_t, V_s, h_t, h_s_proj)
-            else:
-                l_proj1 = torch.tensor(0.0, device=self.device)
-                l_proj2 = torch.tensor(0.0, device=self.device)
-
-            # ===== Compute individual losses =====
-            ce_loss_s      = self.ce_loss_fn(logit_s, labels)
-            logits_kd_loss = self.logits_loss(logit_s, logit_t.detach())
-            dist_loss      = self.dist_loss_fn(logit_s, logit_t.detach())
-            
-            # ===== Build total loss dynamically (ablation-aware) =====
-            # current_lambdas is indexed in activation order: only active losses
-            # are given a DWA slot. We iterate the active flags to assign λ_i.
-            loss_student = torch.tensor(0.0, device=self.device)
-            lam_idx = 0
-
-            if self.use_ce:
-                loss_student = loss_student + current_lambdas[lam_idx] * ce_loss_s
-                lam_idx += 1
-
-            if self.use_proj1:
-                loss_student = loss_student + current_lambdas[lam_idx] * l_proj1
-                lam_idx += 1
-
-            if self.use_proj2:
-                loss_student = loss_student + current_lambdas[lam_idx] * l_proj2
-                lam_idx += 1
-
-            if self.use_logits:
-                loss_student = loss_student + current_lambdas[lam_idx] * logits_kd_loss
-                lam_idx += 1
-
-            if self.use_dist:
-                loss_student = loss_student + current_lambdas[lam_idx] * dist_loss
-                # lam_idx += 1  # no need to increment after last
-
-            # ===== Backward =====
-            self.optimizer_student.zero_grad()
-            loss_student.backward()
-            self.optimizer_student.step()
-
-            # ===== Metrics =====
-            total_loss += loss_student.item()
-            total_kd_loss += (l_proj1.item() + l_proj2.item())
-            total_ce_loss_s += ce_loss_s.item()
-            total_logits_loss += logits_kd_loss.item()
-            total_l1 += l_proj1.item()
-            total_l2 += l_proj2.item()
-            total_dist_loss += dist_loss.item()
-            _, predicted = logit_s.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-            # Rebuild lam_idx for postfix display
-            _idx = 0
-            _lce  = (current_lambdas[_idx].item() if self.use_ce     else 0.0); _idx += int(self.use_ce)
-            _lp1  = (current_lambdas[_idx].item() if self.use_proj1  else 0.0); _idx += int(self.use_proj1)
-            _lp2  = (current_lambdas[_idx].item() if self.use_proj2  else 0.0); _idx += int(self.use_proj2)
-            _llg  = (current_lambdas[_idx].item() if self.use_logits else 0.0); _idx += int(self.use_logits)
-            _lds  = (current_lambdas[_idx].item() if self.use_dist   else 0.0)
-            pbar.set_postfix({
-                "Loss": f"{loss_student.item():.3f}",
-                "CE":    f"{_lce  * ce_loss_s.item():.3f}" if self.use_ce     else "OFF",
-                "Proj1": f"{_lp1  * l_proj1.item():.3f}"  if self.use_proj1  else "OFF",
-                "Proj2": f"{_lp2  * l_proj2.item():.3f}"  if self.use_proj2  else "OFF",
-                "Logits":f"{_llg  * logits_kd_loss.item():.3f}" if self.use_logits else "OFF",
-                "DIST":  f"{_lds  * dist_loss.item():.3f}" if self.use_dist   else "OFF",
-                "Acc":   f"{100.*correct/total:.1f}%",
-                "LR":    f"{self.scheduler_student.get_last_lr()[0]:.4e}",
-            })
-        
-        n_batches = len(self.train_loader)
-        avg_loss      = total_loss      / n_batches
-        avg_kd_loss   = total_kd_loss   / n_batches
-        avg_ce_loss_s = total_ce_loss_s / n_batches
-        accuracy      = 100. * correct / total
-        avg_raw_l1    = total_l1           / n_batches
-        avg_raw_l2    = total_l2           / n_batches
-        avg_raw_l3    = total_logits_loss  / n_batches
-        avg_raw_dist  = total_dist_loss    / n_batches
-
-        # Rebuild λ* for weighted metrics
-        _idx = 0
-        _lce  = (current_lambdas[_idx].item() if self.use_ce     else 0.0); _idx += int(self.use_ce)
-        _lp1  = (current_lambdas[_idx].item() if self.use_proj1  else 0.0); _idx += int(self.use_proj1)
-        _lp2  = (current_lambdas[_idx].item() if self.use_proj2  else 0.0); _idx += int(self.use_proj2)
-        _llg  = (current_lambdas[_idx].item() if self.use_logits else 0.0); _idx += int(self.use_logits)
-        _lds  = (current_lambdas[_idx].item() if self.use_dist   else 0.0)
-
-        return {
-            "loss":         avg_loss,
-            "kd_loss":      avg_kd_loss,
-            "ce_loss_s":    avg_ce_loss_s,
-            "raw_l1":       avg_raw_l1,
-            "raw_l2":       avg_raw_l2,
-            "raw_l3":       avg_raw_l3,
-            "raw_dist":     avg_raw_dist,
-            "ce_weighted":  avg_ce_loss_s * _lce,
-            "l1_weighted":  avg_raw_l1    * _lp1,
-            "l2_weighted":  avg_raw_l2    * _lp2,
-            "l3_weighted":  avg_raw_l3    * _llg,
-            "dist_weighted":avg_raw_dist  * _lds,
-            "accuracy":     accuracy,
-        }
-    
-    
-    @torch.no_grad()
-    def validate(self, loader, desc="Val", class_names=None):
-        """Validate on given loader using total KD loss (not just CE)"""
-        self.student.eval()
-        if self.use_projection:
-            self.pca_projector.eval()
-            self.gl_projector.eval()
-
-        current_lambdas = self.loss_weights.to(self.device)
-
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        all_preds = []
-        all_labels = []
-
-        pbar = tqdm(loader, desc=f"[{desc}]")
-
-        for images, labels in pbar:
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-
-            # Teacher forward
-            teacher_out = self.teacher.extract(images)
-            logit_t = teacher_out["logits"]
-
-            # Student forward
-            feat_map, logit_s = self.student(images)
-
-            # Projector losses
-            if self.use_projection:
-                Q_t = teacher_out["Q_t"]
-                K_t = teacher_out["K_t"]
-                V_t = teacher_out["V_t"]
-                Attn_t = teacher_out["Attn_t"]
-                h_t = teacher_out["block_mean"]
-                pca_out = self.pca_projector(feat_map, Q_t, K_t, V_t)
-                PCAttn_s = pca_out["PCAttnS"]
-                V_s = pca_out["VS"]
-                h_s_proj = self.gl_projector(feat_map)
-                l_proj1, l_proj2 = self.kd_loss_fn(Attn_t, PCAttn_s, V_t, V_s, h_t, h_s_proj)
-            else:
-                l_proj1 = torch.tensor(0.0, device=self.device)
-                l_proj2 = torch.tensor(0.0, device=self.device)
-
-            # Compute all losses
-            ce_loss = self.ce_loss_fn(logit_s, labels)
-            logits_kd_loss = self.logits_loss(logit_s, logit_t.detach())
-            dist_loss = self.dist_loss_fn(logit_s, logit_t.detach())
-
-            # Build total loss (same weighting as training)
-            loss = torch.tensor(0.0, device=self.device)
-            lam_idx = 0
-            if self.use_ce:
-                loss = loss + current_lambdas[lam_idx] * ce_loss
-                lam_idx += 1
-            if self.use_proj1:
-                loss = loss + current_lambdas[lam_idx] * l_proj1
-                lam_idx += 1
-            if self.use_proj2:
-                loss = loss + current_lambdas[lam_idx] * l_proj2
-                lam_idx += 1
-            if self.use_logits:
-                loss = loss + current_lambdas[lam_idx] * logits_kd_loss
-                lam_idx += 1
-            if self.use_dist:
-                loss = loss + current_lambdas[lam_idx] * dist_loss
-
-            total_loss += loss.item()
-
-            # Accuracy
-            _, predicted = logit_s.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-
-            all_preds.extend(predicted.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-
-            pbar.set_postfix({
-                "Loss": f"{loss.item():.4f}",
-                "Acc": f"{100.*correct/total:.2f}%"
-            })
-
-        avg_loss = total_loss / len(loader)
-        accuracy = 100. * correct / total
-
-        result = {
-            "loss": avg_loss,
-            "accuracy": accuracy
-        }
-
-        # Compute per-class metrics if class_names provided
-        if class_names is not None:
-            all_preds = np.array(all_preds)
-            all_labels = np.array(all_labels)
-
-            report = classification_report(
-                all_labels, all_preds,
-                target_names=class_names,
-                output_dict=True,
-                zero_division=0
-            )
-
-            cm = confusion_matrix(all_labels, all_preds)
-
-            result["classification_report"] = report
-            result["confusion_matrix"] = cm
-            result["all_preds"] = all_preds
-            result["all_labels"] = all_labels
-
-        return result
-    
-    def save_checkpoint(self, epoch, val_loss, val_acc, is_best=False):
-        """Save checkpoint using CheckpointManager + latest.pth for resume"""
-        student_sd = self.student.state_dict()
-        optimizer_sd = self.optimizer_student.state_dict()
-        scheduler_sd = self.scheduler_student.state_dict()
-        
-        pca_sd = self.pca_projector.state_dict() if self.use_projection else None
-        gl_sd = self.gl_projector.state_dict() if self.use_projection else None
-
-        # Save via CheckpointManager (handles best.pth + cleanup internally)
-        self.checkpoint_manager.save(
-            student_state_dict=student_sd,
-            optimizer_state_dict=optimizer_sd,
-            scheduler_state_dict=scheduler_sd,
-            epoch=epoch + 1,
-            val_loss=val_loss,
-            val_acc=val_acc,
-            pca_projector_state_dict=pca_sd,
-            gl_projector_state_dict=gl_sd
-        )
-        
-        # Also save latest.pth for resume training
-        latest = {
-            "epoch": epoch + 1,
-            "student_state_dict": student_sd,
-            "optimizer_student_state_dict": optimizer_sd,
-            "scheduler_student_state_dict": scheduler_sd,
-            "val_loss": val_loss,
-            "val_acc": val_acc
-        }
-        torch.save(latest, os.path.join(self.save_dir, "latest.pth"))
-        if pca_sd is not None:
-            torch.save(pca_sd, os.path.join(self.save_dir, "latest_pca_projector.pth"))
-        if gl_sd is not None:
-            torch.save(gl_sd, os.path.join(self.save_dir, "latest_gl_projector.pth"))
-            
-    def load_checkpoint(self, path):
-        """Load checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self.student.load_state_dict(checkpoint["student_state_dict"])
-        
-        if self.use_projection:
-            dir_name = os.path.dirname(path)
-            base_name = os.path.basename(path)
-            
-            if "latest" in base_name or "best" in base_name:
-                prefix = base_name.split("_")[0] # latest or best
-                pca_path = os.path.join(dir_name, f"{prefix}_pca_projector.pth")
-                gl_path = os.path.join(dir_name, f"{prefix}_gl_projector.pth")
-            else:
-                prefix = base_name.split("_val_loss")[0] # epoch_010
-                pca_path = os.path.join(dir_name, f"{prefix}_pca.pth")
-                gl_path = os.path.join(dir_name, f"{prefix}_gl.pth")
-                
-            if os.path.exists(pca_path):
-                self.pca_projector.load_state_dict(torch.load(pca_path, map_location=self.device))
-            if os.path.exists(gl_path):
-                self.gl_projector.load_state_dict(torch.load(gl_path, map_location=self.device))
-
-        self.optimizer_student.load_state_dict(checkpoint["optimizer_student_state_dict"])
-        self.scheduler_student.load_state_dict(checkpoint["scheduler_student_state_dict"])
-        
-        val_loss = checkpoint.get('val_loss', float('inf'))
-        val_acc = checkpoint.get('val_acc', 0.0)
-        print(f"✅ Loaded checkpoint from epoch {checkpoint['epoch']} with val_loss: {val_loss:.4f}, val_acc: {val_acc:.2f}%")
-        
-        return checkpoint["epoch"], val_loss
-    
-    def train(self, resume_path=None):
-        """Full training loop"""
-        start_epoch = 0
-        best_val_loss = float('inf')  # Lower is better
-        epochs_no_improve = 0  # Early stopping counter
-
-        history = {
-            "train_loss": [],
-            "val_loss":   [],
-            "train_acc":  [],
-            "val_acc":    [],
-            "lr":         [],
-            "raw_ce":     [],
-            "raw_l1":     [],
-            "raw_l2":     [],
-            "raw_l3":     [],
-            "raw_dist":   [],
-            "epoch_time": []
-        }
-        training_start_time = time.time()
-
-        if resume_path and os.path.exists(resume_path):
-            start_epoch, best_val_loss = self.load_checkpoint(resume_path)
-            # start_epoch += 1
-
-        print("\n" + "="*60)
-        print("🚀 Starting Training")
-        print(f"   Early Stopping: patience = {self.patience}")
-        print("="*60)
-
-        for epoch in range(start_epoch, self.epochs):
-            # Train
-            epoch_start_time = time.time()
-            train_metrics = self.train_one_epoch(epoch)
-
-            # Validate
-            val_metrics = self.validate(self.val_loader, desc="Val")
-            epoch_elapsed = time.time() - epoch_start_time
-
-            # Get current LR (before step)
-            current_lr_student = self.scheduler_student.get_last_lr()[0]
-            # current_lr_teacher = self.scheduler_teacher.get_last_lr()[0]
-
-            # Record history
-            history["train_loss"].append(train_metrics["loss"])
-            history["val_loss"].append(val_metrics["loss"])
-            history["train_acc"].append(train_metrics["accuracy"])
-            history["val_acc"].append(val_metrics["accuracy"])
-            history["lr"].append(current_lr_student)
-
-            history["raw_ce"].append(train_metrics["ce_loss_s"])
-            history["raw_l1"].append(train_metrics["raw_l1"])
-            history["raw_l2"].append(train_metrics["raw_l2"])
-            history["raw_l3"].append(train_metrics["raw_l3"])
-            history["raw_dist"].append(train_metrics["raw_dist"])
-            history["epoch_time"].append(round(epoch_elapsed, 2))
-
-            # Step scheduler (epoch-level)
-            self.scheduler_student.step()
-            # self.scheduler_teacher.step()
-
-            # Print epoch summary
-            print(f"\n📊 Epoch {epoch+1}/{self.epochs} Summary (LR_S: {current_lr_student:.6f})")
-            print(f"   Train - Loss: {train_metrics['loss']:.4f}, "
-                  f"CE: {train_metrics['ce_weighted']:.4f}, "
-                  f"Proj1: {train_metrics['l1_weighted']:.4f}, "
-                  f"Proj2: {train_metrics['l2_weighted']:.4f}, "
-                  f"Logits: {train_metrics['l3_weighted']:.4f}, "
-                  f"DIST: {train_metrics['dist_weighted']:.4f}, "
-                  f"Acc: {train_metrics['accuracy']:.2f}%")
-            print(f"   Val   - Loss: {val_metrics['loss']:.4f}, "
-                  f"Acc: {val_metrics['accuracy']:.2f}%")
-            # Save checkpoint (based on lowest val_loss)
-            is_best = val_metrics["loss"] < best_val_loss
-            if is_best:
-                best_val_loss = val_metrics["loss"]
-                epochs_no_improve = 0
-            else:
-                epochs_no_improve += 1
-            
-            self.save_checkpoint(epoch, val_metrics["loss"], val_metrics["accuracy"], is_best)
-            
-            # Early stopping check
-            if epochs_no_improve >= self.patience:
-                print(f"\n⚠️ Early stopping triggered! No improvement for {self.patience} epochs.")
-                print(f"   Best val_loss: {best_val_loss:.4f}")
-                break
-            
-            print(f"   Early stopping: {epochs_no_improve}/{self.patience}")
-            print()
-        
-        # Save checkpoint manager info
-        self.checkpoint_manager.save_info()
-
-        history["total_training_time"] = round(time.time() - training_start_time, 2)
-
-        # ===== Plot learning curves =====
-        plot_training_curves(history, self.save_dir)
-
-        # ===== Evaluate all 3 strategies =====
-        all_results = self.evaluate_all_strategies(history)
-
-        # ===== Cleanup training checkpoints, keep only strategy files =====
-        self._cleanup_training_checkpoints()
-
-        # ===== Keep only best-F1 strategy checkpoint =====
-        from config import Config as _Cfg
-        if getattr(_Cfg, 'KEEP_BEST_F1_CHECKPOINT_ONLY', False):
-            self._keep_best_f1_checkpoint()
-
-        return all_results
-
-    def _export_metrics_to_excel(self, metrics, class_names):
-        """Export per-class metrics and confusion matrix to Excel"""
-        report = metrics["classification_report"]
-        cm = metrics["confusion_matrix"]
-
-        excel_path = os.path.join(self.save_dir, "test_metrics.xlsx")
-
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            # Sheet 1: Per-class metrics
-            rows = []
-            for cls_name in class_names:
-                m = report[cls_name]
-                rows.append({
-                    "Class": cls_name,
-                    "Precision": round(m["precision"], 4),
-                    "Recall": round(m["recall"], 4),
-                    "F1-Score": round(m["f1-score"], 4),
-                    "Support": int(m["support"])
-                })
-            # Add overall metrics
-            for avg_type in ["macro avg", "weighted avg"]:
-                m = report[avg_type]
-                rows.append({
-                    "Class": avg_type.title(),
-                    "Precision": round(m["precision"], 4),
-                    "Recall": round(m["recall"], 4),
-                    "F1-Score": round(m["f1-score"], 4),
-                    "Support": int(m["support"])
-                })
-            rows.append({
-                "Class": "Overall Accuracy",
-                "Precision": "",
-                "Recall": "",
-                "F1-Score": round(report["accuracy"], 4),
-                "Support": int(report["macro avg"]["support"])
-            })
-
-            df_metrics = pd.DataFrame(rows)
-            df_metrics.to_excel(writer, sheet_name="Per-Class Metrics", index=False)
-
-            # Sheet 2: Confusion Matrix
-            df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
-            df_cm.index.name = "Actual \\ Predicted"
-            df_cm.to_excel(writer, sheet_name="Confusion Matrix")
-
-        print(f"\n📁 Metrics exported to: {excel_path}")
-
-    # =================================================================
-    # Evaluation Strategy Methods
-    # =================================================================
-    @torch.no_grad()
-    def evaluate_model_full(self, model, loader, class_names):
-        """Full evaluation: per-class precision/recall/F1, AUC, confusion matrix"""
-        model.eval()
-        all_preds = []
-        all_labels = []
-        all_probs = []
-        running_loss = 0.0
-        total = 0
-        criterion = nn.CrossEntropyLoss()
-
-        for images, labels in tqdm(loader, desc="Evaluating", leave=False):
-            images = images.to(self.device)
-            labels = labels.to(self.device)
-            _, logits = model(images)
-            loss = criterion(logits, labels)
-            probs = torch.softmax(logits, dim=1)
-            _, preds = logits.max(1)
-            running_loss += loss.item() * images.size(0)
-            total += labels.size(0)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-        all_preds = np.array(all_preds)
-        all_labels = np.array(all_labels)
-        all_probs = np.array(all_probs)
-
-        test_loss = running_loss / total
-        accuracy = accuracy_score(all_labels, all_preds) * 100
-        precision = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-        recall = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-        try:
-            auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') * 100
-        except Exception:
-            auc = 0.0
-
-        report = classification_report(
-            all_labels, all_preds,
-            target_names=class_names,
-            output_dict=True,
-            zero_division=0
-        )
-        cm = confusion_matrix(all_labels, all_preds)
-
-        return {
-            'Test Loss': test_loss,
-            'Accuracy (%)': accuracy,
-            'Precision (%)': precision,
-            'Recall (%)': recall,
-            'F1-Score (%)': f1,
-            'AUC (%)': auc,
-            'classification_report': report,
-            'confusion_matrix': cm,
-        }
-
-    def _create_student_model(self):
-        """Create a fresh StudentWithHead for loading averaged weights"""
-        model = StudentWithHead(
-            num_classes=self.num_classes, pretrained=False,
-            fc_hidden=self.student_fc_hidden, fc_dropout=self.student_fc_dropout
-        )
-        return model.to(self.device)
-
-    def _print_strategy_results(self, metrics, strategy_name, class_names):
-        """Print evaluation results for one strategy"""
-        print(f"    {'='*60}")
-        print(f"    📊 TEST RESULTS - {strategy_name}:")
-        print(f"    {'='*60}")
-        print(f"    Test Loss : {metrics['Test Loss']:>8.4f}")
-        print(f"    Accuracy  : {metrics['Accuracy (%)']:>8.2f}%")
-        print(f"    Precision : {metrics['Precision (%)']:>8.2f}%")
-        print(f"    Recall    : {metrics['Recall (%)']:>8.2f}%")
-        print(f"    F1-Score  : {metrics['F1-Score (%)']:>8.2f}%")
-        print(f"    AUC       : {metrics['AUC (%)']:>8.2f}%")
-        print(f"    {'='*60}")
-        if 'classification_report' in metrics:
-            report = metrics['classification_report']
-            print(f"    {'Class':<25} {'Precision':>10} {'Recall':>10} {'F1-Score':>10} {'Support':>10}")
-            print(f"    {'-'*65}")
-            for cls_name in class_names:
-                m = report[cls_name]
-                print(f"    {cls_name:<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-            print(f"    {'-'*65}")
-            m = report['macro avg']
-            print(f"    {'Macro Avg':<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-            m = report['weighted avg']
-            print(f"    {'Weighted Avg':<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-
-    def strategy_1_best_checkpoint(self, class_names):
-        """Strategy 1: Evaluate best checkpoint (lowest val_loss)"""
-        print(f"\n  Strategy 1: Best checkpoint (lowest val_loss)")
-        best = self.checkpoint_manager.get_best_checkpoint()
-        if best is None:
-            print("    No checkpoints available!")
-            return None
-
-        epoch, val_loss, path = best
-        print(f"    Best checkpoint: Epoch {epoch}, Val Loss: {val_loss:.4f}")
-
-        model = self._create_student_model()
-        cp = torch.load(path, map_location=self.device)
-        model.load_state_dict(cp['student_state_dict'])
-
-        # Save strategy checkpoint
-        save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'strategy1_best_epoch_{epoch}.pth')
-        torch.save({'student_state_dict': model.state_dict(), 'epoch': epoch, 'val_loss': val_loss}, save_path)
-        print(f"    ✓ Saved to: {save_path}")
-
-        metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-        self._print_strategy_results(metrics, "Strategy 1 (Best Checkpoint)", class_names)
-        return metrics
-
-    def strategy_2_top_k_average(self, class_names):
-        """Strategy 2: Average top-K checkpoints (K=2,3,4,5) and evaluate"""
-        print(f"\n  Strategy 2: Top-K checkpoint averaging")
-        results = {}
-
-        for k in [2, 3, 4, 5]:
-            print(f"    K={k}:")
-            top_k = self.checkpoint_manager.get_top_k_checkpoints(k)
-
-            if len(top_k) < k:
-                print(f"      Warning: Only {len(top_k)} checkpoints available")
-            if not top_k:
-                continue
-
-            paths = [p for _, _, p in top_k]
-            avg_weights = average_student_weights(paths, self.device)
-
-            model = self._create_student_model()
-            model.load_state_dict(avg_weights, strict=True)
-
-            print(f"      Updating BatchNorm statistics...")
-            update_bn_stats(model, self.train_loader, self.device, num_batches=100)
-
-            # Save
-            save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-            os.makedirs(save_dir, exist_ok=True)
-            save_path = os.path.join(save_dir, f'strategy2_top_{k}_averaged.pth')
-            torch.save({'student_state_dict': model.state_dict(), 'k': k}, save_path)
-            print(f"      ✓ Saved to: {save_path}")
-
-            metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-            self._print_strategy_results(metrics, f"Strategy 2 (Top-{k} Avg)", class_names)
-            results[k] = metrics
-
-        return results
-
-    def strategy_3_last_n_average(self, class_names):
-        """Strategy 3: Average last N epoch checkpoints"""
-        print(f"\n  Strategy 3: Last {self.last_n_epochs} epochs averaging")
-        last_n = self.checkpoint_manager.get_last_n_checkpoints(self.last_n_epochs)
-
-        if not last_n:
-            print("    No checkpoints available!")
-            return None
-        if len(last_n) < self.last_n_epochs:
-            print(f"    Warning: Only {len(last_n)} checkpoints available")
-
-        epochs = [e for e, _, _ in last_n]
-        paths = [p for _, _, p in last_n]
-        print(f"    Averaging epochs: {epochs}")
-
-        avg_weights = average_student_weights(paths, self.device)
-
-        model = self._create_student_model()
-        model.load_state_dict(avg_weights, strict=True)
-
-        print(f"    Updating BatchNorm statistics...")
-        update_bn_stats(model, self.train_loader, self.device, num_batches=100)
-
-        # Save
-        save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-        os.makedirs(save_dir, exist_ok=True)
-        save_path = os.path.join(save_dir, f'strategy3_last_{self.last_n_epochs}_averaged.pth')
-        torch.save({'student_state_dict': model.state_dict(), 'epochs': epochs}, save_path)
-        print(f"    ✓ Saved to: {save_path}")
-
-        metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-        self._print_strategy_results(metrics, f"Strategy 3 (Last {self.last_n_epochs} Avg)", class_names)
-        return metrics
-
-    def evaluate_all_strategies(self, history=None):
-        """Run all 3 evaluation strategies and export results to Excel"""
-        print("\n" + "="*70)
-        print("🧪 Evaluating All Strategies")
-        print("="*70)
-
-        class_names = self.data_handler.get_class_names()
-        all_results = {}
-
-        # Strategy 1: Best single checkpoint
-        metrics_1 = self.strategy_1_best_checkpoint(class_names)
-        if metrics_1:
-            all_results['Strategy 1 (Best)'] = metrics_1
-
-        # Strategy 2: Top-K averaging
-        strategy_2 = self.strategy_2_top_k_average(class_names)
-        for k, metrics in strategy_2.items():
-            all_results[f'Strategy 2 (Top-{k} Avg)'] = metrics
-
-        # Strategy 3: Last N epochs averaging
-        metrics_3 = self.strategy_3_last_n_average(class_names)
-        if metrics_3:
-            all_results[f'Strategy 3 (Last {self.last_n_epochs} Avg)'] = metrics_3
-
-        # Export all results to Excel
-        self._export_all_strategies_to_excel(all_results, class_names, history)
-
-        # Store for _keep_best_f1_checkpoint()
-        self._last_all_results = all_results
-
-        # Print summary table
-        print("\n" + "="*70)
-        print("📊 SUMMARY OF ALL STRATEGIES")
-        print("="*70)
-        print(f"{'Strategy':<35} {'Accuracy':>10} {'F1-Score':>10} {'AUC':>10}")
-        print("-" * 70)
-        for name, m in all_results.items():
-            print(f"{name:<35} {m['Accuracy (%)']:>9.2f}% {m['F1-Score (%)']:>9.2f}% {m['AUC (%)']:>9.2f}%")
-        print("=" * 70)
-
-        return all_results
-
-    def _export_all_strategies_to_excel(self, all_results, class_names, history=None):
-        """Export all strategy results to Excel with 3 sheets: Macro Results + Per-Class Metrics + Lambda weight"""
-        excel_path = os.path.join(self.save_dir, "all_strategies_results.xlsx")
-
-        with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-            # ===== Sheet 1: Macro Results =====
-            summary_rows = []
-            for strategy_name, metrics in all_results.items():
-                summary_rows.append({
-                    "Strategy": strategy_name,
-                    "Test Loss": round(metrics['Test Loss'], 4),
-                    "Accuracy (%)": round(metrics['Accuracy (%)'], 2),
-                    "Precision (%)": round(metrics['Precision (%)'], 2),
-                    "Recall (%)": round(metrics['Recall (%)'], 2),
-                    "F1-Score (%)": round(metrics['F1-Score (%)'], 2),
-                    "AUC (%)": round(metrics['AUC (%)'], 2),
-                })
-            df_summary = pd.DataFrame(summary_rows)
-            df_summary.to_excel(writer, sheet_name="Macro Results", index=False)
-
-            # ===== Sheet 2: Per-Class Metrics for all strategies =====
-            per_class_rows = []
-            for strategy_name, metrics in all_results.items():
-                if 'classification_report' not in metrics or 'confusion_matrix' not in metrics:
-                    continue
-                report = metrics['classification_report']
-                cm = metrics['confusion_matrix']
-
-                for idx, cls_name in enumerate(class_names):
-                    m = report[cls_name]
-                    # Per-class accuracy = correctly classified / total samples of this class
-                    cls_total = cm[idx].sum()
-                    cls_accuracy = (cm[idx][idx] / cls_total * 100) if cls_total > 0 else 0.0
-                    per_class_rows.append({
-                        "Strategy": strategy_name,
-                        "Class": cls_name,
-                        "Accuracy (%)": round(cls_accuracy, 2),
-                        "Precision (%)": round(m["precision"] * 100, 2),
-                        "Recall (%)": round(m["recall"] * 100, 2),
-                        "F1-Score (%)": round(m["f1-score"] * 100, 2),
-                        "Support": int(m["support"])
-                    })
-
-            if per_class_rows:
-                df_per_class = pd.DataFrame(per_class_rows)
-                df_per_class.to_excel(writer, sheet_name="Per-Class Metrics", index=False)
-                
-            # ===== Sheet 3: Training Time =====
-            if history and "epoch_time" in history:
-                epoch_times = history["epoch_time"]
-                total_time = history.get("total_training_time", sum(epoch_times))
-                time_rows = []
-                for i, t in enumerate(epoch_times):
-                    m, s = divmod(int(t), 60)
-                    time_rows.append({
-                        "Epoch": i + 1,
-                        "Time (s)": t,
-                        "Time (mm:ss)": f"{m:02d}:{s:02d}"
-                    })
-                total_m, total_s = divmod(int(total_time), 60)
-                time_rows.append({
-                    "Epoch": "Total",
-                    "Time (s)": total_time,
-                    "Time (mm:ss)": f"{total_m:02d}:{total_s:02d}"
-                })
-                df_time = pd.DataFrame(time_rows)
-                df_time.to_excel(writer, sheet_name="Training Time", index=False)
-
-        print(f"\n📁 All strategies results exported to: {excel_path}")
-
-    def _cleanup_training_checkpoints(self):
-        """
-        Xóa tất cả checkpoint training sau khi đã evaluate xong.
-        Chỉ giữ lại folder saved_checkpoints/ chứa 6 strategy files
-        (Strategy 1×1 + Strategy 2×4 + Strategy 3×1).
-        """
-        print("\n🧹 Cleaning up training checkpoints...")
-        kept = 0
-        removed = 0
-
-        # Tên các file training cần xóa (không phải strategy files)
-        _TRAINING_FILES = {
-            'best.pth', 'latest.pth',
-            'best_pca_projector.pth', 'best_gl_projector.pth',
-            'latest_pca_projector.pth', 'latest_gl_projector.pth',
-            'checkpoint_info.json',
-        }
-
-        for fname in os.listdir(self.save_dir):
-            fpath = os.path.join(self.save_dir, fname)
-            # Bỏ qua thư mục con (saved_checkpoints/)
-            if os.path.isdir(fpath):
-                continue
-            # Giữ lại Excel / CSV
-            if fname.endswith('.xlsx') or fname.endswith('.csv') or fname.endswith('.png'):
-                kept += 1
-                continue
-            # Xóa epoch checkpoints và các training files đã biết
-            if (fname.startswith('epoch_') and fname.endswith('.pth')) or fname in _TRAINING_FILES:
-                try:
-                    os.remove(fpath)
-                    removed += 1
-                except Exception as e:
-                    print(f"   Warning: Could not delete {fpath}: {e}")
-            else:
-                kept += 1
-
-        # Count strategy files kept
-        saved_cp_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-        strategy_files = 0
-        if os.path.isdir(saved_cp_dir):
-            strategy_files = len([f for f in os.listdir(saved_cp_dir) if f.endswith('.pth')])
-
-        print(f"   Removed {removed} training checkpoint files")
-        print(f"   Kept {strategy_files} strategy checkpoint files in saved_checkpoints/")
-        print(f"   Kept {kept} other files (Excel, PNG, etc.)")
-
-    def _keep_best_f1_checkpoint(self):
-        """
-        Sau khi evaluate xong tất cả strategies, chỉ giữ lại 1 file
-        trong saved_checkpoints/ của strategy có F1-Score cao nhất.
-        Xóa các file .pth còn lại.
-        Phải được gọi sau _cleanup_training_checkpoints() và sau khi
-        all_results đã được set (truyền vào từ train()).
-        """
-        saved_cp_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-        if not os.path.isdir(saved_cp_dir):
-            return
-
-        pth_files = [f for f in os.listdir(saved_cp_dir) if f.endswith('.pth')]
-        if not pth_files:
-            return
-
-        all_results = getattr(self, '_last_all_results', None)
-        if not all_results:
-            print("   ⚠ No strategy results found — skipping best-F1 checkpoint cleanup")
-            return
-
-        # Tìm strategy có F1 cao nhất
-        best_strategy = max(all_results.keys(), key=lambda s: all_results[s].get('F1-Score (%)', 0.0))
-        best_f1 = all_results[best_strategy].get('F1-Score (%)', 0.0)
-
-        # Map strategy name → filename prefix
-        def _to_prefix(name):
-            if 'Strategy 1' in name:
-                return 'strategy1_'
-            if 'Top-2' in name:
-                return 'strategy2_top_2_'
-            if 'Top-3' in name:
-                return 'strategy2_top_3_'
-            if 'Top-4' in name:
-                return 'strategy2_top_4_'
-            if 'Top-5' in name:
-                return 'strategy2_top_5_'
-            if 'Strategy 3' in name or 'Last' in name:
-                return 'strategy3_'
-            return None
-
-        best_prefix = _to_prefix(best_strategy)
-        if best_prefix is None:
-            print(f"   ⚠ Cannot map '{best_strategy}' to file prefix — skipping")
-            return
-
-        best_final = os.path.join(saved_cp_dir, 'best_f1_checkpoint.pth')
-        renamed = False
-        for fname in pth_files:
-            fpath = os.path.join(saved_cp_dir, fname)
-            if fname.startswith(best_prefix) and not renamed:
-                os.rename(fpath, best_final)
-                renamed = True
-                print(f"\n🏆 Best F1 strategy: {best_strategy} (F1={best_f1:.2f}%) → best_f1_checkpoint.pth")
-            else:
-                try:
-                    os.remove(fpath)
-                except Exception as e:
-                    print(f"   ⚠ Could not delete {fpath}: {e}")
-
-        if not renamed:
-            print(f"   ⚠ No file with prefix '{best_prefix}' found in saved_checkpoints/")
-
-    def get_student_model(self):
-        """
-        Trả về student model (không có projectors) để inference
-        """
-        return self.student
-
-
-# =============================================================================
-# Heuristic Loss Weight Initialisation (§ Loss Weight Initialisation)
-# =============================================================================
-def run_heuristic_weight_init(base_config):
-    """
-    Run 5 single-loss experiments (CE, Proj1, Proj2, Logits, DIST),
-    each with λ=1.0 in isolation.
-
-    Dataset split:
-      - Train: original 70%
-      - Eval : original 15% val (fixed, same indices across all 5 runs)
-      - Test : original 15% test → HELD OUT, never touched.
-
-    After all 5 runs, normalise contribution F1-scores to produce
-    dataset-specific λ values and export summary to Excel.
-    """
-    loss_configs = {
-        "ce":     {"use_ce": True,  "use_proj1": False, "use_proj2": False, "use_logits": False, "use_dist": False, "use_projection": False},
-        "proj1":  {"use_ce": False, "use_proj1": True,  "use_proj2": False, "use_logits": False, "use_dist": False, "use_projection": True},
-        "proj2":  {"use_ce": False, "use_proj1": False, "use_proj2": True,  "use_logits": False, "use_dist": False, "use_projection": True},
-        "logits": {"use_ce": False, "use_proj1": False, "use_proj2": False, "use_logits": True,  "use_dist": False, "use_projection": False},
-        "dist":   {"use_ce": False, "use_proj1": False, "use_proj2": False, "use_logits": False, "use_dist": True,  "use_projection": False},
-    }
-
-    all_metrics = {}  # {loss_name: {strategy_name: metrics_dict}}
-    ablation_save_dir = base_config["save_dir"]
-    os.makedirs(ablation_save_dir, exist_ok=True)
-
-    for loss_name, flags in loss_configs.items():
-        print("\n" + "=" * 70)
-        print(f"� WEIGHT INIT RUN: {loss_name.upper()} (λ=1.0)")
-        print("=" * 70)
-
-        # Build config for this run
-        run_config = dict(base_config)
-        run_config.update(flags)
-        run_config["heuristic_weight_init_mode"] = True
-        run_config["loss_lambdas"] = [1.0, 1.0, 1.0, 1.0, 1.0]
-        run_config["save_dir"] = os.path.join(ablation_save_dir, f"ablation_{loss_name}")
-
-        # Reset seed for each run to ensure identical data splits
-        set_seed(run_config.get("random_seed", 42))
-
-        pipeline = DistillationPipeline(**run_config)
-        results = pipeline.train()
-        all_metrics[loss_name] = results
-
-        # ── Explicit cleanup: shutdown DataLoader workers & free VRAM ──
-        try:
-            pipeline.train_loader._iterator._shutdown_workers()
-        except Exception:
-            pass
-        try:
-            pipeline.val_loader._iterator._shutdown_workers()
-        except Exception:
-            pass
-        try:
-            pipeline.test_loader._iterator._shutdown_workers()
-        except Exception:
-            pass
-        del pipeline
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-
-        print(f"\n✅ Weight init run '{loss_name}' completed. VRAM & workers released.\n")
-
-    # ===== Compute relative weights from Strategy 1 (Best Checkpoint) =====
-    _export_weight_init_summary(all_metrics, ablation_save_dir)
-
-
-def _export_weight_init_summary(all_metrics, save_dir):
-    """
-    Normalise per-loss contribution F1-scores to λ values and export to Excel.
-    Uses Strategy 1 (Best Checkpoint) accuracy & F1 for weight calculation.
-    """
-    loss_names = ["ce", "proj1", "proj2", "logits", "dist"]
-    strategy_key = "Strategy 1 (Best)"
-
-    rows = []
-    for loss_name in loss_names:
-        strats = all_metrics.get(loss_name, {})
-        m = strats.get(strategy_key, None)
-        if m is None:
-            # Fallback: try any available strategy
-            if strats:
-                m = next(iter(strats.values()))
-            else:
-                rows.append({"Loss": loss_name, "Accuracy (%)": 0.0, "F1-Score (%)": 0.0})
-                continue
-        rows.append({
-            "Loss": loss_name,
-            "Accuracy (%)": round(m.get("Accuracy (%)", 0.0), 4),
-            "F1-Score (%)": round(m.get("F1-Score (%)", 0.0), 4),
-            "Precision (%)": round(m.get("Precision (%)", 0.0), 4),
-            "Recall (%)": round(m.get("Recall (%)", 0.0), 4),
-            "AUC (%)": round(m.get("AUC (%)", 0.0), 4),
-            "Test Loss": round(m.get("Test Loss", 0.0), 4),
-        })
-
-    # Compute relative weights
-    total_acc = sum(r["Accuracy (%)"] for r in rows)
-    total_f1  = sum(r["F1-Score (%)"] for r in rows)
-    for r in rows:
-        r["Weight (by Accuracy)"] = round(r["Accuracy (%)"] / total_acc, 6) if total_acc > 0 else 0.0
-        r["Weight (by F1)"]       = round(r["F1-Score (%)"] / total_f1, 6)  if total_f1  > 0 else 0.0
-
-    df = pd.DataFrame(rows)
-
-    excel_path = os.path.join(save_dir, "ablation_weight_summary.xlsx")
-    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Ablation Weights", index=False)
+    return models
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train and evaluate pretrained image classification models.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--model",
+        "--models",
+        dest="models",
+        nargs="+",
+        help="Model(s) to run. Use a space-separated list, comma-separated list, or 'all'.",
+    )
+    parser.add_argument(
+        "--data-root",
+        "--dataset-path",
+        dest="data_root",
+        help=(
+            "Folder that contains 'cifar-100-python'. Overrides Config.DATA_ROOT. "
+            "The dataset is never downloaded."
+        ),
+    )
+    parser.add_argument("--results-dir", "--output-dir", dest="results_dir", help="Base directory for run outputs.")
+    parser.add_argument(
+        "--checkpoints-dir",
+        help="Optional base directory for training checkpoints. A per-run subfolder is still created.",
+    )
+    parser.add_argument("--run-name", help="Optional readable name for this run folder.")
+    parser.add_argument(
+        "--gpu",
+        "--cuda-visible-devices",
+        dest="cuda_visible_devices",
+        help="CUDA_VISIBLE_DEVICES value, e.g. 0, 1, or 0,1. Set before torch import.",
+    )
+    parser.add_argument("--batch-size", type=int, help="Override Config.BATCH_SIZE.")
+    parser.add_argument("--epochs", type=int, help="Override Config.NUM_EPOCHS.")
+    parser.add_argument("--warmup-epochs", type=int, help="Override Config.WARMUP_EPOCHS.")
+    parser.add_argument("--eta-min", type=float, help="Override Config.ETA_MIN for CosineAnnealingLR.")
+    parser.add_argument("--early-stopping", type=int, help="Override Config.EARLY_STOPPING_PATIENCE.")
+    parser.add_argument(
+        "--fc-layers",
+        nargs="+",
+        type=int,
+        help="Hidden layer sizes for the classifier head, e.g. --fc-layers 256 128.",
+    )
+    parser.add_argument("--dropout", type=float, help="Override Config.DROPOUT_RATE.")
+    parser.add_argument("--num-workers", type=int, help="Override Config.NUM_WORKERS.")
+    parser.add_argument(
+        "--profile-batches",
+        type=int,
+        help="Print DataLoader and compute timing for the first N training batches.",
+    )
+    parser.add_argument(
+        "--dataset-stats",
+        action="store_true",
+        help="Print image-size dataset statistics before training. This opens up to 1000 images per run.",
+    )
+    parser.add_argument("--seed", type=int, help="Override Config.RANDOM_SEED.")
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        help="Run these seeds sequentially. If omitted and --seed is not set, Config.SEEDS is used.",
+    )
+    parser.add_argument("--lr", type=float, help="Override Config.LEARNING_RATE.")
+    parser.add_argument("--weight-decay", type=float, help="Override Config.WEIGHT_DECAY.")
+    parser.add_argument(
+        "--optimizer",
+        choices=Config.SUPPORTED_OPTIMIZERS,
+        help="Override Config.OPTIMIZER.",
+    )
+    parser.add_argument(
+        "--momentum",
+        type=float,
+        help="Override Config.SGD_MOMENTUM (used by sgd and rmsprop).",
+    )
+    parser.add_argument(
+        "--no-nesterov",
+        action="store_true",
+        help="Disable Nesterov momentum for --optimizer sgd.",
+    )
+    parser.add_argument(
+        "--no-fused-optimizer",
+        action="store_true",
+        help="Disable fused optimizer kernels even on CUDA.",
+    )
+    parser.add_argument("--cv", action="store_true", help="Enable cross-validation.")
+    parser.add_argument("--no-cv", action="store_true", help="Disable cross-validation.")
+    parser.add_argument("--cv-splits", type=int, help="Override Config.CV_N_SPLITS.")
+    parser.add_argument("--weighted-sampler", action="store_true", help="Enable WeightedRandomSampler.")
+    parser.add_argument("--no-weighted-sampler", action="store_true", help="Disable WeightedRandomSampler.")
+    parser.add_argument("--auto-delete-checkpoints", action="store_true", help="Delete training checkpoints after evaluation.")
+    parser.add_argument("--keep-checkpoints", action="store_true", help="Keep training checkpoints after evaluation.")
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Enable deterministic CUDA behavior. Slower, but more reproducible.",
+    )
+    parser.add_argument(
+        "--cublas-workspace-config",
+        default=":4096:8",
+        help="CUBLAS_WORKSPACE_CONFIG used only with --deterministic.",
+    )
+    return parser.parse_args()
+
+
+def apply_cli_overrides(args):
+    models = parse_model_list(args.models)
+    if models:
+        Config.MODELS = models
+
+    overrides = [
+        ("DATA_ROOT", args.data_root),
+        ("RESULTS_DIR", args.results_dir),
+        ("CHECKPOINTS_DIR", args.checkpoints_dir),
+        ("BATCH_SIZE", args.batch_size),
+        ("NUM_EPOCHS", args.epochs),
+        ("WARMUP_EPOCHS", args.warmup_epochs),
+        ("ETA_MIN", args.eta_min),
+        ("EARLY_STOPPING_PATIENCE", args.early_stopping),
+        ("DROPOUT_RATE", args.dropout),
+        ("NUM_WORKERS", args.num_workers),
+        ("PROFILE_BATCHES", args.profile_batches),
+        ("RANDOM_SEED", args.seed),
+        ("LEARNING_RATE", args.lr),
+        ("WEIGHT_DECAY", args.weight_decay),
+        ("OPTIMIZER", args.optimizer),
+        ("SGD_MOMENTUM", args.momentum),
+        ("CV_N_SPLITS", args.cv_splits),
+    ]
+    for attr, value in overrides:
+        if value is not None:
+            setattr(Config, attr, value)
+
+    if args.fc_layers is not None:
+        Config.CLASSIFIER_CONFIG = args.fc_layers
+
+    if args.no_nesterov:
+        Config.SGD_NESTEROV = False
+
+    if args.no_fused_optimizer:
+        Config.USE_FUSED_OPTIMIZER = False
+
+    if args.dataset_stats:
+        Config.PRINT_DATASET_STATS = True
+
+    if args.epochs is not None and args.warmup_epochs is None:
+        Config.WARMUP_EPOCHS = min(5, max(1, int(Config.NUM_EPOCHS * 0.1)))
+
+    if args.cv and args.no_cv:
+        raise ValueError("Use only one of --cv or --no-cv.")
+    if args.cv:
+        Config.USE_CROSS_VALIDATION = True
+    if args.no_cv:
+        Config.USE_CROSS_VALIDATION = False
+
+    if args.weighted_sampler and args.no_weighted_sampler:
+        raise ValueError("Use only one of --weighted-sampler or --no-weighted-sampler.")
+    if args.weighted_sampler:
+        Config.USE_WEIGHTED_SAMPLER = True
+    if args.no_weighted_sampler:
+        Config.USE_WEIGHTED_SAMPLER = False
+
+    if args.auto_delete_checkpoints and args.keep_checkpoints:
+        raise ValueError("Use only one of --auto-delete-checkpoints or --keep-checkpoints.")
+    if args.auto_delete_checkpoints:
+        Config.AUTO_DELETE_CHECKPOINTS = True
+    if args.keep_checkpoints:
+        Config.AUTO_DELETE_CHECKPOINTS = False
+
+
+def run_seed_jobs_if_needed(args):
+    """Run each configured seed as a separate process with its own output folder."""
+    if args.seed is not None:
+        return False
+
+    seeds = args.seeds if args.seeds else getattr(Config, "SEEDS", None)
+    if not seeds:
+        return False
+
+    seeds = [int(seed) for seed in seeds]
+    if len(seeds) <= 1:
+        Config.RANDOM_SEED = seeds[0]
+        return False
+
+    base_args = sys.argv[1:]
+    original_run_name = args.run_name
 
     print("\n" + "=" * 70)
-    print("📈 ABLATION WEIGHT SUMMARY")
-    print("=" * 70)
-    print(df.to_string(index=False))
-    print(f"\n📁 Saved to: {excel_path}")
+    print(f" MULTI-SEED RUN: {seeds}")
     print("=" * 70)
 
-    return df
+    for seed in seeds:
+        child_args = base_args + ["--seed", str(seed)]
+        if original_run_name:
+            child_args += ["--run-name", f"{sanitize_run_name(original_run_name)}_seed{seed}"]
+        else:
+            model_part = "_".join(Config.MODELS) if Config.MODELS else "models"
+            child_args += ["--run-name", f"{sanitize_run_name(model_part)}_seed{seed}"]
+
+        print(f"\n[Seed {seed}] Starting: {sys.executable} {os.path.basename(__file__)} {' '.join(child_args)}")
+        subprocess.run([sys.executable, __file__, *child_args], check=True)
+
+    print("\n" + "=" * 70)
+    print(" MULTI-SEED RUN COMPLETED")
+    print("=" * 70)
+    return True
 
 
-# ===== Main =====
-if __name__ == "__main__":
-    from config import Config
-    from sklearn.model_selection import StratifiedKFold, train_test_split
-    from torchvision.datasets import ImageFolder
+def get_next_run_folder(base_results_dir, run_name=None):
+    """
+    Tạo folder mới cho mỗi lần chạy
+    Tự động tăng số thứ tự: results/1/, results/2/, results/3/, ...
+    
+    Args:
+        base_results_dir: Thư mục results gốc
+    
+    Returns:
+        run_folder: Đường dẫn đến folder cho lần chạy này
+        run_number: Số thứ tự lần chạy
+    """
+    os.makedirs(base_results_dir, exist_ok=True)
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = Config.CUDA_VISIBLE_DEVICES
+    if run_name:
+        safe_name = sanitize_run_name(run_name)
+        suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pid = os.getpid()
+        candidates = [
+            safe_name,
+            f"{safe_name}_{suffix}_{pid}",
+        ]
 
-    if Config.HEURISTIC_WEIGHT_INIT_MODE:
-        # ── Heuristic Loss Weight Initialisation ──
-        print("=" * 60)
-        print("🔬 HEURISTIC WEIGHT INIT MODE ENABLED")
-        print("   Running 5 single-loss experiments to compute λ values.")
-        print("=" * 60)
-        Config.print_config()
-        config = Config.to_pipeline_dict()
-        run_heuristic_weight_init(config)
-        import sys; sys.exit(0)
+        for candidate in candidates:
+            run_folder = os.path.join(base_results_dir, candidate)
+            try:
+                os.mkdir(run_folder)
+                return run_folder, candidate
+            except FileExistsError:
+                continue
 
-    # ── Normal Training ──
-    Config.print_config()
-    config = Config.to_pipeline_dict()
-    print(f"[KD] block_ids = {config['block_ids']}")
-    print(f"[KD] block_qkv_id = {config['block_qkv_id']}")
+        counter = 1
+        while True:
+            run_id = f"{safe_name}_{suffix}_{pid}_{counter}"
+            run_folder = os.path.join(base_results_dir, run_id)
+            try:
+                os.mkdir(run_folder)
+                return run_folder, run_id
+            except FileExistsError:
+                counter += 1
+    
+    # Tìm tất cả các folder có dạng số
+    existing_runs = []
+    for item in os.listdir(base_results_dir):
+        item_path = os.path.join(base_results_dir, item)
+        if os.path.isdir(item_path) and item.isdigit():
+            existing_runs.append(int(item))
+    
+    # Tìm số tiếp theo
+    next_run = max(existing_runs) + 1 if existing_runs else 1
+    
+    # Tạo folder mới
+    while True:
+        run_folder = os.path.join(base_results_dir, str(next_run))
+        try:
+            os.mkdir(run_folder)
+            return run_folder, next_run
+        except FileExistsError:
+            next_run += 1
 
+
+def save_model_results(model_name, results, output_dir):
+    """
+    Save individual model results to Excel (2 sheets: macro + per-class)
+
+    Args:
+        model_name: Name of the model
+        results: Dictionary with strategy results
+        output_dir: Directory to save results
+    """
+    model_dir = os.path.join(output_dir, model_name)
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Sheet 1: Macro-averaged metrics
+    macro_rows = []
+    for strategy_name, result in results.items():
+        row = {
+            'Model': model_name,
+            'Strategy': strategy_name,
+            **result['metrics']
+        }
+        macro_rows.append(row)
+
+    df_macro = pd.DataFrame(macro_rows)
+
+    # Reorder columns (including Test Loss)
+    column_order = ['Model', 'Strategy', 'Test Loss', 'Accuracy (%)', 'Precision (%)',
+                   'Recall (%)', 'F1-Score (%)', 'AUC (%)']
+    df_macro = df_macro[column_order]
+
+    # Sheet 2: Per-class metrics
+    per_class_rows = []
+    for strategy_name, result in results.items():
+        for cls_name, cls_metrics in result['per_class'].items():
+            pc_row = {
+                'Model': model_name,
+                'Strategy': strategy_name,
+                'Class': cls_name,
+                **cls_metrics
+            }
+            per_class_rows.append(pc_row)
+
+    df_per_class = pd.DataFrame(per_class_rows)
+    pc_column_order = ['Model', 'Strategy', 'Class', 'Precision (%)', 'Recall (%)',
+                       'F1-Score (%)', 'Specificity (%)', 'AUC (%)', 'Support']
+    df_per_class = df_per_class[pc_column_order]
+
+    # Save both sheets to Excel
+    excel_path = os.path.join(model_dir, f'{model_name}_results.xlsx')
+    with pd.ExcelWriter(excel_path, engine='openpyxl') as writer:
+        df_macro.to_excel(writer, sheet_name='Macro Results', index=False)
+        df_per_class.to_excel(writer, sheet_name='Per-Class Results', index=False)
+    print(f"  ✓ Results saved to: {excel_path}")
+
+    return df_macro
+
+
+def delete_model_checkpoints(model_name, checkpoints_dir):
+    """
+    Delete all checkpoints for a specific model
+    
+    Args:
+        model_name: Name of the model
+        checkpoints_dir: Base checkpoints directory
+    """
+    model_checkpoint_dir = os.path.join(checkpoints_dir, model_name)
+    
+    if os.path.exists(model_checkpoint_dir):
+        try:
+            shutil.rmtree(model_checkpoint_dir)
+            print(f"  ✓ Deleted checkpoints: {model_checkpoint_dir}")
+        except Exception as e:
+            print(f"  ✗ Error deleting checkpoints: {str(e)}")
+    else:
+        print(f"  ⚠ No checkpoints found at: {model_checkpoint_dir}")
+
+
+def export_run_config(run_folder, num_classes=None, class_names=None, 
+                      train_count=0, val_count=0, test_count=0):
+    """
+    Xuất toàn bộ config của lần chạy ra file Excel (run_config.xlsx).
+    Mỗi nhóm config = 1 sheet riêng, dễ đọc và so sánh giữa các lần chạy.
+    Nếu tắt focal loss → các param focal tự set 0/None.
+    Nếu tắt WRS → ghi rõ DISABLED.
+    
+    Args:
+        run_folder: Folder lưu kết quả của lần chạy
+        num_classes: Số lượng class
+        class_names: Danh sách tên class
+        train_count, val_count, test_count: Số lượng ảnh mỗi split
+    """
+    import platform
+    import timm
+    import torchvision
+
+    is_focal = Config.LOSS_FUNCTION == 'poly_focal'
+    cuda_available = torch.cuda.is_available()
+    gpu_names = (
+        ", ".join(
+            torch.cuda.get_device_name(index)
+            for index in range(torch.cuda.device_count())
+        )
+        if cuda_available else "CPU only"
+    )
+    try:
+        git_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        git_dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.CalledProcessError):
+        git_commit = "N/A"
+        git_dirty = "N/A"
+
+    dataset_rows = [
+        ("dataset_name", Config.DATASET_NAME),
+        ("data_root", Config.DATA_ROOT),
+        ("dataset_source", "torchvision.datasets.CIFAR100 (download=False)"),
+        ("official_train_split", Config.OFFICIAL_TRAIN_SPLIT),
+        ("official_test_split", Config.OFFICIAL_TEST_SPLIT),
+        ("num_classes", num_classes),
+        ("class_names", ", ".join(class_names) if class_names else ""),
+        ("validation_ratio_from_official_train", Config.VALIDATION_RATIO),
+        ("train_samples", train_count),
+        ("val_samples", val_count),
+        ("test_samples", test_count),
+        ("image_size", Config.IMAGE_SIZE),
+        ("resize_interpolation", Config.RESIZE_INTERPOLATION),
+        ("normalization_mean", str(Config.IMAGE_MEAN)),
+        ("normalization_std", str(Config.IMAGE_STD)),
+        ("random_seed", Config.RANDOM_SEED),
+        ("all_configured_seeds", str(Config.SEEDS)),
+    ]
+
+    model_rows = [
+        ("models", ", ".join(Config.MODELS)),
+        ("vit_pretrained_model_id", Config.VIT_PRETRAINED_MODEL_ID),
+        ("pretrained", Config.PRETRAINED),
+        ("classifier_config", str(Config.CLASSIFIER_CONFIG)),
+        ("classifier_dropout_rate", Config.DROPOUT_RATE),
+        ("model_drop_rate", Config.MODEL_DROP_RATE),
+        ("attention_drop_rate", Config.MODEL_ATTN_DROP_RATE),
+        ("drop_path_rate", Config.MODEL_DROP_PATH_RATE),
+    ]
+
+    training_rows = [
+        ("batch_size_train_val_test", Config.BATCH_SIZE),
+        ("effective_global_batch_size", Config.BATCH_SIZE),
+        ("num_epochs", Config.NUM_EPOCHS),
+        ("early_stopping_patience", Config.EARLY_STOPPING_PATIENCE),
+        ("gradient_clip_norm", Config.GRAD_CLIP_NORM),
+    ]
+
+    is_adam_family = Config.OPTIMIZER.lower() in ("adam", "adamw")
+    optimizer_scheduler_rows = [
+        ("optimizer", Config.OPTIMIZER),
+        ("optimizer_betas", str(Config.OPTIMIZER_BETAS) if is_adam_family else "N/A"),
+        ("optimizer_epsilon", Config.OPTIMIZER_EPS if Config.OPTIMIZER.lower() != "sgd" else "N/A"),
+        ("sgd_momentum", Config.SGD_MOMENTUM if not is_adam_family else "N/A"),
+        ("sgd_nesterov", Config.SGD_NESTEROV if Config.OPTIMIZER.lower() == "sgd" else "N/A"),
+        ("rmsprop_alpha", Config.RMSPROP_ALPHA if Config.OPTIMIZER.lower() == "rmsprop" else "N/A"),
+        ("weight_decay_mode", "decoupled (AdamW)" if Config.OPTIMIZER.lower() == "adamw" else "coupled L2"),
+        ("fused_optimizer_requested", Config.USE_FUSED_OPTIMIZER),
+        ("fused_optimizer_effective", Config.USE_FUSED_OPTIMIZER and cuda_available),
+        ("learning_rate", Config.LEARNING_RATE),
+        ("weight_decay", Config.WEIGHT_DECAY),
+        ("weight_decay_exclusions", "bias, 1D/norm params, model no_weight_decay set"),
+        ("scheduler", Config.SCHEDULER),
+        ("warmup_epochs", Config.WARMUP_EPOCHS),
+        ("warmup_start_factor", Config.WARMUP_START_FACTOR),
+        ("cosine_eta_min", Config.ETA_MIN),
+    ]
+
+    loss_rows = [
+        ("loss_function", Config.LOSS_FUNCTION),
+        ("label_smoothing", Config.LABEL_SMOOTHING if not is_focal else 0),
+        ("focal_gamma", Config.FOCAL_GAMMA if is_focal else 0),
+        ("poly_epsilon", Config.POLY_EPSILON if is_focal else 0),
+        ("class_weight_method", Config.CLASS_WEIGHT_METHOD if is_focal else "N/A"),
+    ]
+
+    augmentation_rows = [
+        ("horizontal_flip_probability", Config.HORIZONTAL_FLIP_PROB),
+        ("use_mixup_cutmix", Config.USE_MIXUP_CUTMIX),
+        ("mixup_alpha", Config.MIXUP_ALPHA if Config.USE_MIXUP_CUTMIX else 0),
+        ("cutmix_alpha", Config.CUTMIX_ALPHA if Config.USE_MIXUP_CUTMIX else 0),
+        ("mixup_or_cutmix_probability", Config.MIXUP_PROB if Config.USE_MIXUP_CUTMIX else 0),
+        ("cutmix_switch_probability", Config.MIXUP_SWITCH_PROB if Config.USE_MIXUP_CUTMIX else 0),
+        ("mixup_mode", Config.MIXUP_MODE if Config.USE_MIXUP_CUTMIX else "disabled"),
+        ("random_erasing_probability", Config.RANDOM_ERASING_PROB),
+        ("random_erasing_scale", str(Config.RANDOM_ERASING_SCALE)),
+        ("random_erasing_ratio", str(Config.RANDOM_ERASING_RATIO)),
+        ("random_erasing_value", Config.RANDOM_ERASING_VALUE),
+        ("validation_augmentation", "resize + normalize only"),
+        ("test_augmentation", "resize + normalize only"),
+    ]
+
+    precision_dataloader_rows = [
+        ("amp_requested", Config.USE_AMP),
+        ("amp_dtype", Config.AMP_DTYPE if Config.USE_AMP else "float32"),
+        ("amp_effective", Config.USE_AMP and cuda_available),
+        ("float32_matmul_precision", Config.FLOAT32_MATMUL_PRECISION),
+        ("torch_compile_requested", Config.USE_TORCH_COMPILE),
+        ("torch_compile_mode", Config.TORCH_COMPILE_MODE),
+        ("torch_compile_effective", Config.USE_TORCH_COMPILE and cuda_available),
+        ("num_workers", Config.NUM_WORKERS),
+        ("prefetch_factor", Config.PREFETCH_FACTOR),
+        ("persistent_workers", Config.PERSISTENT_WORKERS),
+        ("pin_memory", Config.PIN_MEMORY),
+        ("train_drop_last", Config.TRAIN_DROP_LAST),
+    ]
+
+    sampler_cv_rows = [
+        ("use_weighted_random_sampler", Config.USE_WEIGHTED_SAMPLER),
+        ("use_cross_validation", Config.USE_CROSS_VALIDATION),
+        ("cv_n_splits", Config.CV_N_SPLITS if Config.USE_CROSS_VALIDATION else 0),
+        ("cv_pool", "official train only" if Config.USE_CROSS_VALIDATION else "N/A"),
+        ("external_test", f"official {Config.OFFICIAL_TEST_SPLIT}"),
+    ]
+
+    eval_rows = [
+        ("top_k_values", str(Config.TOP_K_VALUES)),
+        ("strategy2_pool_patience", Config.STRATEGY2_POOL_PATIENCE),
+        ("strategy2_candidate_pool_rule",
+         "best-so-far checkpoints only, locked after the patience is exhausted"),
+        ("keep_last_n_checkpoints", Config.KEEP_LAST_N_CHECKPOINTS),
+        ("keep_top_k_checkpoints", Config.KEEP_TOP_K_CHECKPOINTS),
+        ("auto_delete_checkpoints", Config.AUTO_DELETE_CHECKPOINTS),
+        ("save_strategy_checkpoints", Config.SAVE_STRATEGY_CHECKPOINTS),
+        ("experiment_name", Config.EXPERIMENT_NAME),
+    ]
+
+    runtime_rows = [
+        ("run_timestamp", datetime.now().isoformat(timespec="seconds")),
+        ("command", " ".join([sys.executable, *sys.argv])),
+        ("hostname", platform.node()),
+        ("platform", platform.platform()),
+        ("git_commit", git_commit),
+        ("git_worktree_dirty", git_dirty),
+        ("python_version", platform.python_version()),
+        ("torch_version", torch.__version__),
+        ("torchvision_version", torchvision.__version__),
+        ("timm_version", timm.__version__),
+        ("cuda_available", cuda_available),
+        ("cuda_runtime_version", torch.version.cuda or "N/A"),
+        ("cudnn_version", torch.backends.cudnn.version() or "N/A"),
+        ("visible_gpu_count", torch.cuda.device_count()),
+        ("gpu_names", gpu_names),
+        ("bf16_supported", torch.cuda.is_bf16_supported() if cuda_available else False),
+    ]
+
+    notes_rows = [
+        ("WRS + Focal Loss", 
+         "BOTH ACTIVE - WRS handles imbalance at data level, Focal Loss at loss level. "
+         "May double-correct for imbalance." 
+         if (Config.USE_WEIGHTED_SAMPLER and is_focal) else "No conflict"),
+        ("Metrics Averaging", 
+         "All metrics (Precision, Recall, F1, AUC) use MACRO averaging. "
+            "Accuracy is computed as overall (correct/total)."),
+        ("Batch 1024 LR", "Use learning_rate=1e-4 when scaling train batch from 512 to 1024."),
+        ("Train accuracy with Mixup", "Expected correctness under soft target distributions."),
+    ]
+    
+    config_path = os.path.join(run_folder, "run_config.xlsx")
+    with pd.ExcelWriter(config_path, engine='openpyxl') as writer:
+        for sheet_name, rows in [
+            ("Dataset & Splitting", dataset_rows),
+            ("Model", model_rows),
+            ("Training Hyperparams", training_rows),
+            ("Optimizer & Scheduler", optimizer_scheduler_rows),
+            ("Loss Function", loss_rows),
+            ("Augmentation", augmentation_rows),
+            ("Precision & DataLoader", precision_dataloader_rows),
+            ("Sampler & CV", sampler_cv_rows),
+            ("Evaluation & Output", eval_rows),
+            ("Runtime Environment", runtime_rows),
+            ("Notes", notes_rows),
+        ]:
+            df = pd.DataFrame(rows, columns=["Parameter", "Value"])
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
+    
+    print(f"  [OK] Full run config exported to: {config_path}")
+    return config_path
+
+
+def main():
+    """
+    Main pipeline (Process each model sequentially to save disk space):
+    1. Validate configuration
+    2. Load and split dataset
+    3. FOR EACH MODEL:
+       - Train model
+       - Evaluate with 2 strategies
+       - Save individual results
+       - Delete checkpoints
+    4. Combine all results to Excel
+    5. Generate combined performance charts
+    """
+    args = parse_args()
+    apply_cli_overrides(args)
+    torch.set_float32_matmul_precision(Config.FLOAT32_MATMUL_PRECISION)
+    if run_seed_jobs_if_needed(args):
+        return
+
+    print("\n" + "="*70)
+    print(" BASELINE RESEARCH - PRETRAINED MODELS EVALUATION")
+    print("="*70)
+    
+    # Set random seeds for reproducibility across ALL models
+    print(f"\n🔒 Setting random seeds for reproducibility (seed={Config.RANDOM_SEED})...")
+    import random
+    import numpy as np
+    random.seed(Config.RANDOM_SEED)
+    torch.manual_seed(Config.RANDOM_SEED)
+    np.random.seed(Config.RANDOM_SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(Config.RANDOM_SEED)
+        torch.cuda.manual_seed_all(Config.RANDOM_SEED)
+        if args.deterministic:
+            # Reproducibility mode is slower and requires CUBLAS_WORKSPACE_CONFIG.
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        else:
+            torch.backends.cudnn.deterministic = False
+            torch.backends.cudnn.benchmark = True
+    print("✓ Random seeds set successfully")
+    
+    # Step 1: Validate configuration
+    print("\n[Step 1/6] Validating configuration...")
+    Config.validate_config()
+    
+    # Tạo folder riêng cho lần chạy này
+    run_folder, run_number = get_next_run_folder(Config.RESULTS_DIR, args.run_name)
+    print(f"\n📁 Lần chạy thứ: {run_number}")
+    print(f"📁 Kết quả sẽ được lưu tại: {run_folder}")
+    
+    # Keep training checkpoints isolated per run to allow concurrent terminals.
+    if args.checkpoints_dir:
+        run_checkpoints_dir = os.path.join(Config.CHECKPOINTS_DIR, sanitize_run_name(str(run_number)))
+    else:
+        run_checkpoints_dir = os.path.join(run_folder, "training_checkpoints")
+    os.makedirs(run_checkpoints_dir, exist_ok=True)
+    print(f"Training checkpoints: {run_checkpoints_dir}")
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    if torch.cuda.is_available():
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        if Config.USE_AMP and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                "USE_AMP=True requires a CUDA GPU with BF16 support for this pipeline"
+            )
+        print(
+            f"H100 profile: batch={Config.BATCH_SIZE}, "
+            f"precision={Config.AMP_DTYPE if Config.USE_AMP else 'float32'}, "
+            f"workers={Config.NUM_WORKERS}"
+        )
+    else:
+        print("⚠ Running in CPU mode. Training will be slower but uses less memory.")
+        print("  To enable GPU: Increase Windows virtual memory (paging file) to 16-32GB")
+    
+    # Step 2: Load dataset
+    print("\n[Step 2/6] Loading and splitting dataset...")
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, class_names = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
+        Config.RANDOM_SEED
+    )
+    
+    num_classes = len(class_names)
+    print(f"Classes: {class_names}")
+    
+    # Export full run config
+    print("\n[Config] Exporting run configuration...")
+    export_run_config(
+        run_folder, 
+        num_classes=num_classes, 
+        class_names=class_names,
+        train_count=len(train_data),
+        val_count=len(val_data),
+        test_count=len(test_data)
+    )
+    
     # Warn if both WRS and Focal Loss are active
-    if Config.USE_WEIGHTED_SAMPLER and Config.USE_FOCAL_LOSS:
+    if Config.USE_WEIGHTED_SAMPLER and Config.LOSS_FUNCTION == 'poly_focal':
         print("\n⚠ WARNING: Cả WeightedRandomSampler và PolyFocalLoss đều đang BẬT!")
         print("  → WRS xử lý imbalance ở data level (oversampling minority class)")
         print("  → Focal Loss xử lý imbalance ở loss level (focus on hard examples)")
         print("  → Có thể gây double-correction. Hãy cân nhắc tắt 1 trong 2 nếu kết quả không tốt.")
-
+    
     # ===================== CROSS-VALIDATION MODE (Pure K-Fold) =====================
     if Config.USE_CROSS_VALIDATION:
         print(f"\n{'='*70}")
         print(f" PURE CROSS-VALIDATION ({Config.CV_N_SPLITS}-Fold Stratified)")
         print(f"{'='*70}")
-
-        # Kiểm tra per-fold teacher checkpoints (Potato dataset)
-        use_per_fold_teacher = (Config.CV_TEACHER_CHECKPOINTS is not None)
-        if use_per_fold_teacher:
-            assert len(Config.CV_TEACHER_CHECKPOINTS) == Config.CV_N_SPLITS, \
-                f"CV_TEACHER_CHECKPOINTS phải có đúng {Config.CV_N_SPLITS} paths, " \
-                f"nhưng nhận được {len(Config.CV_TEACHER_CHECKPOINTS)}"
-            print(f"  🥔 Potato CV mode: Dùng per-fold teacher checkpoints")
-            for i, ckpt in enumerate(Config.CV_TEACHER_CHECKPOINTS, 1):
-                print(f"     Fold {i} teacher: {ckpt}")
-        else:
-            print(f"  📌 Standard CV mode: Dùng chung 1 teacher checkpoint cho tất cả fold")
-
-        # Load full dataset to get all targets
-        full_dataset = ImageFolder(root=Config.DATA_DIR)
-        all_targets = np.array(full_dataset.targets)
-        all_indices = np.arange(len(full_dataset))
-
-        print(f"  Total data: {len(all_indices)} images → chia {Config.CV_N_SPLITS} fold")
-
+        
+        # Fold only the official training pool; keep official valid untouched.
+        all_data = concatenate_datasets([train_data, val_data])
+        all_labels = train_labels + val_labels
+        
+        print(f"  CV pool: {len(all_data)} official-train images")
+        print(f"  External test: {len(test_data)} official-test images")
+        
         skf = StratifiedKFold(
-            n_splits=Config.CV_N_SPLITS,
-            shuffle=True,
+            n_splits=Config.CV_N_SPLITS, 
+            shuffle=True, 
             random_state=Config.RANDOM_SEED
         )
-
-        # Auto-detect run number for CV
-        run_number = 1
-        while os.path.exists(os.path.join(Config.SAVE_DIR, f"run_{run_number}")):
-            run_number += 1
-        cv_run_dir = os.path.join(Config.SAVE_DIR, f"run_{run_number}")
-        os.makedirs(cv_run_dir, exist_ok=True)
-        print(f"📂 CV run #{run_number}, saving to: {cv_run_dir}")
-
-        all_fold_results = {}  # {"Fold 1": {strategy_name: metrics_dict, ...}, ...}
-
-        for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(all_indices, all_targets), 1):
+        
+        all_fold_results = {}  # {model_name: [fold_results]}
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(all_data, all_labels), 1):
             print(f"\n{'='*70}")
             print(f" FOLD {fold_idx}/{Config.CV_N_SPLITS}")
             print(f"{'='*70}")
-
-            # Tách train_val → train (85%) + val (15%) cho early stopping
-            train_val_targets = all_targets[train_val_idx]
-            train_idx, val_idx = train_test_split(
-                train_val_idx,
-                test_size=0.15,
-                stratify=train_val_targets,
-                random_state=Config.RANDOM_SEED
+            
+            fold_train_data = all_data.select(train_idx.tolist())
+            fold_train_labels = [all_labels[i] for i in train_idx]
+            fold_val_data = all_data.select(val_idx.tolist())
+            fold_val_labels = [all_labels[i] for i in val_idx]
+            
+            print(
+                f"  Train: {len(fold_train_data)} | "
+                f"Val (fold): {len(fold_val_data)} | "
+                f"Test (external): {len(test_data)}"
             )
+            
+            # Create dataloaders for this fold
+            fold_train_loader, fold_val_loader, fold_test_loader = create_dataloaders(
+                fold_train_data, fold_train_labels,
+                fold_val_data, fold_val_labels,
+                test_data, test_labels,
+                Config.BATCH_SIZE,
+                Config.NUM_WORKERS
+            )
+            
+            fold_folder = os.path.join(run_folder, f"fold_{fold_idx}")
+            os.makedirs(fold_folder, exist_ok=True)
+            
+            for model_name in Config.MODELS:
+                print(f"\n  [Fold {fold_idx}] Training {model_name}...")
+                try:
+                    fold_ckpt_dir = os.path.join(fold_folder, model_name, 'training_checkpoints')
+                    checkpoint_manager, history = train_model(
+                        model_name,
+                        fold_train_loader,
+                        fold_val_loader,
+                        num_classes,
+                        device,
+                        class_names=class_names,
+                        train_labels=fold_train_labels,
+                        save_dir=fold_folder,
+                        checkpoints_dir=fold_ckpt_dir
+                    )
+                    
+                    # Evaluate trên fold test set (phần data luân phiên làm test)
+                    strategy_ckpt_dir = (
+                        os.path.join(fold_folder, model_name, 'checkpoints')
+                        if Config.SAVE_STRATEGY_CHECKPOINTS else None
+                    )
+                    results = evaluate_all_strategies(
+                        model_name, checkpoint_manager, fold_test_loader, fold_train_loader,
+                        num_classes, device, class_names=class_names, save_dir=strategy_ckpt_dir
+                    )
+                    
+                    if model_name not in all_fold_results:
+                        all_fold_results[model_name] = []
+                    all_fold_results[model_name].append(results)
 
-            print(f"  Train: {len(train_idx)} | Val: {len(val_idx)} | Test (fold): {len(test_idx)}")
+                    # In kết quả tất cả strategies của fold này
+                    print(f"\n  📊 Fold {fold_idx} - {model_name}:")
+                    for strategy_name, result in results.items():
+                        m = result['metrics']
+                        print(f"     {strategy_name:<30} Acc: {m['Accuracy (%)']:.2f}% | F1: {m['F1-Score (%)']:.2f}% | AUC: {m['AUC (%)']:.2f}%")
 
-            fold_save_dir = os.path.join(cv_run_dir, f"fold_{fold_idx}")
-            fold_indices = (train_idx, val_idx, test_idx)
+                    save_model_results(model_name, results, fold_folder)
 
-            # Chọn teacher checkpoint tương ứng cho fold này
-            fold_config = dict(config)  # Copy config
-            if use_per_fold_teacher:
-                fold_teacher_ckpt = Config.CV_TEACHER_CHECKPOINTS[fold_idx - 1]
-                fold_config["teacher_checkpoint"] = fold_teacher_ckpt
-                print(f"  🎓 Teacher checkpoint cho fold {fold_idx}: {fold_teacher_ckpt}")
+                    # === Chỉ giữ lại Strategy 1 checkpoint (best val_loss) của fold này ===
+                    if strategy_ckpt_dir and os.path.exists(strategy_ckpt_dir):
+                        pth_files = [f for f in os.listdir(strategy_ckpt_dir) if f.endswith('.pth')]
+                        strategy1_src = os.path.join(strategy_ckpt_dir, 'Strategy_1_best.pth')
+                        strategy1_dst = os.path.join(strategy_ckpt_dir, f'strategy1_fold{fold_idx}_checkpoint.pth')
 
-            try:
-                pipeline = DistillationPipeline(
-                    **fold_config,
-                    fold_indices=fold_indices,
-                    fold_save_dir=fold_save_dir
-                )
-                fold_results = pipeline.train()
+                        # Rename Strategy 1 checkpoint to a stable name first (avoid collision)
+                        if os.path.exists(strategy1_src):
+                            os.rename(strategy1_src, strategy1_dst)
 
-                all_fold_results[f"Fold {fold_idx}"] = fold_results
+                        # Delete all other strategy checkpoints
+                        for fname in pth_files:
+                            if fname == 'Strategy_1_best.pth':
+                                continue  # already renamed above
+                            fpath = os.path.join(strategy_ckpt_dir, fname)
+                            try:
+                                os.remove(fpath)
+                            except Exception as e:
+                                print(f"    ⚠ Could not delete {fname}: {e}")
 
-                # In kết quả tất cả strategies của fold này
-                print(f"\n  📊 Fold {fold_idx} - All strategy results:")
-                metric_keys_print = ['Accuracy (%)', 'F1-Score (%)', 'AUC (%)']
-                for strategy_name, metrics in fold_results.items():
-                    vals = " | ".join(f"{k}: {metrics.get(k, 0):.2f}%" for k in metric_keys_print)
-                    print(f"     {strategy_name:<35} {vals}")
+                        if os.path.exists(strategy1_dst):
+                            print(f"    ✓ Kept: Strategy 1 (best val_loss) → strategy1_fold{fold_idx}_checkpoint.pth")
+                        else:
+                            print(f"    ⚠ Strategy 1 checkpoint not found in {strategy_ckpt_dir}")
 
-                print(f"  ✅ Fold {fold_idx} completed")
-
-            except Exception as e:
-                print(f"  ✗ Fold {fold_idx} failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
-
+                    # Xóa training checkpoints (epoch_*.pth, best_checkpoint.pth, etc.)
+                    if os.path.exists(fold_ckpt_dir):
+                        try:
+                            shutil.rmtree(fold_ckpt_dir)
+                            print(f"    🧹 Deleted training checkpoints: {fold_ckpt_dir}")
+                        except Exception as e:
+                            print(f"    ⚠ Could not delete training checkpoints: {e}")
+                    
+                    print(f"  ✅ Fold {fold_idx} - {model_name} completed")
+                    
+                except Exception as e:
+                    print(f"  ✗ Fold {fold_idx} - {model_name} failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+        
         # ===================== Tổng hợp kết quả CV =====================
         print(f"\n{'='*70}")
         print(f" CROSS-VALIDATION SUMMARY ({Config.CV_N_SPLITS}-Fold)")
@@ -1746,1226 +899,227 @@ if __name__ == "__main__":
 
         metric_keys = ['Test Loss', 'Accuracy (%)', 'Precision (%)', 'Recall (%)', 'F1-Score (%)', 'AUC (%)']
 
-        # Lấy danh sách strategy từ fold đầu tiên có kết quả
-        strategy_names = []
-        for fold_res in all_fold_results.values():
-            strategy_names = list(fold_res.keys())
-            break
-
-        # === Sheet 1: CV Summary — Mean ± Std per strategy across all folds ===
+        # === Sheet 1: CV Summary — Mean ± Std per strategy per model ===
         cv_summary_rows = []
-        for strategy_name in strategy_names:
-            fold_metrics = []
-            for fold_res in all_fold_results.values():
-                if strategy_name in fold_res:
-                    fold_metrics.append(fold_res[strategy_name])
+        for model_name, fold_results_list in all_fold_results.items():
+            strategy_names = list(fold_results_list[0].keys())
+            for strategy_name in strategy_names:
+                fold_metrics = []
+                for fold_res in fold_results_list:
+                    if strategy_name in fold_res:
+                        fold_metrics.append(fold_res[strategy_name]['metrics'])
 
-            if fold_metrics:
-                row = {'Strategy': strategy_name}
-                for key in metric_keys:
-                    values = [m[key] for m in fold_metrics if key in m]
-                    if values:
-                        mean_v = np.mean(values)
-                        std_v  = np.std(values)
-                        fmt = '.4f' if key == 'Test Loss' else '.2f'
-                        row[f"{key} (mean)"] = round(mean_v, 4 if key == 'Test Loss' else 2)
-                        row[f"{key} (std)"]  = round(std_v,  4 if key == 'Test Loss' else 2)
-                        row[f"{key} (mean ± std)"] = f"{mean_v:{fmt}} ± {std_v:{fmt}}"
-                cv_summary_rows.append(row)
+                if fold_metrics:
+                    row = {'Model': model_name, 'Strategy': strategy_name}
+                    for key in metric_keys:
+                        values = [m[key] for m in fold_metrics if key in m]
+                        if values:
+                            mean_v = np.mean(values)
+                            std_v  = np.std(values)
+                            fmt = '.4f' if key == 'Test Loss' else '.2f'
+                            row[f"{key} (mean)"] = round(mean_v, 4 if key == 'Test Loss' else 2)
+                            row[f"{key} (std)"]  = round(std_v,  4 if key == 'Test Loss' else 2)
+                            row[f"{key} (mean ± std)"] = f"{mean_v:{fmt}} ± {std_v:{fmt}}"
+                    cv_summary_rows.append(row)
 
-        cv_summary_df = pd.DataFrame(cv_summary_rows) if cv_summary_rows else pd.DataFrame()
+        cv_summary_df = pd.DataFrame(cv_summary_rows)
 
-        # === Sheet 2: Fold Details — raw values per fold per strategy ===
+        # === Sheet 2: Fold Details — raw values per fold per model per strategy ===
         cv_detail_rows = []
-        for fold_name, fold_res in all_fold_results.items():
-            fold_idx_num = int(fold_name.split()[-1])
-            for strategy_name, metrics in fold_res.items():
-                detail_row = {'Fold': fold_idx_num, 'Strategy': strategy_name}
-                for key in metric_keys:
-                    if key in metrics:
-                        detail_row[key] = round(metrics[key], 4 if key == 'Test Loss' else 2)
-                if use_per_fold_teacher:
-                    detail_row['Teacher Checkpoint'] = Config.CV_TEACHER_CHECKPOINTS[fold_idx_num - 1] \
-                        if Config.CV_TEACHER_CHECKPOINTS else Config.TEACHER_CHECKPOINT
-                cv_detail_rows.append(detail_row)
+        for model_name, fold_results_list in all_fold_results.items():
+            for fold_idx_0, fold_res in enumerate(fold_results_list):
+                for strategy_name, result in fold_res.items():
+                    m = result['metrics']
+                    detail_row = {'Model': model_name, 'Fold': fold_idx_0 + 1, 'Strategy': strategy_name}
+                    for key in metric_keys:
+                        if key in m:
+                            detail_row[key] = round(m[key], 4 if key == 'Test Loss' else 2)
+                    cv_detail_rows.append(detail_row)
 
-        cv_detail_df = pd.DataFrame(cv_detail_rows) if cv_detail_rows else pd.DataFrame()
+        cv_detail_df = pd.DataFrame(cv_detail_rows)
         if not cv_detail_df.empty:
-            cv_detail_df = cv_detail_df.sort_values(['Fold', 'Strategy']).reset_index(drop=True)
+            cv_detail_df = cv_detail_df.sort_values(['Model', 'Fold', 'Strategy']).reset_index(drop=True)
 
         # === Xuất Excel ===
-        cv_excel_path = os.path.join(cv_run_dir, 'cv_summary_results.xlsx')
+        cv_excel_path = os.path.join(run_folder, 'cv_summary_results.xlsx')
         with pd.ExcelWriter(cv_excel_path, engine='openpyxl') as writer:
-            if not cv_summary_df.empty:
-                cv_summary_df.to_excel(writer, sheet_name='CV Summary (Mean ± Std)', index=False)
-            if not cv_detail_df.empty:
-                cv_detail_df.to_excel(writer, sheet_name='Fold Details', index=False)
+            cv_summary_df.to_excel(writer, sheet_name='CV Summary', index=False)
+            cv_detail_df.to_excel(writer, sheet_name='Fold Details', index=False)
 
         print(f"\n✓ CV Summary saved to: {cv_excel_path}")
-        print(f"  - Sheet 'CV Summary (Mean ± Std)': Mean ± Std cho từng strategy qua {Config.CV_N_SPLITS} fold")
-        print(f"  - Sheet 'Fold Details': Kết quả raw của từng strategy trên từng fold")
-
-        if not cv_summary_df.empty:
-            print(f"\n{'='*70}")
-            print(f" CV SUMMARY — MEAN ± STD PER STRATEGY:")
-            print(f"{'='*70}")
-            # In các cột mean ± std
-            cols_to_print = ['Strategy'] + [f"{k} (mean ± std)" for k in metric_keys if f"{k} (mean ± std)" in cv_summary_df.columns]
-            print(cv_summary_df[cols_to_print].to_string(index=False))
-
+        print(f"  - Sheet 'CV Summary': Mean ± Std per strategy across {Config.CV_N_SPLITS} folds")
+        print(f"  - Sheet 'Fold Details': Raw values per fold per strategy")
+        
+        # In summary ra console
+        print(f"\n{'='*70}")
+        print(f" CV SUMMARY (Mean ± Std per Strategy):")
+        print(f"{'='*70}")
+        for _, row in cv_summary_df.iterrows():
+            print(f"  {row['Model']} - {row['Strategy']}:")
+            for key in metric_keys:
+                col = f"{key} (mean ± std)"
+                if col in row:
+                    print(f"    {key}: {row[col]}")
+        
         print(f"\n{'='*70}")
         print(f" CROSS-VALIDATION COMPLETED!")
         print(f"{'='*70}")
+        return
+    
+    # ===================== NORMAL MODE (no CV) =====================
+    # Create dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_data, train_labels,
+        val_data, val_labels,
+        test_data, test_labels,
+        Config.BATCH_SIZE,
+        Config.NUM_WORKERS
+    )
+    
+    # Step 3: Train and evaluate each model (one at a time to save disk space)
+    print(f"\n[Step 3/6] Training and evaluating {len(Config.MODELS)} models...")
+    print("  Strategy: Train → Evaluate → Save Results → Delete Checkpoints")
+    
+    # Optional: opens up to 1000 images, so keep disabled for high-compute runs.
+    if Config.PRINT_DATASET_STATS:
+        print_dataset_statistics(concatenate_datasets([train_data, val_data, test_data]),
+                                 train_labels + val_labels + test_labels,
+                                 class_names)
+    
+    all_model_results = {}
+    successfully_processed = []
+    
+    for idx, model_name in enumerate(Config.MODELS, 1):
+        print(f"\n{'='*70}")
+        print(f"[Model {idx}/{len(Config.MODELS)}] Processing: {model_name}")
+        print(f"{'='*70}")
+        
+        try:
+            # 3.1: Train model
+            print(f"\n  [3.1] Training {model_name}...")
+            checkpoint_manager, history = train_model(
+                model_name,
+                train_loader,
+                val_loader,
+                num_classes,
+                device,
+                class_names=class_names,
+                train_labels=train_labels,
+                save_dir=run_folder,
+                checkpoints_dir=run_checkpoints_dir
+            )
+            print(f"  ✓ Training completed for {model_name}")
+            
+            # 3.2: Evaluate with 2 strategies
+            print(f"\n  [3.2] Evaluating {model_name} with 2 strategies...")
+            # Tạo folder lưu checkpoint cho các strategy
+            strategy_checkpoint_dir = (
+                os.path.join(run_folder, model_name, 'checkpoints')
+                if Config.SAVE_STRATEGY_CHECKPOINTS else None
+            )
+            results = evaluate_all_strategies(
+                model_name,
+                checkpoint_manager,
+                test_loader,
+                train_loader,  # CRITICAL: Pass train_loader for BatchNorm update
+                num_classes,
+                device,
+                class_names=class_names,
+                save_dir=strategy_checkpoint_dir
+            )
+            all_model_results[model_name] = results
+            print(f"  ✓ Evaluation completed for {model_name}")
+            
+            # 3.3: Save individual model results
+            print(f"\n  [3.3] Saving results for {model_name}...")
+            save_model_results(model_name, results, run_folder)
 
+            # 3.3.1: Save confusion matrices for this model
+            model_dir = os.path.join(run_folder, model_name)
+            save_confusion_matrices(
+                {model_name: results}, model_dir, class_names=class_names
+            )
+            
+            # 3.4: Delete checkpoints to free disk space (conditional)
+            if Config.AUTO_DELETE_CHECKPOINTS:
+                print(f"\n  [3.4] Cleaning up checkpoints for {model_name}...")
+                delete_model_checkpoints(model_name, run_checkpoints_dir)
+            else:
+                print(f"\n  [3.4] Keeping checkpoints for {model_name} (AUTO_DELETE_CHECKPOINTS=False)")
+            
+            successfully_processed.append(model_name)
+            print(f"\n  ✅ {model_name} completed successfully!")
+            
+        except Exception as e:
+            print(f"\n  ✗ Error processing {model_name}: {str(e)}")
+            print(f"  Skipping {model_name} and continuing with next model...")
+            import traceback
+            traceback.print_exc()
+            continue
+    
+    if not all_model_results:
+        print("\n✗ No models processed successfully. Exiting...")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f"✓ Successfully processed {len(successfully_processed)}/{len(Config.MODELS)} models")
+    print(f"  Models: {', '.join(successfully_processed)}")
+    print(f"{'='*70}")
+    
+    # Step 4: Combine all results to single Excel
+    print(f"\n[Step 4/6] Combining all results to Excel...")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    excel_path = os.path.join(run_folder, f'all_models_results.xlsx')
+    
+    df = export_results_to_excel(all_model_results, excel_path)
+    
+    # Display summary
+    print("\n" + "="*70)
+    print("COMBINED RESULTS SUMMARY")
+    print("="*70)
+    print(df.to_string(index=False))
+    
+    # Step 5: Generate combined performance charts
+    print(f"\n[Step 5/6] Generating combined performance chart...")
+    create_performance_charts(df, run_folder)
+    
+    # Step 6: Experiment info already saved via export_run_config
+    print(f"\n[Step 6/6] Run config already exported at start.")
+    
+    # Final summary
+    print("\n" + "="*70)
+    print(" BASELINE RESEARCH COMPLETED SUCCESSFULLY!")
+    print("="*70)
+    print(f"\n📊 Lần chạy #{run_number}:")
+    print(f"  - Folder: {run_folder}")
+    print(f"  - Combined Excel: {excel_path}")
+    print(f"  - Combined Chart: {os.path.join(run_folder, 'performance_comparison.png')}")
+    print(f"  - Run Config: {os.path.join(run_folder, 'run_config.xlsx')}")
+    print(f"  - Individual Results: {run_folder}/<model_name>/")
+    print(f"\n💾 Disk Space Optimization:")
+    if Config.AUTO_DELETE_CHECKPOINTS:
+        print(f"  - Training checkpoints were deleted after evaluation")
     else:
-        # ===================== NORMAL MODE (no CV) =====================
-        pipeline = DistillationPipeline(**config)
-        pipeline.train()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# import os
-# import copy
-# import json
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
-# from tqdm import tqdm
-# import numpy as np
-# import pandas as pd
-# from sklearn.metrics import (classification_report, confusion_matrix,
-#                             accuracy_score, precision_score, recall_score,
-#                             f1_score, roc_auc_score)
-
-# # Import các module đã tạo
-# from Teacher_extraction import TeacherExtractor
-# from Student_extraction import StudentExtractor
-# from PCA_projector import PCAttentionProjector
-# from GWLinear_projector import GWLinearProjector
-# from loss_functions import ProjectionLoss, LogitsKDLoss, DIST
-# from dataset import DatasetHandler
-# from visualization import plot_training_curves
-# torch.use_deterministic_algorithms(True, warn_only=True)
-
-# os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
-# class StudentWithHead(nn.Module):
-#     """
-#     Student model với classification head
-#     """
-#     def __init__(self, num_classes, pretrained=True, feature_dim=96,
-#                  fc_hidden=None, fc_dropout=0.7):
-#         super().__init__()
-#         if fc_hidden is None:
-#             fc_hidden = [512, 256]
-#         self.backbone = StudentExtractor(pretrained=pretrained)
-        
-#         # Classification head: Global Average Pooling + MLP
-#         self.gap = nn.AdaptiveAvgPool2d(1)
-#         layers = []
-#         in_dim = feature_dim
-#         for h in fc_hidden:
-#             layers += [nn.Linear(in_dim, h), nn.ReLU(), nn.Dropout(fc_dropout)]
-#             in_dim = h
-#         layers.append(nn.Linear(in_dim, num_classes))
-#         self.classifier = nn.Sequential(*layers)
+        print(f"  - Training checkpoints kept at: {run_checkpoints_dir}")
+    if Config.SAVE_STRATEGY_CHECKPOINTS:
+        print(f"  - Strategy checkpoints/results kept under: {run_folder}/<model_name>/")
+    else:
+        print(f"  - Strategy checkpoints were not saved")
     
-#     def forward(self, x):
-#         """
-#         Returns:
-#             feat_map: [B, 1024, 14, 14] - for distillation
-#             logits: [B, num_classes] - for classification
-#         """
-#         feat_map = self.backbone(x)  # [B, 1024, 14, 14]
-        
-#         # Classification
-#         pooled = self.gap(feat_map)  # [B, 1024, 1, 1]
-#         pooled = pooled.flatten(1)   # [B, 1024]
-#         logits = self.classifier(pooled)  # [B, num_classes]
-        
-#         return feat_map, logits
-
-
-# # =============================================================================
-# # CheckpointManager: keep last N + top K best checkpoints
-# # =============================================================================
-# class CheckpointManager:
-#     def __init__(self, save_dir, keep_last_n=10, keep_top_k=5):
-#         self.save_dir = save_dir
-#         os.makedirs(self.save_dir, exist_ok=True)
-#         self.checkpoints = []  # List of (epoch, val_loss, path)
-#         self.best_val_loss = float('inf')
-#         self.best_epoch = 0
-#         self.keep_last_n = keep_last_n
-#         self.keep_top_k = keep_top_k
-
-#     def save(self, student_state_dict, optimizer_state_dict, scheduler_state_dict,
-#              epoch, val_loss, val_acc):
-#         checkpoint = {
-#             'epoch': epoch,
-#             'student_state_dict': student_state_dict,
-#             'optimizer_student_state_dict': optimizer_state_dict,
-#             'scheduler_student_state_dict': scheduler_state_dict,
-#             'val_loss': val_loss,
-#             'val_acc': val_acc
-#         }
-#         path = os.path.join(self.save_dir, f'epoch_{epoch:03d}_val_loss_{val_loss:.4f}.pth')
-#         torch.save(checkpoint, path)
-#         self.checkpoints.append((epoch, val_loss, path))
-
-#         if val_loss < self.best_val_loss:
-#             self.best_val_loss = val_loss
-#             self.best_epoch = epoch
-#             best_path = os.path.join(self.save_dir, 'best.pth')
-#             torch.save(checkpoint, best_path)
-#             print(f"\U0001f4be Best model saved (epoch {epoch}, val_loss: {val_loss:.4f}, val_acc: {val_acc:.2f}%)")
-
-#         self._cleanup()
-#         return path
-
-#     def _cleanup(self):
-#         if len(self.checkpoints) <= self.keep_last_n + self.keep_top_k:
-#             return
-#         sorted_by_epoch = sorted(self.checkpoints, key=lambda x: x[0])
-#         last_n = set(cp[0] for cp in sorted_by_epoch[-self.keep_last_n:])
-#         sorted_by_loss = sorted(self.checkpoints, key=lambda x: x[1])
-#         top_k = set(cp[0] for cp in sorted_by_loss[:self.keep_top_k])
-#         keep_epochs = last_n | top_k
-#         to_keep = []
-#         for epoch, val_loss, path in self.checkpoints:
-#             if epoch in keep_epochs:
-#                 to_keep.append((epoch, val_loss, path))
-#             else:
-#                 try:
-#                     if os.path.exists(path):
-#                         os.remove(path)
-#                 except Exception:
-#                     pass
-#         self.checkpoints = to_keep
-
-#     def get_best_checkpoint(self):
-#         if not self.checkpoints:
-#             return None
-#         return min(self.checkpoints, key=lambda x: x[1])
-
-#     def get_top_k_checkpoints(self, k):
-#         return sorted(self.checkpoints, key=lambda x: x[1])[:k]
-
-#     def get_last_n_checkpoints(self, n):
-#         return sorted(self.checkpoints, key=lambda x: x[0])[-n:]
-
-#     def save_info(self):
-#         info = {'checkpoints': [(e, v, p) for e, v, p in self.checkpoints]}
-#         with open(os.path.join(self.save_dir, 'checkpoint_info.json'), 'w') as f:
-#             json.dump(info, f, indent=4)
-
-
-# # =============================================================================
-# # Helper functions for checkpoint averaging
-# # =============================================================================
-# def average_student_weights(checkpoint_paths, device):
-#     """Average student model weights, skip BN running stats"""
-#     if not checkpoint_paths:
-#         return None
-#     if len(checkpoint_paths) == 1:
-#         cp = torch.load(checkpoint_paths[0], map_location=device)
-#         return cp['student_state_dict']
-
-#     first = torch.load(checkpoint_paths[0], map_location=device)
-#     averaged = copy.deepcopy(first['student_state_dict'])
-
-#     keys_to_avg = []
-#     keys_to_keep = []
-#     for key in averaged.keys():
-#         if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-#             keys_to_keep.append(key)
-#         else:
-#             keys_to_avg.append(key)
-
-#     for path in checkpoint_paths[1:]:
-#         cp = torch.load(path, map_location=device)
-#         sd = cp['student_state_dict']
-#         for key in keys_to_avg:
-#             averaged[key] = averaged[key] + sd[key]
-
-#     n = len(checkpoint_paths)
-#     for key in keys_to_avg:
-#         averaged[key] = averaged[key] / n
-
-#     return averaged
-
-
-# def update_bn_stats(model, train_loader, device, num_batches=100):
-#     """
-#     Update BatchNorm running statistics after loading averaged weights.
+    # Find best model (based on Strategy 1 F1-Score)
+    strategy_1_df = df[df['Strategy'] == 'Strategy 1']
+    best_idx = strategy_1_df['F1-Score (%)'].idxmax()
+    best_model = strategy_1_df.loc[best_idx, 'Model']
+    best_f1 = strategy_1_df.loc[best_idx, 'F1-Score (%)']
+    best_acc = strategy_1_df.loc[best_idx, 'Accuracy (%)']
     
-#     IMPORTANT: For frozen backbone models, we should NOT update the backbone BN layers
-#     because they already have good statistics from ImageNet pretraining.
-#     We only update BN layers that are in trainable (unfrozen) parts.
-#     """
-#     # Identify which BN layers are in trainable parts
-#     trainable_bn_layers = []
-#     for name, module in model.named_modules():
-#         if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-#             has_trainable = False
-#             for param in module.parameters():
-#                 if param.requires_grad:
-#                     has_trainable = True
-#                     break
-#             if has_trainable:
-#                 trainable_bn_layers.append((name, module))
-
-#     if not trainable_bn_layers:
-#         print("      (No trainable BN layers found, skipping BN update)")
-#         return
-
-#     print(f"      (Found {len(trainable_bn_layers)} trainable BN layers to update)")
-
-#     # Set model to eval mode first
-#     model.eval()
-
-#     # Only set trainable BN layers to train mode and reset their statistics
-#     for name, module in trainable_bn_layers:
-#         module.train()
-#         module.momentum = None  # Use cumulative moving average
-#         module.reset_running_stats()
-
-#     # Forward pass to accumulate BN statistics (no gradient computation)
-#     with torch.no_grad():
-#         for batch_idx, (images, _) in enumerate(train_loader):
-#             if batch_idx >= num_batches:
-#                 break
-#             images = images.to(device)
-#             _ = model(images)
-
-#     # Set everything back to eval mode
-#     model.eval()
-
-
-# class DistillationPipeline:
-#     def __init__(
-#         self,
-#         data_dir,
-#         num_classes,
-#         batch_size=32,
-#         num_workers=16,
-#         lr_student=1e-4,
-#         # lr_teacher=1e-4,
-#         epochs=120,
-#         warmup_epochs_student=5,
-#         # warmup_epochs_teacher=5,
-#         device="cuda",
-#         save_dir="checkpoints",
-#         lambda1=1.0,  # weight for L_proj1 (PCA loss)
-#         lambda2=1.0,  # weight for L_proj2 (GL loss)
-#         lambda3=1.0,  # weight for L_logits (Hinton loss)
-#         lambda4=1.0,  # weight for DIST loss
-#         patience=15,  # early stopping patience
-#         start_factor_student=1e-8,
-#         # start_factor_teacher=1e-8,  # warmup start factor
-#         eta_min_student=1e-7,
-#         block_ids=[11,10,9,8,7],
-#         block_qkv_id=11,
-#         temperature=4.0,
-#         dist_beta=2.0,
-#         dist_gamma=2.0,
-#         last_n_epochs=10,
-#         keep_last_n=10,
-#         keep_top_k=5,
-#         # eta_min_teacher=1e-7,  # cosine annealing min lr
-#         teacher_checkpoint=None,
-#         student_fc_dropout=0.7,
-#         student_fc_hidden=None,
-#         pca_dropout=0.5,
-#         pca_partial_p=0.5,
-#         gw_drop_p=0.4,
-#         label_smoothing=0.1,
-#         use_projection=True,  # ablation: set False to skip PCA/GL projectors
-#     ):
-#         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-#         self.epochs = epochs
-#         self.warmup_epochs_student = warmup_epochs_student
-#         # self.warmup_epochs_teacher = warmup_epochs_teacher
-#         self.save_dir = save_dir
-#         self.lambda1 = lambda1
-#         self.lambda2 = lambda2
-#         self.lambda3 = lambda3
-#         self.lambda4 = lambda4
-#         self.temperature = temperature
-#         self.patience = patience
-#         self.start_factor_student = start_factor_student
-#         # self.start_factor_teacher = start_factor_teacher
-#         self.eta_min_student = eta_min_student
-#         self.dist_beta = dist_beta
-#         self.dist_gamma = dist_gamma
-#         self.use_projection = use_projection
-#         # self.eta_min_teacher = eta_min_teacher,
-#         os.makedirs(save_dir, exist_ok=True)
-        
-#         # Auto-detect experiment run number
-#         run_number = 1
-#         while os.path.exists(os.path.join(save_dir, f"run_{run_number}")):
-#             run_number += 1
-#         self.save_dir = os.path.join(save_dir, f"run_{run_number}")
-#         os.makedirs(self.save_dir, exist_ok=True)
-#         print(f"📂 Experiment run #{run_number}, saving to: {self.save_dir}")
-        
-#         # ===== Dataset =====
-#         print("Loading dataset...")
-#         self.data_handler = DatasetHandler(
-#             root_dir=data_dir,
-#             batch_size=batch_size,
-#             num_workers=num_workers
-#         )
-#         self.train_loader, self.val_loader, self.test_loader = self.data_handler.get_dataloaders()
-        
-#         print(f"Train samples: {len(self.train_loader.dataset)}")
-#         print(f"Val samples: {len(self.val_loader.dataset)}")
-#         print(f"Test samples: {len(self.test_loader.dataset)}")
-#         print(f"Num classes: {num_classes}")
-        
-#         # ===== Models =====
-#         print("\nInitializing models...")
-        
-#         # Teacher (frozen, inference only)
-#         self.teacher = TeacherExtractor(pretrained=False,
-#                                         checkpoint_path=teacher_checkpoint,
-#                                         block_ids=block_ids,
-#                                         block_qkv_id=block_qkv_id)
-#         self.teacher.to(self.device)
-#         print("✅ Teacher (ViT-B/16) loaded and frozen")
-        
-#         # Student with classification head
-#         self.student_fc_dropout = student_fc_dropout
-#         self.student_fc_hidden = student_fc_hidden if student_fc_hidden else [512, 256]
-#         self.student = StudentWithHead(
-#             num_classes=num_classes, pretrained=True,
-#             fc_hidden=self.student_fc_hidden, fc_dropout=self.student_fc_dropout
-#         )
-#         self.student = self.student.to(self.device)
-#         print("✅ Student (ResNet-50) loaded")
-        
-#         # # Teacher Head (trainable)
-#         # self.teacher_head = TeacherHead(num_classes=num_classes, embed_dim=768)
-#         # self.teacher_head = self.teacher_head.to(self.device)
-#         # print("✅ Teacher Head (trainable) loaded")
-        
-#         # Projectors (only created when use_projection=True)
-#         self.pca_dropout = pca_dropout
-#         self.pca_partial_p = pca_partial_p
-#         self.gw_drop_p = gw_drop_p
-#         if self.use_projection:
-#             self.pca_projector = PCAttentionProjector(
-#                 in_channels=96, embed_dim=768,
-#                 p=self.pca_partial_p, dropout=self.pca_dropout
-#             )
-#             self.pca_projector = self.pca_projector.to(self.device)
-#             print("✅ PCA Projector loaded")
-            
-#             self.gl_projector = GWLinearProjector(in_dim=96, out_dim=768, drop_p=self.gw_drop_p)
-#             self.gl_projector = self.gl_projector.to(self.device)
-#             print("✅ GL Projector loaded")
-#         else:
-#             self.pca_projector = None
-#             self.gl_projector = None
-#             print("⏭️  Projectors skipped (use_projection=False)")
-        
-#         # ===== Loss functions =====
-#         self.label_smoothing = label_smoothing
-#         self.kd_loss_fn = ProjectionLoss() if self.use_projection else None
-#         self.ce_loss_fn = nn.CrossEntropyLoss(label_smoothing=self.label_smoothing)
-#         self.logits_loss = LogitsKDLoss(temperature=temperature)
-#         self.dist_loss_fn = DIST(beta=dist_beta, gamma=dist_gamma)
-#         # ===== Optimizer (chỉ train student + projectors nếu có) =====
-#         trainable_params = list(self.student.parameters())
-#         if self.use_projection:
-#             trainable_params += list(self.pca_projector.parameters()) + \
-#                                 list(self.gl_projector.parameters())
-#         # self.optimizer_teacher = optim.Adam(self.teacher_head.parameters(), lr=lr_teacher)
-#         self.optimizer_student = optim.Adam(trainable_params, lr=lr_student)
-        
-#         # ===== Scheduler: Linear warmup + Cosine Annealing (epoch-level) =====
-#         self.scheduler_student = self._get_scheduler()
-        
-#         # Store for evaluation strategies
-#         self.num_classes = num_classes
-#         self.last_n_epochs = last_n_epochs
-        
-#         # Checkpoint Manager (keeps last N + top K best checkpoints)
-#         self.checkpoint_manager = CheckpointManager(
-#             save_dir=self.save_dir,
-#             keep_last_n=keep_last_n,
-#             keep_top_k=keep_top_k
-#         )
-        
-#         print(f"\n✅ Pipeline initialized on {self.device}")
+    print(f"\n🏆 Best Model (Strategy 1):")
+    print(f"  Model: {best_model}")
+    print(f"  Accuracy: {best_acc:.2f}%")
+    print(f"  F1-Score: {best_f1:.2f}%")
     
-#     def _get_scheduler(self):
-#         """
-#         Linear warmup + Cosine annealing scheduler using SequentialLR (epoch-level)
-#         Tạo scheduler riêng cho teacher và student
-#         """
-#         warmup_epochs_student = self.warmup_epochs_student
-#         cosine_epochs_student = self.epochs - self.warmup_epochs_student
-#         # warmup_epochs_teacher = self.warmup_epochs_teacher
-#         # cosine_epochs_teacher = self.epochs - self.warmup_epochs_teacher 
-    
-#         # ===== SCHEDULER CHO STUDENT =====
-#         warmup_scheduler_student = LinearLR(
-#             self.optimizer_student,
-#             start_factor=self.start_factor_student,
-#             end_factor=1.0,
-#             total_iters=self.warmup_epochs_student
-#         )
-        
-#         cosine_scheduler_student = CosineAnnealingLR(
-#             self.optimizer_student,
-#             T_max=cosine_epochs_student,
-#             eta_min=self.eta_min_student
-#         )
-        
-#         scheduler_student = SequentialLR(
-#             self.optimizer_student,
-#             schedulers=[warmup_scheduler_student, cosine_scheduler_student],
-#             milestones=[warmup_epochs_student]
-#         )
-        
-#         # # ===== SCHEDULER CHO TEACHER HEAD =====
-#         # warmup_scheduler_teacher = LinearLR(
-#         #     self.optimizer_teacher,
-#         #     start_factor=self.start_factor_teacher,
-#         #     end_factor=1.0,
-#         #     total_iters=self.warmup_epochs_teacher
-#         # )
-        
-#         # cosine_scheduler_teacher = CosineAnnealingLR(
-#         #     self.optimizer_teacher,
-#         #     T_max=cosine_epochs_teacher,
-#         #     eta_min=self.eta_min_teacher
-#         # )
-        
-#         # scheduler_teacher = SequentialLR(
-#         #     self.optimizer_teacher,
-#         #     schedulers=[warmup_scheduler_teacher, cosine_scheduler_teacher],
-#         #     milestones=[warmup_epochs_teacher]
-#         # )
-        
-#         return scheduler_student
-    
-#     def train_one_epoch(self, epoch):
-#         """Train for one epoch"""
-#         self.student.train()
-#         if self.use_projection:
-#             self.pca_projector.train()
-#             self.gl_projector.train()
-#         # self.teacher_head.train()  # ← Teacher head cũng train!
-#         total_loss = 0.0
-#         total_kd_loss = 0.0
-#         total_logits_loss = 0.0
-#         total_ce_loss_s = 0.0
-#         total_l1 = 0.0
-#         total_l2 = 0.0
-#         total_dist_loss = 0.0
-#         # total_ce_loss_t = 0.0
-#         correct = 0
-#         total = 0
-        
-#         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}/{self.epochs} [Train]")
-        
-#         for images, labels in pbar:
-#             images = images.to(self.device)
-#             labels = labels.to(self.device)
-            
-#             # ===== Teacher forward (no grad) =====
-#             with torch.no_grad():
-#                 teacher_out = self.teacher.extract(images)
-#             logit_t = teacher_out["logits"]
-#             if self.use_projection:
-#                 Q_t = teacher_out["Q_t"]
-#                 K_t = teacher_out["K_t"]
-#                 V_t = teacher_out["V_t"]
-#                 Attn_t = teacher_out["Attn_t"]
-#                 h_t = teacher_out["block_mean"]  # [B, 196, 768]
-            
-#             # ===== Student forward =====
-#             feat_map, logit_s = self.student(images)
+    print("\n" + "="*70 + "\n")
 
-#             # ===== PCA & GL Projectors (only when use_projection=True) =====
-#             if self.use_projection:
-#                 pca_out = self.pca_projector(feat_map, Q_t, K_t, V_t)
-#                 PCAttn_s = pca_out["PCAttnS"]
-#                 V_s = pca_out["VS"]
-#                 h_s_proj = self.gl_projector(feat_map)  # [B, 196, 768]
-#                 l_proj1, l_proj2 = self.kd_loss_fn(Attn_t, PCAttn_s, V_t, V_s, h_t, h_s_proj)
-#             else:
-#                 l_proj1 = torch.tensor(0.0, device=self.device)
-#                 l_proj2 = torch.tensor(0.0, device=self.device)
 
-#             # ===== Calculate losses =====
-#             ce_loss_s = self.ce_loss_fn(logit_s, labels)
-#             logits_kd_loss = self.logits_loss(logit_s, logit_t.detach())
-#             dist_loss = self.dist_loss_fn(logit_s, logit_t.detach())
-            
-#             # ===== TÍNH LOSS RIÊNG =====
-#             # Loss cho STUDENT (KHÔNG có ce_loss_teacher!)(Offline learning)
-#             loss_student = ce_loss_s + self.lambda1 * l_proj1 + self.lambda2 * l_proj2 + self.lambda3 * logits_kd_loss + self.lambda4 * dist_loss
-#             # Loss cho TEACHER HEAD (chỉ CE)
-#             # loss_teacher = ce_loss_t
-
-#             # ===== BACKWARD RIÊNG CHO STUDENT TRƯỚC =====
-#             self.optimizer_student.zero_grad()
-#             loss_student.backward()  # ← STUDENT TRƯỚC (thêm retain_graph=True)
-#             self.optimizer_student.step()
-
-#             # # ===== BACKWARD RIÊNG CHO TEACHER SAU =====
-#             # self.optimizer_teacher.zero_grad()
-#             # loss_teacher.backward()  # ← TEACHER SAU (bỏ retain_graph=True)
-#             # self.optimizer_teacher.step()
-
-#             # ===== Metrics =====
-#             total_loss += loss_student.item()
-#             total_kd_loss += (l_proj1.item() + l_proj2.item())
-#             total_ce_loss_s += ce_loss_s.item()
-#             total_logits_loss += logits_kd_loss.item()
-#             total_l1 += l_proj1.item()
-#             total_l2 += l_proj2.item()
-#             total_dist_loss += dist_loss.item()
-#             _, predicted = logit_s.max(1)
-#             total += labels.size(0)
-#             correct += predicted.eq(labels).sum().item()
-            
-#             # Update progress bar
-#             pbar.set_postfix({
-#             "Loss_S": f"{loss_student.item():.3f}",
-#             "KD": f"{(self.lambda1*l_proj1.item()+self.lambda2*l_proj2.item()+self.lambda3*logits_kd_loss.item()):.3f}",
-#             "DIST": f"{(dist_loss.item()):.3f}",
-#             "CE": f"{ce_loss_s.item():.3f}",
-#             "Acc": f"{100.*correct/total:.1f}%",
-#             "LR": f"{self.scheduler_student.get_last_lr()[0]:.4e}",
-#         })
-        
-#         avg_loss = total_loss / len(self.train_loader)
-#         avg_kd_loss = total_kd_loss / len(self.train_loader)
-#         avg_ce_loss_s = total_ce_loss_s / len(self.train_loader)
-#         accuracy = 100. * correct / total
-        
-#         return {
-#             "loss": avg_loss,
-#             "kd_loss": avg_kd_loss,
-#             "ce_loss_s": avg_ce_loss_s,
-#             "l1_weighted": (total_l1 / len(self.train_loader)) * self.lambda1,
-#             "l2_weighted": (total_l2 / len(self.train_loader)) * self.lambda2,
-#             "l3_weighted": (total_logits_loss / len(self.train_loader)) * self.lambda3,
-#             "dist_weighted": (total_dist_loss / len(self.train_loader)) * self.lambda4,
-#             "accuracy": accuracy
-#         }
-    
-#     @torch.no_grad()
-#     def validate(self, loader, desc="Val", class_names=None):
-#         """Validate on given loader, optionally compute per-class metrics"""
-#         self.student.eval()
-
-#         total_loss = 0.0
-#         correct = 0
-#         total = 0
-#         all_preds = []
-#         all_labels = []
-
-#         pbar = tqdm(loader, desc=f"[{desc}]")
-
-#         for images, labels in pbar:
-#             images = images.to(self.device)
-#             labels = labels.to(self.device)
-
-#             # Student forward
-#             feat_map, logit_s = self.student(images)
-
-#             # CE Loss
-#             ce_loss = self.ce_loss_fn(logit_s, labels)
-#             total_loss += ce_loss.item()
-
-#             # Accuracy
-#             _, predicted = logit_s.max(1)
-#             total += labels.size(0)
-#             correct += predicted.eq(labels).sum().item()
-
-#             all_preds.extend(predicted.cpu().numpy())
-#             all_labels.extend(labels.cpu().numpy())
-
-#             pbar.set_postfix({
-#                 "Loss": f"{ce_loss.item():.4f}",
-#                 "Acc": f"{100.*correct/total:.2f}%"
-#             })
-
-#         avg_loss = total_loss / len(loader)
-#         accuracy = 100. * correct / total
-
-#         result = {
-#             "loss": avg_loss,
-#             "accuracy": accuracy
-#         }
-
-#         # Compute per-class metrics if class_names provided
-#         if class_names is not None:
-#             import numpy as np
-#             all_preds = np.array(all_preds)
-#             all_labels = np.array(all_labels)
-
-#             report = classification_report(
-#                 all_labels, all_preds,
-#                 target_names=class_names,
-#                 output_dict=True,
-#                 zero_division=0
-#             )
-
-#             cm = confusion_matrix(all_labels, all_preds)
-
-#             result["classification_report"] = report
-#             result["confusion_matrix"] = cm
-#             result["all_preds"] = all_preds
-#             result["all_labels"] = all_labels
-
-#         return result
-    
-#     def save_checkpoint(self, epoch, val_loss, val_acc, is_best=False):
-#         """Save checkpoint using CheckpointManager + latest.pth for resume"""
-#         student_sd = self.student.state_dict()
-#         optimizer_sd = self.optimizer_student.state_dict()
-#         scheduler_sd = self.scheduler_student.state_dict()
-        
-#         # Save via CheckpointManager (handles best.pth + cleanup internally)
-#         self.checkpoint_manager.save(
-#             student_state_dict=student_sd,
-#             optimizer_state_dict=optimizer_sd,
-#             scheduler_state_dict=scheduler_sd,
-#             epoch=epoch + 1,
-#             val_loss=val_loss,
-#             val_acc=val_acc
-#         )
-        
-#         # Also save latest.pth for resume training
-#         latest = {
-#             "epoch": epoch + 1,
-#             "student_state_dict": student_sd,
-#             "optimizer_student_state_dict": optimizer_sd,
-#             "scheduler_student_state_dict": scheduler_sd,
-#             "val_loss": val_loss,
-#             "val_acc": val_acc
-#         }
-#         torch.save(latest, os.path.join(self.save_dir, "latest.pth"))
-    
-#     def load_checkpoint(self, path):
-#         """Load checkpoint"""
-#         checkpoint = torch.load(path, map_location=self.device)
-        
-#         self.student.load_state_dict(checkpoint["student_state_dict"])
-#         # self.pca_projector.load_state_dict(checkpoint["pca_projector_state_dict"])
-#         # self.gl_projector.load_state_dict(checkpoint["gl_projector_state_dict"])
-#         self.optimizer_student.load_state_dict(checkpoint["optimizer_student_state_dict"])
-#         self.scheduler_student.load_state_dict(checkpoint["scheduler_student_state_dict"])
-        
-#         val_loss = checkpoint.get('val_loss', float('inf'))
-#         val_acc = checkpoint.get('val_acc', 0.0)
-#         print(f"✅ Loaded checkpoint from epoch {checkpoint['epoch']} with val_loss: {val_loss:.4f}, val_acc: {val_acc:.2f}%")
-        
-#         return checkpoint["epoch"], val_loss
-    
-#     def train(self, resume_path=None):
-#         """Full training loop"""
-#         start_epoch = 0
-#         best_val_loss = float('inf')  # Lower is better
-#         epochs_no_improve = 0  # Early stopping counter
-
-#         history = {
-#             "train_loss": [],
-#             "val_loss":   [],
-#             "train_acc":  [],
-#             "val_acc":    [],
-#             "lr":         [],
-#         }
-
-#         if resume_path and os.path.exists(resume_path):
-#             start_epoch, best_val_loss = self.load_checkpoint(resume_path)
-#             # start_epoch += 1
-
-#         print("\n" + "="*60)
-#         print("🚀 Starting Training")
-#         print(f"   Early Stopping: patience = {self.patience}")
-#         print("="*60)
-
-#         for epoch in range(start_epoch, self.epochs):
-#             # Train
-#             train_metrics = self.train_one_epoch(epoch)
-            
-#             # Validate
-#             val_metrics = self.validate(self.val_loader, desc="Val")
-            
-#             # Get current LR (before step)
-#             current_lr_student = self.scheduler_student.get_last_lr()[0]
-#             # current_lr_teacher = self.scheduler_teacher.get_last_lr()[0]
-
-#             # Record history
-#             history["train_loss"].append(train_metrics["loss"])
-#             history["val_loss"].append(val_metrics["loss"])
-#             history["train_acc"].append(train_metrics["accuracy"])
-#             history["val_acc"].append(val_metrics["accuracy"])
-#             history["lr"].append(current_lr_student)
-
-#             # Step scheduler (epoch-level)
-#             self.scheduler_student.step()
-#             # self.scheduler_teacher.step()
-
-#             # Print epoch summary
-#             print(f"\n📊 Epoch {epoch+1}/{self.epochs} Summary (LR_S: {current_lr_student:.6f}")
-#             print(f"   Train - Loss: {train_metrics['loss']:.4f}, "
-#                   f"KD: {train_metrics['l1_weighted']+train_metrics['l2_weighted']+train_metrics['l3_weighted']:.4f}, "
-#                   f"DIST: {train_metrics['dist_weighted']:.4f}, " 
-#                   f"CE: {train_metrics['ce_loss_s']:.4f}, "
-#                   f"Acc: {train_metrics['accuracy']:.2f}%")
-#             print(f"   Val   - Loss: {val_metrics['loss']:.4f}, "
-#                   f"Acc: {val_metrics['accuracy']:.2f}%")
-#             print(f" L1 projection: {train_metrics['l1_weighted']:.4f}")
-#             print(f" L2 projection: {train_metrics['l2_weighted']:.4f}")
-#             print(f" Logits projection: {train_metrics['l3_weighted']:.4f}")
-#             # Save checkpoint (based on lowest val_loss)
-#             is_best = val_metrics["loss"] < best_val_loss
-#             if is_best:
-#                 best_val_loss = val_metrics["loss"]
-#                 epochs_no_improve = 0
-#             else:
-#                 epochs_no_improve += 1
-            
-#             self.save_checkpoint(epoch, val_metrics["loss"], val_metrics["accuracy"], is_best)
-            
-#             # Early stopping check
-#             if epochs_no_improve >= self.patience:
-#                 print(f"\n⚠️ Early stopping triggered! No improvement for {self.patience} epochs.")
-#                 print(f"   Best val_loss: {best_val_loss:.4f}")
-#                 break
-            
-#             print(f"   Early stopping: {epochs_no_improve}/{self.patience}")
-#             print()
-        
-#         # Save checkpoint manager info
-#         self.checkpoint_manager.save_info()
-
-#         # ===== Plot learning curves =====
-#         plot_training_curves(history, self.save_dir)
-
-#         # ===== Evaluate all 3 strategies =====
-#         all_results = self.evaluate_all_strategies()
-        
-#         # ===== Cleanup training checkpoints, keep only strategy files =====
-#         self._cleanup_training_checkpoints()
-        
-#         return all_results
-
-#     def _export_metrics_to_excel(self, metrics, class_names):
-#         """Export per-class metrics and confusion matrix to Excel"""
-#         report = metrics["classification_report"]
-#         cm = metrics["confusion_matrix"]
-
-#         excel_path = os.path.join(self.save_dir, "test_metrics.xlsx")
-
-#         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-#             # Sheet 1: Per-class metrics
-#             rows = []
-#             for cls_name in class_names:
-#                 m = report[cls_name]
-#                 rows.append({
-#                     "Class": cls_name,
-#                     "Precision": round(m["precision"], 4),
-#                     "Recall": round(m["recall"], 4),
-#                     "F1-Score": round(m["f1-score"], 4),
-#                     "Support": int(m["support"])
-#                 })
-#             # Add overall metrics
-#             for avg_type in ["macro avg", "weighted avg"]:
-#                 m = report[avg_type]
-#                 rows.append({
-#                     "Class": avg_type.title(),
-#                     "Precision": round(m["precision"], 4),
-#                     "Recall": round(m["recall"], 4),
-#                     "F1-Score": round(m["f1-score"], 4),
-#                     "Support": int(m["support"])
-#                 })
-#             rows.append({
-#                 "Class": "Overall Accuracy",
-#                 "Precision": "",
-#                 "Recall": "",
-#                 "F1-Score": round(report["accuracy"], 4),
-#                 "Support": int(report["macro avg"]["support"])
-#             })
-
-#             df_metrics = pd.DataFrame(rows)
-#             df_metrics.to_excel(writer, sheet_name="Per-Class Metrics", index=False)
-
-#             # Sheet 2: Confusion Matrix
-#             df_cm = pd.DataFrame(cm, index=class_names, columns=class_names)
-#             df_cm.index.name = "Actual \\ Predicted"
-#             df_cm.to_excel(writer, sheet_name="Confusion Matrix")
-
-#         print(f"\n📁 Metrics exported to: {excel_path}")
-
-#     # =================================================================
-#     # Evaluation Strategy Methods
-#     # =================================================================
-#     @torch.no_grad()
-#     def evaluate_model_full(self, model, loader, class_names):
-#         """Full evaluation: per-class precision/recall/F1, AUC, confusion matrix"""
-#         model.eval()
-#         all_preds = []
-#         all_labels = []
-#         all_probs = []
-#         running_loss = 0.0
-#         total = 0
-#         criterion = nn.CrossEntropyLoss()
-
-#         for images, labels in tqdm(loader, desc="Evaluating", leave=False):
-#             images = images.to(self.device)
-#             labels = labels.to(self.device)
-#             _, logits = model(images)
-#             loss = criterion(logits, labels)
-#             probs = torch.softmax(logits, dim=1)
-#             _, preds = logits.max(1)
-#             running_loss += loss.item() * images.size(0)
-#             total += labels.size(0)
-#             all_preds.extend(preds.cpu().numpy())
-#             all_labels.extend(labels.cpu().numpy())
-#             all_probs.extend(probs.cpu().numpy())
-
-#         all_preds = np.array(all_preds)
-#         all_labels = np.array(all_labels)
-#         all_probs = np.array(all_probs)
-
-#         test_loss = running_loss / total
-#         accuracy = accuracy_score(all_labels, all_preds) * 100
-#         precision = precision_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-#         recall = recall_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-#         f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0) * 100
-#         try:
-#             auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro') * 100
-#         except Exception:
-#             auc = 0.0
-
-#         report = classification_report(
-#             all_labels, all_preds,
-#             target_names=class_names,
-#             output_dict=True,
-#             zero_division=0
-#         )
-#         cm = confusion_matrix(all_labels, all_preds)
-
-#         return {
-#             'Test Loss': test_loss,
-#             'Accuracy (%)': accuracy,
-#             'Precision (%)': precision,
-#             'Recall (%)': recall,
-#             'F1-Score (%)': f1,
-#             'AUC (%)': auc,
-#             'classification_report': report,
-#             'confusion_matrix': cm,
-#         }
-
-#     def _create_student_model(self):
-#         """Create a fresh StudentWithHead for loading averaged weights"""
-#         model = StudentWithHead(
-#             num_classes=self.num_classes, pretrained=False,
-#             fc_hidden=self.student_fc_hidden, fc_dropout=self.student_fc_dropout
-#         )
-#         return model.to(self.device)
-
-#     def _print_strategy_results(self, metrics, strategy_name, class_names):
-#         """Print evaluation results for one strategy"""
-#         print(f"    {'='*60}")
-#         print(f"    📊 TEST RESULTS - {strategy_name}:")
-#         print(f"    {'='*60}")
-#         print(f"    Test Loss : {metrics['Test Loss']:>8.4f}")
-#         print(f"    Accuracy  : {metrics['Accuracy (%)']:>8.2f}%")
-#         print(f"    Precision : {metrics['Precision (%)']:>8.2f}%")
-#         print(f"    Recall    : {metrics['Recall (%)']:>8.2f}%")
-#         print(f"    F1-Score  : {metrics['F1-Score (%)']:>8.2f}%")
-#         print(f"    AUC       : {metrics['AUC (%)']:>8.2f}%")
-#         print(f"    {'='*60}")
-#         if 'classification_report' in metrics:
-#             report = metrics['classification_report']
-#             print(f"    {'Class':<25} {'Precision':>10} {'Recall':>10} {'F1-Score':>10} {'Support':>10}")
-#             print(f"    {'-'*65}")
-#             for cls_name in class_names:
-#                 m = report[cls_name]
-#                 print(f"    {cls_name:<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-#             print(f"    {'-'*65}")
-#             m = report['macro avg']
-#             print(f"    {'Macro Avg':<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-#             m = report['weighted avg']
-#             print(f"    {'Weighted Avg':<25} {m['precision']:>10.4f} {m['recall']:>10.4f} {m['f1-score']:>10.4f} {m['support']:>10.0f}")
-
-#     def strategy_1_best_checkpoint(self, class_names):
-#         """Strategy 1: Evaluate best checkpoint (lowest val_loss)"""
-#         print(f"\n  Strategy 1: Best checkpoint (lowest val_loss)")
-#         best = self.checkpoint_manager.get_best_checkpoint()
-#         if best is None:
-#             print("    No checkpoints available!")
-#             return None
-
-#         epoch, val_loss, path = best
-#         print(f"    Best checkpoint: Epoch {epoch}, Val Loss: {val_loss:.4f}")
-
-#         model = self._create_student_model()
-#         cp = torch.load(path, map_location=self.device)
-#         model.load_state_dict(cp['student_state_dict'])
-
-#         # Save strategy checkpoint
-#         save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-#         os.makedirs(save_dir, exist_ok=True)
-#         save_path = os.path.join(save_dir, f'strategy1_best_epoch_{epoch}.pth')
-#         torch.save({'student_state_dict': model.state_dict(), 'epoch': epoch, 'val_loss': val_loss}, save_path)
-#         print(f"    ✓ Saved to: {save_path}")
-
-#         metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-#         self._print_strategy_results(metrics, "Strategy 1 (Best Checkpoint)", class_names)
-#         return metrics
-
-#     def strategy_2_top_k_average(self, class_names):
-#         """Strategy 2: Average top-K checkpoints (K=2,3,4,5) and evaluate"""
-#         print(f"\n  Strategy 2: Top-K checkpoint averaging")
-#         results = {}
-
-#         for k in [2, 3, 4, 5]:
-#             print(f"    K={k}:")
-#             top_k = self.checkpoint_manager.get_top_k_checkpoints(k)
-
-#             if len(top_k) < k:
-#                 print(f"      Warning: Only {len(top_k)} checkpoints available")
-#             if not top_k:
-#                 continue
-
-#             paths = [p for _, _, p in top_k]
-#             avg_weights = average_student_weights(paths, self.device)
-
-#             model = self._create_student_model()
-#             model.load_state_dict(avg_weights, strict=True)
-
-#             print(f"      Updating BatchNorm statistics...")
-#             update_bn_stats(model, self.train_loader, self.device, num_batches=100)
-
-#             # Save
-#             save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-#             os.makedirs(save_dir, exist_ok=True)
-#             save_path = os.path.join(save_dir, f'strategy2_top_{k}_averaged.pth')
-#             torch.save({'student_state_dict': model.state_dict(), 'k': k}, save_path)
-#             print(f"      ✓ Saved to: {save_path}")
-
-#             metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-#             self._print_strategy_results(metrics, f"Strategy 2 (Top-{k} Avg)", class_names)
-#             results[k] = metrics
-
-#         return results
-
-#     def strategy_3_last_n_average(self, class_names):
-#         """Strategy 3: Average last N epoch checkpoints"""
-#         print(f"\n  Strategy 3: Last {self.last_n_epochs} epochs averaging")
-#         last_n = self.checkpoint_manager.get_last_n_checkpoints(self.last_n_epochs)
-
-#         if not last_n:
-#             print("    No checkpoints available!")
-#             return None
-#         if len(last_n) < self.last_n_epochs:
-#             print(f"    Warning: Only {len(last_n)} checkpoints available")
-
-#         epochs = [e for e, _, _ in last_n]
-#         paths = [p for _, _, p in last_n]
-#         print(f"    Averaging epochs: {epochs}")
-
-#         avg_weights = average_student_weights(paths, self.device)
-
-#         model = self._create_student_model()
-#         model.load_state_dict(avg_weights, strict=True)
-
-#         print(f"    Updating BatchNorm statistics...")
-#         update_bn_stats(model, self.train_loader, self.device, num_batches=100)
-
-#         # Save
-#         save_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-#         os.makedirs(save_dir, exist_ok=True)
-#         save_path = os.path.join(save_dir, f'strategy3_last_{self.last_n_epochs}_averaged.pth')
-#         torch.save({'student_state_dict': model.state_dict(), 'epochs': epochs}, save_path)
-#         print(f"    ✓ Saved to: {save_path}")
-
-#         metrics = self.evaluate_model_full(model, self.test_loader, class_names)
-#         self._print_strategy_results(metrics, f"Strategy 3 (Last {self.last_n_epochs} Avg)", class_names)
-#         return metrics
-
-#     def evaluate_all_strategies(self):
-#         """Run all 3 evaluation strategies and export results to Excel"""
-#         print("\n" + "="*70)
-#         print("🧪 Evaluating All Strategies")
-#         print("="*70)
-
-#         class_names = self.data_handler.get_class_names()
-#         all_results = {}
-
-#         # Strategy 1: Best single checkpoint
-#         metrics_1 = self.strategy_1_best_checkpoint(class_names)
-#         if metrics_1:
-#             all_results['Strategy 1 (Best)'] = metrics_1
-
-#         # Strategy 2: Top-K averaging
-#         strategy_2 = self.strategy_2_top_k_average(class_names)
-#         for k, metrics in strategy_2.items():
-#             all_results[f'Strategy 2 (Top-{k} Avg)'] = metrics
-
-#         # Strategy 3: Last N epochs averaging
-#         metrics_3 = self.strategy_3_last_n_average(class_names)
-#         if metrics_3:
-#             all_results[f'Strategy 3 (Last {self.last_n_epochs} Avg)'] = metrics_3
-
-#         # Export all results to Excel
-#         self._export_all_strategies_to_excel(all_results, class_names)
-
-#         # Print summary table
-#         print("\n" + "="*70)
-#         print("📊 SUMMARY OF ALL STRATEGIES")
-#         print("="*70)
-#         print(f"{'Strategy':<35} {'Accuracy':>10} {'F1-Score':>10} {'AUC':>10}")
-#         print("-" * 70)
-#         for name, m in all_results.items():
-#             print(f"{name:<35} {m['Accuracy (%)']:>9.2f}% {m['F1-Score (%)']:>9.2f}% {m['AUC (%)']:>9.2f}%")
-#         print("=" * 70)
-
-#         return all_results
-
-#     def _export_all_strategies_to_excel(self, all_results, class_names):
-#         """Export all strategy results to Excel with 2 sheets: Macro Results + Per-Class Metrics"""
-#         excel_path = os.path.join(self.save_dir, "all_strategies_results.xlsx")
-
-#         with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
-#             # ===== Sheet 1: Macro Results =====
-#             summary_rows = []
-#             for strategy_name, metrics in all_results.items():
-#                 summary_rows.append({
-#                     "Strategy": strategy_name,
-#                     "Test Loss": round(metrics['Test Loss'], 4),
-#                     "Accuracy (%)": round(metrics['Accuracy (%)'], 2),
-#                     "Precision (%)": round(metrics['Precision (%)'], 2),
-#                     "Recall (%)": round(metrics['Recall (%)'], 2),
-#                     "F1-Score (%)": round(metrics['F1-Score (%)'], 2),
-#                     "AUC (%)": round(metrics['AUC (%)'], 2),
-#                 })
-#             df_summary = pd.DataFrame(summary_rows)
-#             df_summary.to_excel(writer, sheet_name="Macro Results", index=False)
-
-#             # ===== Sheet 2: Per-Class Metrics for all strategies =====
-#             per_class_rows = []
-#             for strategy_name, metrics in all_results.items():
-#                 if 'classification_report' not in metrics or 'confusion_matrix' not in metrics:
-#                     continue
-#                 report = metrics['classification_report']
-#                 cm = metrics['confusion_matrix']
-
-#                 for idx, cls_name in enumerate(class_names):
-#                     m = report[cls_name]
-#                     # Per-class accuracy = correctly classified / total samples of this class
-#                     cls_total = cm[idx].sum()
-#                     cls_accuracy = (cm[idx][idx] / cls_total * 100) if cls_total > 0 else 0.0
-#                     per_class_rows.append({
-#                         "Strategy": strategy_name,
-#                         "Class": cls_name,
-#                         "Accuracy (%)": round(cls_accuracy, 2),
-#                         "Precision (%)": round(m["precision"] * 100, 2),
-#                         "Recall (%)": round(m["recall"] * 100, 2),
-#                         "F1-Score (%)": round(m["f1-score"] * 100, 2),
-#                         "Support": int(m["support"])
-#                     })
-
-#             if per_class_rows:
-#                 df_per_class = pd.DataFrame(per_class_rows)
-#                 df_per_class.to_excel(writer, sheet_name="Per-Class Metrics", index=False)
-
-#         print(f"\n📁 All strategies results exported to: {excel_path}")
-
-#     def _cleanup_training_checkpoints(self):
-#         """
-#         Xóa tất cả checkpoint training (epoch_*.pth, best.pth, latest.pth, checkpoint_info.json)
-#         sau khi đã evaluate xong. Chỉ giữ lại folder saved_checkpoints/ chứa strategy files.
-#         """
-#         print("\n🧹 Cleaning up training checkpoints...")
-#         kept = 0
-#         removed = 0
-#         saved_cp_dir = os.path.join(self.save_dir, 'saved_checkpoints')
-
-#         for fname in os.listdir(self.save_dir):
-#             fpath = os.path.join(self.save_dir, fname)
-#             # Skip the saved_checkpoints directory and the Excel results
-#             if os.path.isdir(fpath):
-#                 continue
-#             if fname.endswith('.xlsx') or fname.endswith('.csv'):
-#                 kept += 1
-#                 continue
-#             # Remove training checkpoint files
-#             if fname.endswith('.pth') or fname == 'checkpoint_info.json':
-#                 try:
-#                     os.remove(fpath)
-#                     removed += 1
-#                 except Exception as e:
-#                     print(f"   Warning: Could not delete {fpath}: {e}")
-#             else:
-#                 kept += 1
-
-#         # Count strategy files kept
-#         strategy_files = 0
-#         if os.path.isdir(saved_cp_dir):
-#             strategy_files = len([f for f in os.listdir(saved_cp_dir) if f.endswith('.pth')])
-
-#         print(f"   Removed {removed} training checkpoint files")
-#         print(f"   Kept {strategy_files} strategy checkpoint files in saved_checkpoints/")
-#         print(f"   Kept {kept} other files (Excel, etc.)")
-
-#     def get_student_model(self):
-#         """
-#         Trả về student model (không có projectors) để inference
-#         """
-#         return self.student
-
-
-# # ===== Main =====
-# if __name__ == "__main__":
-#     from config import Config
-
-#     os.environ["CUDA_VISIBLE_DEVICES"] = Config.CUDA_VISIBLE_DEVICES
-
-#     Config.print_config()
-#     config = Config.to_pipeline_dict()
-#     print(f"[KD] block_ids = {config['block_ids']}")
-#     print(f"[KD] block_qkv_id = {config['block_qkv_id']}")
-#     pipeline = DistillationPipeline(**config)
-#     pipeline.train()
-
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,761 @@
+"""
+Training script with early stopping and checkpoint saving
+"""
+import os
+import time
+import json
+import csv
+import inspect
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+from collections import Counter
+
+from config import Config
+from models import get_model
+from losses import PolyFocalLoss, compute_class_weights
+from dataset import load_dataset, create_dataloaders
+from visualization import print_dataset_statistics, plot_training_history, plot_patience_period
+
+from torch.optim.lr_scheduler import SequentialLR
+from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
+
+def autocast_context(device):
+    """Use native BF16 autocast on CUDA and a no-op context elsewhere."""
+    enabled = Config.USE_AMP and device.type == "cuda"
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.bfloat16,
+        enabled=enabled,
+    )
+
+class EarlyStopping:
+    """Early stopping based on validation loss"""
+    
+    def __init__(self, patience=10, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+    
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
+
+
+class CheckpointManager:
+    """Manage model checkpoints - Optimized to keep only last N + top K best checkpoints
+
+    Also maintains the Strategy 2 candidate pool: only epochs that set a new
+    best-so-far validation loss are eligible for top-K averaging, and the pool
+    stops accepting epochs once `pool_patience` consecutive epochs fail to
+    improve (see `_update_candidate_pool`).
+    """
+
+    def __init__(self, save_dir, model_name, keep_last_n=10, keep_top_k=5, pool_patience=10):
+        self.save_dir = os.path.join(save_dir, model_name)
+        os.makedirs(self.save_dir, exist_ok=True)
+        self.checkpoints = []  # List of (epoch, val_loss, checkpoint_path)
+        self.best_val_loss = float('inf')
+        self.best_epoch = 0
+        self.keep_last_n = keep_last_n  # Keep last N epochs
+        self.keep_top_k = keep_top_k    # Keep top K best checkpoints
+
+        # ---- Strategy 2 candidate pool ----
+        self.pool_patience = pool_patience
+        self.candidate_pool = []              # List of (epoch, val_loss, path), val_loss strictly decreasing
+        self.pool_best_val_loss = float('inf')
+        self.pool_counter = 0                 # Consecutive epochs without a new record
+        self.pool_locked = False
+        self.pool_cutoff_epoch = None
+
+    def save_checkpoint(self, model, optimizer, epoch, val_loss, is_best=False):
+        """Save checkpoint and manage storage efficiently"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'val_loss': val_loss
+        }
+
+        # Save checkpoint
+        checkpoint_path = os.path.join(self.save_dir, f'epoch_{epoch:03d}_val_loss_{val_loss:.4f}.pth')
+        torch.save(checkpoint, checkpoint_path)
+
+        # Add to checkpoint list
+        self.checkpoints.append((epoch, val_loss, checkpoint_path))
+
+        # Track best (ties go to the later epoch - it is the more converged one)
+        if val_loss <= self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.best_epoch = epoch
+
+        # Save best checkpoint separately
+        if is_best:
+            best_path = os.path.join(self.save_dir, 'best_checkpoint.pth')
+            torch.save(checkpoint, best_path)
+
+        # Update the Strategy 2 candidate pool BEFORE cleanup so its files are protected
+        self._update_candidate_pool(epoch, val_loss, checkpoint_path)
+
+        # MEMORY OPTIMIZATION: Clean up old checkpoints
+        # Keep only: last N epochs + top K best val_loss + Strategy 2 candidate pool
+        self._cleanup_checkpoints()
+
+        return checkpoint_path
+
+    def _update_candidate_pool(self, epoch, val_loss, checkpoint_path):
+        """Update the Strategy 2 candidate pool for this epoch.
+
+        Rules:
+        - val_loss < current pool best  -> new record, append to the pool
+        - val_loss == current pool best -> tie, replace the record holder with
+          this epoch because a later epoch is the more converged one
+        - val_loss > current pool best  -> no improvement, advance the counter;
+          once it reaches `pool_patience` the pool is locked permanently, even
+          if training keeps running afterwards
+        """
+        if self.pool_locked:
+            return
+
+        if val_loss < self.pool_best_val_loss:
+            self.pool_best_val_loss = val_loss
+            self.pool_counter = 0
+            self.candidate_pool.append((epoch, val_loss, checkpoint_path))
+            print(
+                f"  ✓ New best — added epoch {epoch} to Strategy 2 candidate pool "
+                f"(pool size: {len(self.candidate_pool)})"
+            )
+        elif val_loss == self.pool_best_val_loss and self.candidate_pool:
+            replaced_epoch = self.candidate_pool[-1][0]
+            self.candidate_pool[-1] = (epoch, val_loss, checkpoint_path)
+            self.pool_counter = 0
+            print(
+                f"  = Tied with current best (val_loss={val_loss:.4f}) — replacing "
+                f"epoch {replaced_epoch} with epoch {epoch} (more converged)"
+            )
+        else:
+            self.pool_counter += 1
+            if self.pool_counter >= self.pool_patience:
+                self.pool_locked = True
+                self.pool_cutoff_epoch = epoch
+                print(
+                    f"  🔒 Strategy 2 pool locked at epoch {epoch} "
+                    f"(patience={self.pool_patience} exhausted, "
+                    f"{len(self.candidate_pool)} candidates)"
+                )
+
+    def _cleanup_checkpoints(self):
+        """Remove checkpoints that are not needed by any strategy or by the pool"""
+        if len(self.checkpoints) <= self.keep_last_n + self.keep_top_k:
+            return  # Not enough checkpoints to cleanup
+
+        # Get last N checkpoints by epoch
+        sorted_by_epoch = sorted(self.checkpoints, key=lambda x: x[0])
+        last_n_epochs = set(cp[0] for cp in sorted_by_epoch[-self.keep_last_n:])
+
+        # Get top K checkpoints by val_loss (protects the Strategy 1 best checkpoint)
+        sorted_by_loss = sorted(self.checkpoints, key=lambda x: x[1])
+        top_k_epochs = set(cp[0] for cp in sorted_by_loss[:self.keep_top_k])
+
+        # CRITICAL: every epoch currently in the Strategy 2 candidate pool must survive.
+        # The pool is NOT a subset of the global top-K: an epoch can be a best-so-far
+        # record yet rank below other (non-record) epochs on global val_loss.
+        pool_epochs = set(cp[0] for cp in self.candidate_pool)
+
+        # Combined set of epochs to keep
+        epochs_to_keep = last_n_epochs | top_k_epochs | pool_epochs
+
+        # Find checkpoints to delete
+        checkpoints_to_remove = []
+        checkpoints_to_keep = []
+        
+        for epoch, val_loss, path in self.checkpoints:
+            if epoch in epochs_to_keep:
+                checkpoints_to_keep.append((epoch, val_loss, path))
+            else:
+                checkpoints_to_remove.append((epoch, val_loss, path))
+        
+        # Delete old checkpoints
+        for epoch, val_loss, path in checkpoints_to_remove:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception as e:
+                print(f"  Warning: Could not delete checkpoint {path}: {e}")
+        
+        # Update checkpoints list
+        self.checkpoints = checkpoints_to_keep
+    
+    def get_best_checkpoint(self):
+        """Get checkpoint with lowest val_loss (ties go to the later epoch)"""
+        if not self.checkpoints:
+            return None
+        return min(self.checkpoints, key=lambda x: (x[1], -x[0]))
+
+    def get_top_k_from_pool(self, k):
+        """Get the K lowest-val_loss checkpoints from the Strategy 2 candidate pool.
+
+        The pool only contains epochs that set a new best-so-far val_loss before
+        the pool was locked, so an epoch whose val_loss merely happens to beat
+        some older epochs is never eligible here.
+        """
+        if not self.candidate_pool:
+            return []
+        sorted_pool = sorted(self.candidate_pool, key=lambda x: x[1])
+        return sorted_pool[:k]
+
+    def save_checkpoint_info(self):
+        """Save checkpoint information to JSON"""
+        info = {
+            'checkpoints': [(epoch, val_loss, path) for epoch, val_loss, path in self.checkpoints],
+            'strategy2_pool_patience': self.pool_patience,
+            'strategy2_pool_cutoff_epoch': self.pool_cutoff_epoch,
+            'strategy2_candidate_pool': [
+                (epoch, val_loss, path) for epoch, val_loss, path in self.candidate_pool
+            ],
+        }
+        info_path = os.path.join(self.save_dir, 'checkpoint_info.json')
+        with open(info_path, 'w') as f:
+            json.dump(info, f, indent=4)
+
+
+def train_one_epoch(
+    model,
+    train_loader,
+    criterion,
+    optimizer,
+    device,
+    freeze_backbone=True,
+    mixup_fn=None,
+):
+    """Train for one epoch"""
+    model.train()
+    
+    # CRITICAL FIX: Set frozen backbone modules to eval mode to prevent BatchNorm stats update
+    if freeze_backbone:
+        for name, module in model.named_modules():
+            # Identify backbone modules (không phải classifier/head/fc)
+            if any(backbone_name in name for backbone_name in 
+                   ['features', 'layer1', 'layer2', 'layer3', 'layer4',  # VGG, ResNet
+                    'blocks', 'stages',  # EfficientNet, ConvNeXt
+                    'patch_embed', 'layers', 'pos_drop',  # ViT, Swin
+                    'conv_stem', 'bn1']):
+                # Check if module is frozen
+                if hasattr(module, 'parameters'):
+                    params = list(module.parameters())
+                    if params and all(not p.requires_grad for p in params):
+                        module.eval()
+    
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    profile_batches = getattr(Config, 'PROFILE_BATCHES', 0)
+    profile_data_time = 0.0
+    profile_compute_time = 0.0
+    profile_count = 0
+    end_time = time.time()
+    
+    pbar = tqdm(train_loader, desc='Training', leave=False)
+    for batch_idx, (images, labels) in enumerate(pbar, 1):
+        data_loaded_time = time.time()
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        # DeiT-style Mixup/CutMix is a batch-level augmentation. It converts
+        # integer labels into soft class distributions.
+        targets = labels
+        if mixup_fn is not None:
+            images, targets = mixup_fn(images, labels)
+        
+        # Forward pass
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+        
+        # Backward pass
+        loss.backward()
+        if Config.GRAD_CLIP_NORM is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=Config.GRAD_CLIP_NORM,
+            )
+        optimizer.step()
+
+        if profile_batches and batch_idx <= profile_batches:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            batch_end_time = time.time()
+            profile_data_time += data_loaded_time - end_time
+            profile_compute_time += batch_end_time - data_loaded_time
+            profile_count += 1
+            end_time = batch_end_time
+        
+        # Statistics
+        running_loss += loss.item() * images.size(0)
+        _, predicted = torch.max(outputs.data, 1)
+        total += labels.size(0)
+        if targets.ndim == 2:
+            # Expected correctness under the soft target distribution. This is
+            # more meaningful than comparing mixed images to one hard label.
+            correct += targets.gather(1, predicted.unsqueeze(1)).sum().item()
+        else:
+            correct += (predicted == targets).sum().item()
+
+        if not profile_batches or batch_idx > profile_batches:
+            end_time = time.time()
+        
+        # Update progress bar
+        pbar.set_postfix({'loss': loss.item(), 'acc': 100. * correct / total})
+
+    if profile_count:
+        print(
+            f"  Profile first {profile_count} train batches: "
+            f"data={profile_data_time / profile_count:.3f}s/batch, "
+            f"compute={profile_compute_time / profile_count:.3f}s/batch"
+        )
+    
+    epoch_loss = running_loss / total
+    epoch_acc = 100. * correct / total
+    
+    return epoch_loss, epoch_acc
+
+
+def validate(model, val_loader, criterion, device):
+    """Validate model"""
+    model.eval()
+    running_loss = 0.0
+    correct = 0
+    total = 0
+    
+    with torch.no_grad():
+        pbar = tqdm(val_loader, desc='Validation', leave=False)
+        for images, labels in pbar:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+            
+            with autocast_context(device):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+            
+            running_loss += loss.item() * images.size(0)
+            _, predicted = torch.max(outputs.data, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            pbar.set_postfix({'loss': loss.item(), 'acc': 100. * correct / total})
+    
+    epoch_loss = running_loss / total
+    epoch_acc = 100. * correct / total
+    
+    return epoch_loss, epoch_acc
+
+
+OPTIMIZER_CLASSES = {
+    "adamw": optim.AdamW,
+    "adam": optim.Adam,
+    "sgd": optim.SGD,
+    "rmsprop": optim.RMSprop,
+}
+
+
+def build_optimizer(model, device):
+    """Build the optimizer selected by ``Config.OPTIMIZER``.
+
+    Weight decay always goes through timm's parameter groups, so biases and
+    1D/norm parameters stay undecayed no matter which optimizer is chosen.
+    Note that AdamW decouples weight decay while Adam/SGD/RMSprop apply it as
+    classic L2 on the gradients, so the same WEIGHT_DECAY value is not
+    equivalent across optimizers.
+
+    Args:
+        model: Model whose parameters are optimized
+        device: Device used for training (fused kernels need CUDA)
+
+    Returns:
+        torch.optim.Optimizer
+    """
+    from timm.optim import param_groups_weight_decay
+
+    name = Config.OPTIMIZER.lower()
+    optimizer_cls = OPTIMIZER_CLASSES.get(name)
+    if optimizer_cls is None:
+        raise ValueError(
+            f"Unsupported OPTIMIZER '{Config.OPTIMIZER}'. "
+            f"Choose one of: {', '.join(sorted(OPTIMIZER_CLASSES))}"
+        )
+
+    parameter_groups = param_groups_weight_decay(
+        model,
+        weight_decay=Config.WEIGHT_DECAY,
+    )
+
+    optimizer_kwargs = {"lr": Config.LEARNING_RATE}
+    if name in ("adamw", "adam"):
+        optimizer_kwargs["betas"] = Config.OPTIMIZER_BETAS
+        optimizer_kwargs["eps"] = Config.OPTIMIZER_EPS
+        extra = f"betas={Config.OPTIMIZER_BETAS}, eps={Config.OPTIMIZER_EPS}"
+    elif name == "sgd":
+        optimizer_kwargs["momentum"] = Config.SGD_MOMENTUM
+        optimizer_kwargs["nesterov"] = Config.SGD_NESTEROV
+        extra = f"momentum={Config.SGD_MOMENTUM}, nesterov={Config.SGD_NESTEROV}"
+    else:  # rmsprop
+        optimizer_kwargs["momentum"] = Config.SGD_MOMENTUM
+        optimizer_kwargs["alpha"] = Config.RMSPROP_ALPHA
+        optimizer_kwargs["eps"] = Config.OPTIMIZER_EPS
+        extra = f"momentum={Config.SGD_MOMENTUM}, alpha={Config.RMSPROP_ALPHA}"
+
+    # Fused kernels only exist for some optimizers and only on CUDA.
+    fused_supported = "fused" in inspect.signature(optimizer_cls).parameters
+    fused_enabled = (
+        Config.USE_FUSED_OPTIMIZER and device.type == "cuda" and fused_supported
+    )
+    if fused_enabled:
+        optimizer_kwargs["fused"] = True
+    elif Config.USE_FUSED_OPTIMIZER and device.type == "cuda" and not fused_supported:
+        print(f"  Note: {optimizer_cls.__name__} has no fused implementation, using the default one")
+
+    optimizer = optimizer_cls(parameter_groups, **optimizer_kwargs)
+    print(
+        f"  Optimizer: {optimizer_cls.__name__}(lr={Config.LEARNING_RATE}, "
+        f"weight_decay={Config.WEIGHT_DECAY}, {extra}, fused={fused_enabled})"
+    )
+    if name != "adamw":
+        print("    Weight decay is coupled (classic L2) for this optimizer, not decoupled as in AdamW")
+    return optimizer
+
+
+def train_model(model_name, train_loader, val_loader, num_classes, device, class_names=None, test_loader=None, train_labels=None, save_dir=None, checkpoints_dir=None):
+    """
+    Train a single model
+
+    Args:
+        model_name: Name of the model
+        train_loader: Training dataloader
+        val_loader: Validation dataloader
+        num_classes: Number of classes
+        device: Device to train on
+        class_names: List of class names (optional, for visualization)
+        test_loader: Test dataloader (optional, for final test evaluation)
+        train_labels: List of training labels (optional, for computing class weights)
+        save_dir: Directory to save training curves (per-run folder). If None, uses Config.RESULTS_DIR
+        checkpoints_dir: Base directory for CheckpointManager. If None, uses Config.CHECKPOINTS_DIR.
+                         Pass a fold-specific path in CV mode to isolate checkpoints per fold.
+
+    Returns:
+        checkpoint_manager: CheckpointManager object
+        history: Training history dictionary
+    """
+    
+    torch.set_float32_matmul_precision(Config.FLOAT32_MATMUL_PRECISION)
+
+    print(f"\n{'='*70}")
+    print(f"Training {model_name}")
+    print(f"{'='*70}")
+    
+    # Create model
+    model = get_model(model_name, num_classes, freeze_backbone=False)
+    model = model.to(device)
+
+    compile_enabled = Config.USE_TORCH_COMPILE and device.type == "cuda"
+    if compile_enabled:
+        if hasattr(model, "compile"):
+            model.compile(mode=Config.TORCH_COMPILE_MODE)
+        else:
+            model = torch.compile(model, mode=Config.TORCH_COMPILE_MODE)
+        print(f"  torch.compile: ENABLED ({Config.TORCH_COMPILE_MODE})")
+    else:
+        print("  torch.compile: DISABLED")
+    
+    # Loss and optimizer
+    if Config.LOSS_FUNCTION == 'poly_focal':
+        # Compute class weights from training labels
+        if train_labels is not None:
+            class_weights = compute_class_weights(train_labels, method=Config.CLASS_WEIGHT_METHOD)
+            print(f"  Class weights ({Config.CLASS_WEIGHT_METHOD}):")
+            if class_names:
+                for i, name in enumerate(class_names):
+                    print(f"    {name}: {class_weights[i]:.4f}")
+            else:
+                print(f"    {class_weights.tolist()}")
+        else:
+            class_weights = None
+            print("  Warning: No train_labels provided, using equal class weights")
+
+        criterion = PolyFocalLoss(
+            gamma=Config.FOCAL_GAMMA,
+            epsilon=Config.POLY_EPSILON,
+            alpha=class_weights
+        )
+        print(f"  Loss: PolyFocalLoss(gamma={Config.FOCAL_GAMMA}, epsilon={Config.POLY_EPSILON})")
+    else:
+        # train_labels_list = train_loader.dataset.labels
+        # label_counts = Counter(train_labels_list)
+        # total_samples = len(train_labels_list)
+        # class_weights = torch.tensor(
+        #     [total_samples / (num_classes * label_counts[i]) for i in range(num_classes)],
+        #     dtype=torch.float32
+        # ).to(device)
+        # print(f"  Class weights: {class_weights.cpu().tolist()}")
+        criterion = nn.CrossEntropyLoss(label_smoothing=Config.LABEL_SMOOTHING)
+
+    mixup_fn = None
+    if Config.USE_MIXUP_CUTMIX:
+        from timm.data import Mixup
+
+        mixup_fn = Mixup(
+            mixup_alpha=Config.MIXUP_ALPHA,
+            cutmix_alpha=Config.CUTMIX_ALPHA,
+            prob=Config.MIXUP_PROB,
+            switch_prob=Config.MIXUP_SWITCH_PROB,
+            mode=Config.MIXUP_MODE,
+            label_smoothing=Config.LABEL_SMOOTHING,
+            num_classes=num_classes,
+        )
+        print(
+            "  Batch augmentation: "
+            f"Mixup(alpha={Config.MIXUP_ALPHA}) / "
+            f"CutMix(alpha={Config.CUTMIX_ALPHA}), "
+            f"prob={Config.MIXUP_PROB}, "
+            f"switch_prob={Config.MIXUP_SWITCH_PROB}"
+        )
+    optimizer = build_optimizer(model, device)
+    print(
+        f"  Precision: {'BF16 AMP' if Config.USE_AMP and device.type == 'cuda' else 'FP32'}"
+    )
+    
+    # # Learning rate scheduler
+    # scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    #     optimizer, 
+    #     mode='min', 
+    #     factor=Config.LR_DECAY_FACTOR, 
+    #     patience=Config.LR_DECAY_PATIENCE,
+    #     # verbose=True  # IMPORTANT: Show LR changes for monitoring
+    # )
+        # Sequential LR: Linear Warmup + Cosine Annealing
+    scheduler1 = LinearLR(
+        optimizer,
+        start_factor=Config.WARMUP_START_FACTOR,
+        end_factor=1.0,     
+        total_iters=Config.WARMUP_EPOCHS
+    )
+    scheduler2 = CosineAnnealingLR(
+        optimizer,
+        T_max=Config.NUM_EPOCHS - Config.WARMUP_EPOCHS,
+        eta_min=Config.ETA_MIN
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[scheduler1, scheduler2],
+        milestones=[Config.WARMUP_EPOCHS]
+    )
+    # Early stopping and checkpoint manager
+    early_stopping = EarlyStopping(patience=Config.EARLY_STOPPING_PATIENCE)
+    checkpoint_manager = CheckpointManager(
+        checkpoints_dir if checkpoints_dir is not None else Config.CHECKPOINTS_DIR,
+        model_name,
+        keep_last_n=Config.KEEP_LAST_N_CHECKPOINTS,
+        keep_top_k=Config.KEEP_TOP_K_CHECKPOINTS,
+        pool_patience=Config.STRATEGY2_POOL_PATIENCE
+    )
+    
+    best_val_loss = float('inf')
+    
+    # Training history for visualization
+    history = {
+        'train_loss': [],
+        'train_acc': [],
+        'val_loss': [],
+        'val_acc': [],
+        'learning_rate': []
+    }
+    
+    # Training loop
+    for epoch in range(1, Config.NUM_EPOCHS + 1):
+        epoch_start_time = time.time()
+        
+        # Train
+        train_loss, train_acc = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            freeze_backbone=False,
+            mixup_fn=mixup_fn,
+        )
+        
+        # Validate
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
+        
+        # Save to history
+        history['train_loss'].append(train_loss)
+        history['train_acc'].append(train_acc)
+        history['val_loss'].append(val_loss)
+        history['val_acc'].append(val_acc)
+        history['learning_rate'].append(optimizer.param_groups[0]['lr'])
+        
+        epoch_time = time.time() - epoch_start_time
+        
+        # Print epoch results
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch [{epoch}/{Config.NUM_EPOCHS}] ({epoch_time:.2f}s) - LR: {current_lr:.6f}")
+        print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
+        print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
+        
+        # Learning rate scheduler step
+        scheduler.step()
+        
+        # Save checkpoint
+        is_best = val_loss < best_val_loss
+        if is_best:
+            best_val_loss = val_loss
+            print(f"  ✓ New best validation loss!")
+        
+        checkpoint_manager.save_checkpoint(model, optimizer, epoch, val_loss, is_best)
+        
+        # Early stopping check
+        early_stopping(val_loss)
+        if early_stopping.early_stop:
+            print(f"\n✓ Early stopping triggered at epoch {epoch}")
+            break
+    
+    # Save checkpoint info
+    checkpoint_manager.save_checkpoint_info()
+    
+    print(f"\n✓ Training completed for {model_name}")
+    print(f"  Best Val Loss: {best_val_loss:.4f}")
+    print(f"  Total checkpoints saved: {len(checkpoint_manager.checkpoints)}")
+
+    pool_cutoff = checkpoint_manager.pool_cutoff_epoch
+    print(
+        f"  Strategy 2 candidate pool: {len(checkpoint_manager.candidate_pool)} checkpoints "
+        f"(patience={checkpoint_manager.pool_patience}, "
+        f"cutoff={'epoch ' + str(pool_cutoff) if pool_cutoff else 'not reached'})"
+    )
+    print(
+        "    Pool epochs: "
+        + ", ".join(
+            f"{epoch}({val_loss:.4f})"
+            for epoch, val_loss, _ in checkpoint_manager.candidate_pool
+        )
+    )
+    
+    # ================= FINAL TEST EVALUATION =================
+    test_loss = None
+    test_acc = None
+    
+    if test_loader is not None:
+        print(f"\n{'='*70}")
+        print(f"Final Test Evaluation on Best Checkpoint")
+        print(f"{'='*70}")
+        
+        # Load best checkpoint
+        best_epoch, best_val_loss_cp, best_checkpoint_path = checkpoint_manager.get_best_checkpoint()
+        checkpoint = torch.load(best_checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Evaluate on test set
+        test_loss, test_acc = validate(model, test_loader, criterion, device)
+        
+        print(f"  Best Checkpoint: Epoch {best_epoch}, Val Loss: {best_val_loss_cp:.4f}")
+        print(f"  Test Loss: {test_loss:.4f}, Test Acc: {test_acc:.2f}%")
+    
+    # Determine save directory for training curves
+    if save_dir is not None:
+        curves_dir = os.path.join(save_dir, model_name, "training_curves")
+    else:
+        curves_dir = os.path.join(Config.RESULTS_DIR, "training_curves")
+    os.makedirs(curves_dir, exist_ok=True)
+    
+    # Save training history to CSV
+    history_csv_path = os.path.join(curves_dir, f"{model_name}_training_history.csv")
+    
+    with open(history_csv_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['epoch', 'train_loss', 'train_acc', 'val_loss', 'val_acc', 'learning_rate'])
+        for i in range(len(history['train_loss'])):
+            writer.writerow([
+                i + 1,
+                history['train_loss'][i],
+                history['train_acc'][i],
+                history['val_loss'][i],
+                history['val_acc'][i],
+                history['learning_rate'][i]
+            ])
+    print(f"\n✓ Training history CSV saved to: {history_csv_path}")
+    
+    # Generate training plots
+    # Plot full training history
+    history_plot_path = os.path.join(curves_dir, f"{model_name}_training_history.png")
+    plot_training_history(history, model_name, save_path=history_plot_path)
+    
+    # Plot patience period (last N epochs)
+    patience_plot_path = os.path.join(curves_dir, f"{model_name}_patience_period.png")
+    plot_patience_period(history, Config.EARLY_STOPPING_PATIENCE, model_name, save_path=patience_plot_path)
+    
+    return checkpoint_manager, history
+
+
+if __name__ == "__main__":
+    # Test training
+    from config import Config
+    from dataset import concatenate_datasets
+    
+    Config.validate_config()
+    
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Load dataset
+    print("\nLoading dataset...")
+    train_data, train_labels, val_data, val_labels, test_data, test_labels, class_names = load_dataset(
+        Config.DATASET_NAME,
+        Config.VALIDATION_RATIO,
+        Config.RANDOM_SEED
+    )
+    
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_data, train_labels,
+        val_data, val_labels,
+        test_data, test_labels,
+        Config.BATCH_SIZE, 
+        Config.NUM_WORKERS
+    )
+    
+    num_classes = len(class_names)
+    
+    # Display dataset statistics
+    print("\n" + "="*70)
+    print("Dataset Statistics")
+    print("="*70)
+    
+    print_dataset_statistics(concatenate_datasets([train_data, val_data, test_data]),
+                           train_labels + val_labels + test_labels, 
+                           class_names)
+    
+    # Train first model as test
+    checkpoint_manager, history = train_model(
+        Config.MODELS[0],
+        train_loader,
+        val_loader,
+        num_classes,
+        device,
+        class_names=class_names,
+        test_loader=test_loader,
+        train_labels=train_labels
+    )
+
