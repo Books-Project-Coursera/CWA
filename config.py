@@ -67,8 +67,8 @@ class Config:
     EARLY_STOPPING_PATIENCE = 12
     
     # Learning Rate Decay
-    LR_DECAY_PATIENCE = 5
-    LR_DECAY_FACTOR = 0.5
+    LR_DECAY_PATIENCE = 0
+    LR_DECAY_FACTOR = 0.0
     
     # ===================== Sampler Configuration =====================
     USE_WEIGHTED_SAMPLER = False
@@ -86,7 +86,7 @@ class Config:
 
     # ===================== Model Configuration =====================
     MODELS = [
-    'vgg16']
+    'mobilenet_v2']
     PRETRAINED = True
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
