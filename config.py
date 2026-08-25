@@ -73,12 +73,119 @@ class Config:
     MIXUP = 0.0            # mixup không tương thích well với instance segmentation
     COPY_PASTE = 0.1       # copy-paste hữu ích cho segmentation (đặc biệt parts)
 
+    # ===================== Method Comparison =====================
+    # Các phương pháp weight-averaging được bật trong MỘT lần train.
+    #   "top-k" : Strategy 2 của bạn — uniform average Top-K checkpoint tốt
+    #             nhất trên val (chọn theo fitness).
+    #   "ema"   : Exponential Moving Average of weights (Morales-Brotons et
+    #             al., TMLR 2024; công thức = ModelEMA của Ultralytics).
+    #   "swa"   : Stochastic Weight Averaging (Izmailov et al., UAI 2018) —
+    #             uniform average các epoch cuối trajectory.
+    #
+    # ⚠ KHÁCH QUAN: cả ba method đều được tính TRÊN CÙNG MỘT trajectory (cùng
+    # seed, cùng config, cùng LR schedule). Không method nào can thiệp vào
+    # optimization, nên chạy `--method top-k ema swa` một lần cho ra so sánh
+    # PAIRED trên từng seed — tốt hơn hẳn việc train riêng cho mỗi method.
+    # CLI: --method top-k ema swa   |   --method EMA,SWA   |   --method all
+    # MẶC ĐỊNH = RUN 1 (bảng chính): top-k + ema trên cosine schedule chuẩn,
+    # cùng trajectory ⇒ so sánh paired. SWA KHÔNG nằm ở đây vì nó đã được chốt
+    # chạy constant LR (xem SWA_LR_SCHEDULE) ⇒ đổi trajectory, phải là run riêng:
+    #     RUN 1: python main.py                          (top-k + ema, 100 epoch)
+    #     RUN 2: python main.py --methods swa --patience 0   (SWA, 100 epoch)
+    METHODS = ["top-k", "ema"]
+    VALID_METHODS = ("top-k", "ema", "swa")
+
+    # ---- EMA (baseline 1) ----
+    # Implement bằng torch.optim.swa_utils.AveragedModel + get_ema_multi_avg_fn:
+    #     w_ema ← decay · w_ema + (1 − decay) · w_t      (mỗi optimizer step)
+    # KHÔNG warmup/ramp — công thức lũy thừa thuần của thư viện.
+    #
+    # MỘT giá trị decay duy nhất ⇒ đúng MỘT dòng "EMA" trong bảng kết quả,
+    # không phải chọn decay nào để báo cáo (tránh cherry-pick trên test).
+    #
+    # ⚠ Carparts nhỏ hơn VOC nhiều nên decay phải KHÁC nhánh detection: chỉ có
+    # N ≈ 2 500 optimizer step (3 156 ảnh, batch 128, 100 epoch ⇒ 25 step/epoch).
+    # Vì sao là 0.996 — hai ràng buộc đồng thời:
+    #   (a) CỬA SỔ trung bình 1/(1−decay) = 250 step = 10.0 epoch — cùng thang với
+    #       cửa sổ SWA (25 epoch cuối), và khớp cửa sổ ~8.6 epoch của nhánh detection.
+    #   (b) RESIDUE decay^N = 4.5e-05 ⇒ weights khởi tạo đã bị quên hẳn. Không có
+    #       warmup nên đây là ràng buộc cứng: decay ≤ 0.9982 (residue < 1%).
+    #       0.999 để lại 8.2%, 0.9999 để lại 78% là model pretrained ⇒ EMA HỎNG.
+    # Thêm giá trị vào list nếu muốn sweep (mỗi giá trị = thêm một dòng kết quả);
+    # khi đó nên bật --shadow-val để chọn decay trên val chứ không phải trên test.
+    # train.py in cửa sổ + residue của decay ra log ngay khi bắt đầu train.
+    EMA_DECAYS = [0.996]
+    EMA_UPDATE_PERIOD = 1   # cập nhật mỗi N optimizer step (paper EMA dùng T=16)
+
+    # ---- SWA (baseline 2) ----
+    # Implement bằng torch.optim.swa_utils.AveragedModel + get_swa_multi_avg_fn:
+    #     w_swa ← (w_swa · n + w_t) / (n + 1)      (mỗi epoch, cycle length c = 1)
+    # use_buffers=False ⇒ PyTorch average đúng learnable params còn BN running
+    # stats được ĐỒNG BỘ từ model nguồn — khớp Algorithm 1 của Izmailov, nơi BN
+    # được tính lại bằng một lượt forward trên train sau khi average.
+    SWA_START_FRACS = [0.75]   # mốc bắt đầu average, theo tỉ lệ budget
+    SWA_PERIOD = 1             # average mỗi N epoch
+
+    # ---- LR schedule cho pha SWA ----
+    # ⭐ CHỐT CHO PAPER: "truncate" — 75% đầu chạy ĐÚNG cosine schedule của bạn,
+    #    25% sau giữ LR HẰNG SỐ = SWA_LR. TỔNG BUDGET GIỮ NGUYÊN 100 epoch ⇒
+    #    công bằng tuyệt đối về số epoch với Top-K/EMA.
+    #    Đây là biến thể "1 budget" của Izmailov et al. cho VGG / WRN / PreResNet:
+    #    "we first run standard SGD training for ≈75% of the training budget ...
+    #     we just stop the training early WITHOUT MODIFYING the learning rate
+    #     schedule" (§3.2). 75 epoch đầu trùng khít run chuẩn (bit-exact).
+    #
+    # ⚠ constant LR ĐỔI TRAJECTORY ⇒ run bật SWA là MỘT EXPERIMENT RIÊNG.
+    #   Top-K/EMA PHẢI lấy số từ run khác (METHODS mặc định dưới đây). Code
+    #   RAISE lỗi nếu bạn bật swa chung với top-k/ema ở chế độ constant.
+    #
+    # Hai mode còn lại giữ trong code nhưng KHÔNG dùng cho paper:
+    #   "inherit" : SWA average trên chính cosine (không constant) — cùng trajectory
+    #               với Top-K/EMA. LR ở cửa sổ 75–99 chỉ còn ~6% lr0.
+    #   "extend"  : cosine trọn 100 epoch RỒI nối thêm epoch constant (1.25 budget)
+    #               — biến thể Shake-Shake/ImageNet (§4.1), SWA được nhiều epoch hơn.
+    SWA_LR_SCHEDULE = "truncate"  # "truncate" (chốt) | "inherit" | "extend"
+
+    # Mốc cắt cosine để chuyển sang constant LR (mode "truncate").
+    # 0.75 ⇒ epoch 0..74 chạy cosine y nguyên, epoch 75..99 chạy constant, và SWA
+    # average đúng 25 epoch đó.
+    SWA_LR_START_FRAC = 0.75
+
+    # Chỉ dùng khi mode = "extend": số epoch constant-LR nối thêm, theo tỉ lệ EPOCHS.
+    SWA_EXTRA_BUDGET = 0.25
+
+    SWA_LR = None                 # constant LR của pha SWA.
+                                  # None = TỰ TÍNH giá trị TRUNG GIAN giữa LR lớn nhất và
+                                  # nhỏ nhất của annealing schedule, đúng khuyến nghị
+                                  # Izmailov et al. §4.3:
+                                  #     SWA_LR = (lr0 + lr0·lrf) / 2
+                                  # Với lr0=5e-3, lrf=0.01 ⇒ (5e-3 + 5e-5)/2 = 2.525e-3
+                                  # (0.505 × lr0 — đúng cận trên khoảng 0.1×–0.5× lr0
+                                  #  mà Izmailov dùng thực tế, ví dụ CIFAR-100 WRN).
+                                  # Tự tính theo lr0/lrf HIỆN HÀNH nên --lr0 trên CLI cũng
+                                  # được tôn trọng. Đặt số cụ thể để ghi đè (hoặc --swa-lr).
+
+    # ---- Snapshot báo cáo của EMA/SWA ----
+    # "final"   (MẶC ĐỌNH): lấy trạng thái shadow ở EPOCH CUỐI của run — đúng
+    #           cách dùng chuẩn của cả hai paper. Mọi epoch đều đã được tính vào
+    #           trung bình lũy thừa, kể cả các epoch trong đuôi `patience` sau
+    #           best checkpoint (ví dụ best = epoch 30, patience = 5, dừng ở 35
+    #           ⇒ EMA báo cáo là x_EMA^35, đã nuốt cả epoch 31–35).
+    #           KHÔNG cần nhìn validation ⇒ không tốn thêm thời gian train.
+    # "best_val": chọn epoch có fitness val cao nhất (cần SHADOW_VAL_ENABLED=True).
+    SHADOW_SELECT = "final"       # "final" | "best_val"
+    # Bật để có thêm đường cong fitness val của shadow theo epoch (ghi vào
+    # averaging_shadows.json, hữu ích cho phụ lục). Cái giá: mỗi shadow tốn thêm
+    # MỘT lượt val trên tập val mỗi SHADOW_VAL_PERIOD epoch.
+    SHADOW_VAL_ENABLED = False
+    SHADOW_VAL_PERIOD = 1
+
     # ===================== Strategy Configuration =====================
     # Strategy 1: best.pt — RAW checkpoint có fitness cao nhất trên val'
     # Strategy 2: uniform element-wise average RAW weights của Top-K checkpoint
     #             có raw-model fitness cao nhất. train.py tắt EMA để toàn bộ
     #             validation, early stopping và checkpoint selection nhất quán.
-    USE_STRATEGY2 = True
+    USE_STRATEGY2 = True   # tự đồng bộ theo METHODS trong normalize_methods()
     TOP_K_VALUES = [2, 3, 4, 5]
     # Chỉ giữ đúng K checkpoint tốt nhất trên disk: checkpoint mỗi epoch được
     # Ultralytics lưu (save_period=1) rồi TopKCheckpointManager prune NGAY nếu
@@ -105,6 +212,12 @@ class Config:
     #   True  = luôn tắt mosaic/mixup/cutmix/copy_paste khi update BN
     #   False = luôn dùng full train augmentation
     BN_UPDATE_CLOSE_MOSAIC = "auto"
+    # Control quan trọng cho paper: mọi bản average (Top-K, EMA, SWA) đều được
+    # BN-recalibrate còn baseline thì không → không thể biết cải thiện đến từ
+    # AVERAGING hay từ hiệu chỉnh BN. Bật cờ này để eval thêm dòng
+    # "BN recal control (K=1)" = đúng checkpoint Top-1 nhưng đã BN-recalibrate.
+    # Tốn thêm 1 lần BN update + 1 lần eval mỗi seed.
+    BN_UPDATE_CONTROL = True
     # Mixed precision: dùng cho CẢ training (Ultralytics `amp`) lẫn forward pass
     # của BN update. Trên H100 autocast tự chọn bfloat16 (không cần GradScaler
     # tuning) — để True.
@@ -158,9 +271,115 @@ class Config:
 
     VALID_EVAL_SPLITS = (None, "val", "test", "train")
 
+    # Alias người dùng hay gõ → tên chuẩn trong VALID_METHODS
+    METHOD_ALIASES = {
+        "topk": "top-k", "top_k": "top-k", "top-k": "top-k", "strategy2": "top-k",
+        "s2": "top-k", "cwa": "top-k",
+        "ema": "ema",
+        "swa": "swa",
+    }
+
+    @classmethod
+    def normalize_methods(cls, methods=None):
+        """
+        Chuẩn hóa cls.METHODS: parse alias, tách dấu phẩy, bỏ trùng, giữ thứ tự.
+
+        Chấp nhận: ["top-k", "ema"], "EMA,SWA", ["all"], ["none"].
+        Đồng bộ luôn USE_STRATEGY2 = ("top-k" in METHODS) để phần code cũ
+        (build_train_args, run_strategy_evaluation, Excel...) không phải đổi.
+        """
+        raw = cls.METHODS if methods is None else methods
+        if raw is None:
+            raw = []
+        if isinstance(raw, str):
+            raw = [raw]
+
+        tokens = []
+        for item in raw:
+            tokens.extend(str(item).replace(";", ",").split(","))
+
+        resolved = []
+        for token in tokens:
+            name = token.strip().lower()
+            if not name:
+                continue
+            if name == "all":
+                resolved.extend(cls.VALID_METHODS)
+                continue
+            if name in ("none", "off"):
+                resolved = []
+                continue
+            canonical = cls.METHOD_ALIASES.get(name)
+            if canonical is None:
+                raise ValueError(
+                    f"--method {token!r} không hợp lệ. Chọn trong "
+                    f"{list(cls.VALID_METHODS)} (hoặc 'all'/'none'), "
+                    "ví dụ: --method top-k ema swa | --method EMA,SWA"
+                )
+            resolved.append(canonical)
+
+        # Giữ thứ tự chuẩn để bảng kết quả luôn nhất quán giữa các lần chạy.
+        cls.METHODS = [m for m in cls.VALID_METHODS if m in set(resolved)]
+        cls.USE_STRATEGY2 = "top-k" in cls.METHODS
+        return cls.METHODS
+
+    @classmethod
+    def swa_lr_mode(cls):
+        """'inherit' | 'extend' | 'truncate' — chuẩn hoá, chấp nhận alias 'constant'."""
+        mode = str(cls.SWA_LR_SCHEDULE).strip().lower()
+        if mode == "constant":
+            return "extend"
+        if mode not in ("inherit", "extend", "truncate"):
+            raise ValueError(
+                f"SWA_LR_SCHEDULE={cls.SWA_LR_SCHEDULE!r} không hợp lệ. "
+                "Chọn 'inherit' | 'extend' | 'truncate'."
+            )
+        return mode
+
+    @classmethod
+    def swa_extra_epochs(cls):
+        """Số epoch constant-LR nối thêm (chỉ > 0 ở mode 'extend')."""
+        if not cls.method_enabled("swa") or cls.swa_lr_mode() != "extend":
+            return 0
+        return max(1, int(round(float(cls.SWA_EXTRA_BUDGET) * int(cls.EPOCHS))))
+
+    @classmethod
+    def total_epochs(cls):
+        """
+        Số epoch THẬT truyền cho model.train().
+
+        Mode 'extend' nối thêm pha constant-LR SAU khi cosine chạy trọn EPOCHS,
+        nên tổng = EPOCHS + swa_extra_epochs(). Các mode khác giữ nguyên EPOCHS.
+        """
+        return int(cls.EPOCHS) + cls.swa_extra_epochs()
+
+    @classmethod
+    def resolved_swa_lr(cls):
+        """
+        Giá trị constant LR thực tế của pha SWA.
+
+        ``SWA_LR = None`` ⇒ trung bị́nh cộng của LR lớn nhất và nhỏ nhất trong
+        annealing schedule: ``(lr0 + lr0·lrf) / 2`` — "intermediate value between
+        the largest and the smallest learning rate used in the annealing scheme"
+        (Izmailov et al. §4.3). Tính theo LR0/LRF hiện hành nên CLI override vẫn đúng.
+        """
+        if cls.SWA_LR is None:
+            return (float(cls.LR0) + float(cls.LR0) * float(cls.LRF)) / 2.0
+        return float(cls.SWA_LR)
+
+    @classmethod
+    def method_enabled(cls, name):
+        return str(name).lower() in cls.METHODS
+
+    @classmethod
+    def any_method(cls):
+        """Có ít nhất một method cần RAW checkpoint / raw-weight validation."""
+        return bool(cls.METHODS)
+
     @classmethod
     def validate_config(cls, require_model=True):
         """Validate configuration (giữ pattern validate_config của repo gốc)."""
+        cls.normalize_methods()
         if require_model and not cls.MODEL:
             raise ValueError(
                 "Chưa set model. Đặt Config.MODEL trong config.py "
@@ -230,18 +449,99 @@ class Config:
                     "KEEP_TOP_K_CHECKPOINTS must be >= max(TOP_K_VALUES) "
                     "để đủ checkpoint cho mọi giá trị K"
                 )
+        if cls.any_method():
             if cls.USE_BN_UPDATE:
                 if int(cls.BN_UPDATE_BATCHES) <= 0:
                     raise ValueError("BN_UPDATE_BATCHES must be positive when USE_BN_UPDATE=True")
-                if not isinstance(cls.BN_UPDATE_CLOSE_MOSAIC, bool) and \
-                        str(cls.BN_UPDATE_CLOSE_MOSAIC).lower() != "auto":
+                if not isinstance(cls.BN_UPDATE_CLOSE_MOSAIC, bool) and                         str(cls.BN_UPDATE_CLOSE_MOSAIC).lower() != "auto":
                     raise ValueError("BN_UPDATE_CLOSE_MOSAIC must be True, False or 'auto'")
+            else:
+                print(
+                    "⚠ WARNING: USE_BN_UPDATE=False → sau khi average, BN running stats "
+                    "không khớp weights mới. Cả Top-K, EMA lẫn SWA đều bị tụt oan "
+                    "(Izmailov et al. nêu rõ BN phải được tính lại sau khi average)."
+                )
             if float(cls.VAL_RATIO) == 0.0:
                 print(
-                    "ℹ VAL_RATIO=0: dùng split val gốc để chọn checkpoint. "
+                    "ℹ VAL_RATIO=0: dùng split val gốc để chọn checkpoint/snapshot. "
                     "Hãy bảo đảm data.yaml có val độc lập với test "
                     "(carparts-seg.yaml mặc định đáp ứng điều này)."
                 )
+
+        # ---- EMA / SWA hyper-parameters ----
+        if cls.method_enabled("ema"):
+            if not cls.EMA_DECAYS:
+                raise ValueError("EMA_DECAYS must be a non-empty list")
+            for decay in cls.EMA_DECAYS:
+                if not 0.0 < float(decay) < 1.0:
+                    raise ValueError(f"EMA decay must be in (0, 1), got {decay}")
+            if int(cls.EMA_UPDATE_PERIOD) < 1:
+                raise ValueError("EMA_UPDATE_PERIOD must be >= 1")
+
+        if cls.method_enabled("swa"):
+            if not cls.SWA_START_FRACS:
+                raise ValueError("SWA_START_FRACS must be a non-empty list")
+            for frac in cls.SWA_START_FRACS:
+                if not 0.0 <= float(frac) < 1.0:
+                    raise ValueError(f"SWA start fraction must be in [0, 1), got {frac}")
+            if int(cls.SWA_PERIOD) < 1:
+                raise ValueError("SWA_PERIOD must be >= 1")
+            mode = cls.swa_lr_mode()
+            if mode != "inherit":
+                if cls.SWA_LR is not None and not 0.0 < float(cls.SWA_LR):
+                    raise ValueError(
+                        "SWA_LR must be positive, or None to auto-compute (lr0 + lr0*lrf)/2"
+                    )
+                if mode == "extend" and not 0.0 < float(cls.SWA_EXTRA_BUDGET):
+                    raise ValueError("SWA_EXTRA_BUDGET must be positive when SWA_LR_SCHEDULE='extend'")
+                if mode == "truncate" and not 0.0 <= float(cls.SWA_LR_START_FRAC) < 1.0:
+                    raise ValueError("SWA_LR_START_FRAC must be in [0, 1)")
+                extra = cls.swa_extra_epochs()
+                total = cls.total_epochs()
+                if mode == "extend":
+                    detail = (f"cosine chạy trọn {cls.EPOCHS} epoch (đúng run chuẩn) rồi nối "
+                              f"{extra} epoch constant ⇒ tổng {total} epoch "
+                              f"({total / int(cls.EPOCHS):.2f} budget)")
+                else:
+                    detail = (f"cắt cosine ở {float(cls.SWA_LR_START_FRAC):.0%} rồi chạy nốt "
+                              f"bằng constant ⇒ tổng vẫn {total} epoch (1.00 budget)")
+                print(
+                    f"⚠ SWA_LR_SCHEDULE={mode!r}: LR giữ hằng {cls.resolved_swa_lr():g} "
+                    f"({cls.resolved_swa_lr() / float(cls.LR0):.3f} × lr0"
+                    + (" — tự tính (lr0+lr0·lrf)/2" if cls.SWA_LR is None else "") + f"); {detail}. "
+                    "Đây là TRAJECTORY KHÁC với run chuẩn ⇒ phải báo cáo như một experiment riêng."
+                )
+                # LỖI CỨNG, không phải cảnh báo: constant LR đổi trajectory từ mốc cắt
+                # trở đi. Nếu top-k/ema cùng bật thì chúng bị tính trên một LR
+                # schedule KHÔNG PHẢI của chúng ⇒ số liệu vô giá trị cho paper.
+                # Chặn hẳn để không thể vô tình trộn hai trajectory vào một bảng.
+                clash = [m for m in ("top-k", "ema") if cls.method_enabled(m)]
+                if clash:
+                    raise ValueError(
+                        f"SWA_LR_SCHEDULE={mode!r} đổi LR schedule từ {float(cls.SWA_LR_START_FRAC):.0%} "
+                        f"budget trở đi, nhưng {clash} cũng đang bật. Constant LR là một phần "
+                        f"THUẬT TOÁN của SWA, KHÔNG phải của {clash} — chạy chung sẽ cho ra số "
+                        "Top-K/EMA trên một schedule không phải của chúng.\n"
+                        "  → RUN 1 (Top-K + EMA): python main.py\n"
+                        "  → RUN 2 (SWA)         : python main.py --methods swa --patience 0"
+                    )
+                if int(cls.PATIENCE) > 0:
+                    raise ValueError(
+                        f"SWA_LR_SCHEDULE={mode!r} + PATIENCE={cls.PATIENCE}: constant LR làm val "
+                        "fitness đi ngang nên early stopping gần như chắc chắn cắt mất pha SWA "
+                        "(SWA sẽ average thiếu epoch mà không báo gì).\n"
+                        "  → Chạy với --patience 0 (Ultralytics hiểu 0 = tắt early stopping)."
+                    )
+
+        if str(cls.SHADOW_SELECT).lower() not in ("best_val", "final"):
+            raise ValueError("SHADOW_SELECT must be 'best_val' or 'final'")
+        if int(cls.SHADOW_VAL_PERIOD) < 1:
+            raise ValueError("SHADOW_VAL_PERIOD must be >= 1")
+        if (cls.method_enabled("ema") or cls.method_enabled("swa"))                 and not cls.SHADOW_VAL_ENABLED and str(cls.SHADOW_SELECT).lower() == "best_val":
+            print(
+                "ℹ SHADOW_VAL_ENABLED=False → SHADOW_SELECT bị hạ về 'final': "
+                "EMA/SWA lấy snapshot ở epoch cuối thay vì epoch tốt nhất trên val."
+            )
 
         if cls.EXPORT_ENABLED and not cls.EXPORT_FORMAT:
             raise ValueError("EXPORT_ENABLED=True requires EXPORT_FORMAT (e.g. onnx, engine)")
@@ -249,21 +549,52 @@ class Config:
         print("[OK] Config validated successfully")
         print(f"  Model : {cls.MODEL or '(chưa set — bắt buộc khi train)'}")
         print(f"  Data  : {cls.DATA} | VAL_RATIO: {cls.VAL_RATIO}")
-        print(f"  Epochs: {cls.EPOCHS} | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
+        extra = cls.swa_extra_epochs()
+        print(f"  Epochs: {cls.EPOCHS}"
+              + (f" (+{extra} constant-LR cho SWA = {cls.total_epochs()})" if extra else "")
+              + f" | imgsz: {cls.IMGSZ} | batch: {cls.BATCH}")
         print(f"  Task  : Instance Segmentation")
         print(f"  Experiment name: {cls.EXP_NAME or '(auto timestamp)'}")
+        print(f"  Methods: {', '.join(cls.METHODS) if cls.METHODS else '(none — chỉ train + Strategy 1)'}")
         if cls.USE_STRATEGY2:
-            print(f"  Strategy 2: ON — Top-K {cls.TOP_K_VALUES} "
+            print(f"    top-k      : K ∈ {cls.TOP_K_VALUES} "
                   "(uniform element-wise average của raw weights, KHÔNG EMA)")
-            print(f"  Top-1 raw baseline (K=1): {'ON' if cls.EVAL_TOP1_BASELINE else 'OFF'}")
-        else:
-            print("  Strategy 2: OFF")
+            print(f"    Top-1 raw baseline (K=1): {'ON' if cls.EVAL_TOP1_BASELINE else 'OFF'}")
+        if cls.method_enabled("ema"):
+            print(f"    ema        : decay ∈ {list(cls.EMA_DECAYS)} (không warmup), "
+                  f"update mỗi {cls.EMA_UPDATE_PERIOD} optimizer step")
+        if cls.method_enabled("swa"):
+            print(f"    swa        : start ∈ {[f'{float(f):.0%}' for f in cls.SWA_START_FRACS]} "
+                  f"budget, average mỗi {cls.SWA_PERIOD} epoch")
+            mode = cls.swa_lr_mode()
+            if mode == "inherit":
+                print("    swa LR     : theo cosine schedule chung (inherit) — cùng trajectory")
+            else:
+                print(f"    swa LR     : HẰNG SỐ {cls.resolved_swa_lr():g} "
+                      f"({cls.resolved_swa_lr() / float(cls.LR0):.3f} × lr0"
+                      + (" — auto" if cls.SWA_LR is None else "") + f") — mode '{mode}'")
+                if mode == "extend":
+                    print(f"                 cosine trọn {cls.EPOCHS} epoch + "
+                          f"{cls.swa_extra_epochs()} epoch constant = {cls.total_epochs()} epoch "
+                          f"({cls.total_epochs() / int(cls.EPOCHS):.2f} budget) — TRAJECTORY RIÊNG")
+                else:
+                    print(f"                 cắt cosine ở {float(cls.SWA_LR_START_FRAC):.0%} budget, "
+                          f"tổng vẫn {cls.total_epochs()} epoch — TRAJECTORY RIÊNG")
+        if cls.method_enabled("ema") or cls.method_enabled("swa"):
+            print(
+                "    snapshot   : "
+                + (f"best trên val (val shadow mỗi {cls.SHADOW_VAL_PERIOD} epoch)"
+                   if cls.SHADOW_VAL_ENABLED and str(cls.SHADOW_SELECT).lower() == "best_val"
+                   else "epoch cuối (không val shadow)")
+            )
         print(
             "  BN update : "
             + (f"ON — {cls.BN_UPDATE_BATCHES} batch train, no-grad forward, "
-               f"close_mosaic={cls.BN_UPDATE_CLOSE_MOSAIC}"
+               f"close_mosaic={cls.BN_UPDATE_CLOSE_MOSAIC} "
+               "(áp dụng GIỐNG NHAU cho top-k / ema / swa)"
                if cls.USE_BN_UPDATE else "OFF")
         )
+        print(f"  BN control: {'ON (thêm dòng BN recal control (K=1))' if cls.BN_UPDATE_CONTROL else 'OFF'}")
         print(
             "  Checkpoints: "
             + ("temporary → delete after evaluation" if cls.DELETE_CHECKPOINTS_AFTER_RUN else "keep")

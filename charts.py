@@ -6,11 +6,14 @@ chạy được trên server). Mỗi hàm nhận DataFrame đã gom sẵn và gh
 PNG; nếu thiếu dữ liệu thì bỏ qua và trả về None thay vì raise, để lỗi vẽ
 chart không bao giờ làm hỏng một run training đã tốn nhiều giờ.
 
-Quy ước tên strategy (xem evaluate.py):
+Quy ước tên strategy (xem evaluate.py / averaging.py):
     "Strategy 1 (best.pt)"        -> baseline, không có K
     "Top-1 (best raw ckpt)"       -> K = 1, không average
     "Strategy 2 (Top-<K> avg)"    -> K = 2, 3, ...
-``strategy_k()`` parse K từ tên để dựng đường cong metric theo K.
+    "EMA (decay <d>)"             -> baseline EMA of weights
+    "SWA (start <p>% budget)"     -> baseline Stochastic Weight Averaging
+``strategy_k()`` parse K từ tên để dựng đường cong metric theo K; EMA/SWA không
+có K nên không bao giờ rơi vào đường cong đó.
 """
 import re
 from pathlib import Path
@@ -19,6 +22,8 @@ from pathlib import Path
 BASELINE_COLOR = "#D55E00"   # cam đỏ  — Strategy 1 / baseline
 AVERAGE_COLOR = "#0072B2"    # xanh dương — Strategy 2 (averaging)
 SINGLE_COLOR = "#009E73"     # xanh lá   — Top-1 raw (không average)
+EMA_COLOR = "#CC79A7"        # hồng      — baseline EMA
+SWA_COLOR = "#E69F00"        # vàng cam  — baseline SWA
 NEUTRAL_COLOR = "#666666"
 SEED_COLORS = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442"]
 
@@ -31,11 +36,39 @@ def strategy_k(name):
     return int(match.group(1)) if match else None
 
 
-def strategy_color(name):
-    k = strategy_k(name)
+def strategy_family(name):
+    """
+    'baseline' | 'top1' | 'bn_control' | 'topk' | 'ema' | 'swa'.
+
+    Dùng để tô màu, sắp xếp, và quyết định dòng nào được vào đường cong
+    metric-theo-K (chỉ 'top1'/'topk') hay làm đường tham chiếu ('baseline').
+    """
+    text = str(name)
+    if text.startswith("EMA"):
+        return "ema"
+    if text.startswith("SWA"):
+        return "swa"
+    if text.startswith("BN recal control"):
+        return "bn_control"
+    k = strategy_k(text)
     if k is None:
-        return BASELINE_COLOR
-    return SINGLE_COLOR if k == 1 else AVERAGE_COLOR
+        return "baseline"
+    return "top1" if k == 1 else "topk"
+
+
+FAMILY_COLORS = {
+    "baseline": BASELINE_COLOR,
+    "top1": SINGLE_COLOR,
+    "bn_control": NEUTRAL_COLOR,
+    "topk": AVERAGE_COLOR,
+    "ema": EMA_COLOR,
+    "swa": SWA_COLOR,
+}
+FAMILY_ORDER = {"baseline": 0, "top1": 1, "bn_control": 2, "topk": 3, "ema": 4, "swa": 5}
+
+
+def strategy_color(name):
+    return FAMILY_COLORS.get(strategy_family(name), NEUTRAL_COLOR)
 
 
 def _pyplot():
@@ -68,12 +101,20 @@ def _pyplot():
 
 def _short(name):
     """Rút gọn tên strategy cho nhãn trục x."""
-    k = strategy_k(name)
-    if k is None:
+    family = strategy_family(name)
+    if family == "baseline":
         return "best.pt\n(S1)"
-    if k == 1:
+    if family == "top1":
         return "Top-1\n(raw)"
-    return f"Top-{k}\navg"
+    if family == "bn_control":
+        return "K=1\n+BN"
+    if family == "topk":
+        return f"Top-{strategy_k(name)}\navg"
+    # "EMA (decay 0.999)" → "EMA\nd=0.999"; "SWA (start 75% budget)" → "SWA\n75%"
+    inner = re.search(r"\(([^)]*)\)", str(name))
+    detail = (inner.group(1) if inner else "")
+    detail = detail.replace("decay ", "d=").replace("start ", "").replace(" budget", "")
+    return f"{family.upper()}\n{detail}".strip()
 
 
 def _finish(fig, out_path):
@@ -87,9 +128,12 @@ def _finish(fig, out_path):
 
 
 def _ordered_strategies(summary_df):
-    """Sắp xếp strategy: baseline trước, rồi Top-K tăng dần."""
+    """Sắp xếp: baseline → Top-1 → Top-K tăng dần → EMA → SWA."""
     names = list(dict.fromkeys(summary_df["Strategy"]))
-    return sorted(names, key=lambda n: (strategy_k(n) is not None, strategy_k(n) or 0))
+    return sorted(
+        names,
+        key=lambda n: (FAMILY_ORDER.get(strategy_family(n), 9), strategy_k(n) or 0, str(n)),
+    )
 
 
 # ==================== Chart tổng hợp nhiều seed ====================
@@ -176,7 +220,9 @@ def plot_topk_curve(summary_df, metric, out_path, title=None):
     ax.plot(ks, means, marker="o", markersize=5, color=AVERAGE_COLOR,
             linewidth=1.8, zorder=4, label="Top-K average")
 
-    baseline_rows = summary_df[summary_df["Strategy"].map(strategy_k).isna()]
+    # CHỈ Strategy 1 mới là đường tham chiếu — EMA/SWA cũng không có K nhưng là
+    # method đang được so; gom chúng vào baseline thì đường này vô nghĩa.
+    baseline_rows = summary_df[summary_df["Strategy"].map(strategy_family) == "baseline"]
     if not baseline_rows.empty:
         baseline = float(baseline_rows[metric].astype(float).mean())
         ax.axhline(baseline, color=BASELINE_COLOR, linestyle="--", linewidth=1.4,
@@ -393,7 +439,7 @@ def build_summary_charts(summary_df, per_class_df, charts_dir, baseline_name):
 
     # Δ AP theo class giữa baseline và strategy averaging tốt nhất
     try:
-        averaging = [n for n in set(summary_df["Strategy"]) if (strategy_k(n) or 0) > 1]
+        averaging = [n for n in set(summary_df["Strategy"]) if strategy_family(n) == "topk"]
         if averaging and not per_class_df.empty:
             best = max(
                 averaging,

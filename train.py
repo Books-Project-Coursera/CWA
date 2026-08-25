@@ -35,6 +35,7 @@ from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
+from averaging import ShadowAveragingManager
 from config import Config
 from dataset import prepare_dataset
 from evaluate import (
@@ -121,8 +122,9 @@ class TopKCheckpointManager:
         trainer.ema.enabled = False
         TopKCheckpointManager.sync_raw_validation_model(trainer)
         print(
-            "  Strategy 2: EMA smoothing disabled — validation dùng bản sao "
-            "đồng bộ chính xác RAW weights"
+            "  Raw-weight validation: EMA smoothing của Ultralytics được TẮT — "
+            "fitness / best.pt / early stopping đều tính trên RAW weights, giống hệt "
+            "nhau ở mọi tổ hợp --method (EMA baseline là shadow riêng, xem averaging.py)"
         )
 
     @staticmethod
@@ -387,7 +389,9 @@ def build_train_args(data_yaml):
     train_args = {
         # ---- Training core ----
         "data": str(data_yaml),
-        "epochs": int(Config.EPOCHS),
+        # total_epochs() = EPOCHS, trừ khi SWA chạy mode 'extend' thì cộng thêm pha
+        # constant-LR nối sau khi cosine đã chạy trọn (xem Config.swa_extra_epochs()).
+        "epochs": Config.total_epochs(),
         "imgsz": int(Config.IMGSZ),
         "batch": int(Config.BATCH),
         "workers": int(Config.WORKERS),
@@ -413,13 +417,15 @@ def build_train_args(data_yaml):
         "copy_paste": float(Config.COPY_PASTE),
     }
 
-    if Config.USE_STRATEGY2:
-        # Lưu ckpt mỗi epoch để có nguồn chọn Top-K; TopKCheckpointManager
-        # prune ngay nên disk không phình theo số epoch
+    if Config.any_method():
+        # Lưu ckpt mỗi epoch để có nguồn chọn Top-K VÀ để baseline Strategy 1
+        # luôn là raw FP32 rank #1 (cùng precision với mọi bản average, kể cả
+        # khi chỉ chạy --method ema/swa). TopKCheckpointManager prune ngay nên
+        # disk không phình theo số epoch.
         train_args["save_period"] = 1
     else:
-        # Không dùng Strategy 2 → không cần lưu checkpoint
-        train_args["save"] = False
+        # Không method nào → không cần lưu checkpoint epoch
+        train_args["save"] = True
 
     if Config.DEVICE is not None:
         train_args["device"] = Config.DEVICE
@@ -427,10 +433,10 @@ def build_train_args(data_yaml):
         train_args["name"] = Config.NAME
     train_args.update(Config.EXTRA_TRAIN_ARGS or {})
 
-    # Invariants của Strategy 2: phải validate và lưu checkpoint ở mọi epoch
-    # để mỗi epoch có fitness + epochN.pt tương ứng. Không cho EXTRA_TRAIN_ARGS
-    # vô tình phá vỡ hai điều kiện này.
-    if Config.USE_STRATEGY2:
+    # Mọi method đều cần validate ở MỌI epoch (fitness val là tín hiệu chọn
+    # checkpoint/snapshot chung) và lưu checkpoint mỗi epoch. Không cho
+    # EXTRA_TRAIN_ARGS vô tình phá vỡ invariant này.
+    if Config.any_method():
         train_args["val"] = True
         train_args["save"] = True
         train_args["save_period"] = 1
@@ -614,6 +620,8 @@ def train_detector():
     print(f"  Model      : {Config.MODEL}")
     print(f"  Data       : {Config.DATA}")
     print(f"  Seeds      : {seeds}")
+    print(f"  Methods    : {', '.join(Config.METHODS) or '(none)'}  "
+          "— cùng 1 trajectory / seed, so sánh paired")
     print(f"  Experiment : {exp_dir}")
     print("=" * 70)
 
@@ -640,10 +648,36 @@ def train_detector():
         "loss_function": Config.LOSS_FUNCTION,
         "focal_gamma": Config.FOCAL_GAMMA,
         "focal_alpha": Config.FOCAL_ALPHA,
+        "methods": list(Config.METHODS),
         "use_strategy2": Config.USE_STRATEGY2,
         "top_k_values": Config.TOP_K_VALUES,
         "keep_top_k_checkpoints": Config.KEEP_TOP_K_CHECKPOINTS,
         "eval_top1_baseline": Config.EVAL_TOP1_BASELINE,
+        "ema_decays": list(Config.EMA_DECAYS) if Config.method_enabled("ema") else None,
+        "ema_update_period": Config.EMA_UPDATE_PERIOD if Config.method_enabled("ema") else None,
+        "swa_start_fracs": list(Config.SWA_START_FRACS) if Config.method_enabled("swa") else None,
+        "swa_period": Config.SWA_PERIOD if Config.method_enabled("swa") else None,
+        "swa_lr_schedule": Config.swa_lr_mode() if Config.method_enabled("swa") else None,
+        "swa_extra_epochs": Config.swa_extra_epochs() or None,
+        "total_epochs": Config.total_epochs(),
+        "swa_budget": (round(Config.total_epochs() / int(Config.EPOCHS), 4)
+                       if Config.method_enabled("swa") else None),
+        "swa_lr": (Config.resolved_swa_lr()
+                   if Config.method_enabled("swa")
+                   and str(Config.SWA_LR_SCHEDULE).lower() == "constant" else None),
+        "swa_lr_source": (("auto (lr0+lr0*lrf)/2" if Config.SWA_LR is None else "explicit")
+                          if Config.method_enabled("swa")
+                          and str(Config.SWA_LR_SCHEDULE).lower() == "constant" else None),
+        "swa_lr_start_frac": (float(Config.SWA_LR_START_FRAC)
+                              if Config.method_enabled("swa")
+                              and str(Config.SWA_LR_SCHEDULE).lower() == "constant" else None),
+        "shadow_val_enabled": Config.SHADOW_VAL_ENABLED,
+        "shadow_val_period": Config.SHADOW_VAL_PERIOD,
+        "shadow_select": Config.SHADOW_SELECT,
+        "shared_trajectory": (
+            "Top-K, EMA và SWA đều được tính trên CÙNG MỘT training run mỗi seed; "
+            "không method nào can thiệp vào optimization → so sánh paired theo seed"
+        ),
         "use_bn_update": Config.USE_BN_UPDATE,
         "bn_update_batches": Config.BN_UPDATE_BATCHES,
         "bn_update_close_mosaic": Config.BN_UPDATE_CLOSE_MOSAIC,
@@ -684,15 +718,32 @@ def train_detector():
                 install_cls_loss(model)
                 model.add_callback("on_pretrain_routine_start", cap_val_dataloader_workers)
 
-                if Config.USE_STRATEGY2:
-                    manager = TopKCheckpointManager(Config.KEEP_TOP_K_CHECKPOINTS)
+                if Config.any_method():
+                    # Raw-weight validation là NỀN CHUNG của cả ba method:
+                    # fitness val, best.pt và early stopping đều tính trên raw
+                    # weights, nên trajectory và tín hiệu chọn checkpoint giống
+                    # hệt nhau ở mọi tổ hợp --method. Khi không bật top-k vẫn
+                    # giữ 1 checkpoint để baseline là raw FP32 (cùng precision
+                    # với các bản average) thay vì best.pt FP16.
+                    keep = int(Config.KEEP_TOP_K_CHECKPOINTS) if Config.USE_STRATEGY2 else 1
+                    manager = TopKCheckpointManager(keep)
                     model.add_callback("on_train_start", manager.on_train_start)
                     model.add_callback("on_train_epoch_end", manager.on_train_epoch_end)
                     model.add_callback("on_model_save", manager.on_model_save)
                     print(
-                        f"  Strategy 2: giữ Top-{Config.KEEP_TOP_K_CHECKPOINTS} RAW checkpoint "
+                        f"  Checkpoint pool: giữ Top-{keep} RAW checkpoint "
                         "theo raw-model fitness cao nhất"
                     )
+
+                if Config.method_enabled("ema") or Config.method_enabled("swa"):
+                    # EMA/SWA chỉ QUAN SÁT weights (shadow ngoài training loop)
+                    # — không optimizer step nào, không gradient nào của chúng
+                    # đi vào model.
+                    shadow_manager = ShadowAveragingManager()
+                    model.add_callback("on_train_start", shadow_manager.on_train_start)
+                    model.add_callback("on_train_epoch_end", shadow_manager.on_train_epoch_end)
+                    model.add_callback("on_fit_epoch_end", shadow_manager.on_fit_epoch_end)
+                    model.add_callback("on_train_end", shadow_manager.on_train_end)
 
                 # model.train() trả về SegmentMetrics của lượt val CUỐI trên best.pt.
                 metrics = model.train(**build_train_args(data_yaml))

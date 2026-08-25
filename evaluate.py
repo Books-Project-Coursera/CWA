@@ -20,6 +20,7 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from averaging import SHADOW_MANIFEST, load_shadow_manifest
 from config import Config
 
 # File ranking do TopKCheckpointManager (train.py) ghi trong <run_dir>/weights/
@@ -28,6 +29,11 @@ RANKING_FILE = "strategy2_checkpoints.json"
 # Tên strategy — charts.strategy_k() parse "Top-<K>" từ các tên này.
 STRATEGY_BASELINE = "Strategy 1 (best.pt)"
 STRATEGY_TOP1 = "Top-1 (best raw ckpt)"
+# Control: chính checkpoint Top-1 nhưng ĐÃ BN-recalibrate, KHÔNG average. Cần
+# thiết vì mọi bản average (Top-K, EMA, SWA) đều được BN recal — thiếu dòng này
+# thì không tách được phần cải thiện do averaging khỏi phần do hiệu chỉnh BN.
+# Cố ý KHÔNG chứa chuỗi "Top-<số>" để không lọt vào đường cong metric-theo-K.
+STRATEGY_BN_CONTROL = "BN recal control (K=1)"
 
 
 def strategy_avg_name(k):
@@ -612,6 +618,14 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, excel_pat
                                     Strategy 2 (bật/tắt qua EVAL_TOP1_BASELINE).
       - Strategy 2 (Top-K avg)    : uniform average K checkpoint tốt nhất, có
                                     BN recalibration.
+      - EMA (decay ...)           : baseline EMA of weights, snapshot do
+                                    averaging.py tích lũy khi train (--method ema)
+      - SWA (start ...)           : baseline Stochastic Weight Averaging
+                                    (--method swa)
+
+    Cả ba họ method dùng CHUNG một trajectory, CHUNG val để chọn checkpoint/
+    snapshot, và CHUNG một quy trình BN recalibration → khác biệt duy nhất là
+    toán tử average.
 
     Returns:
         dict {
@@ -647,25 +661,46 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, excel_pat
     else:
         print(f"  ⚠ Không tìm thấy {best_weights} — bỏ qua Strategy 1")
 
-    ranked = []
+    shadows = load_shadow_manifest(run_dir)
+    # Ranking raw checkpoint cần cho CẢ Top-K lẫn baseline K=1 raw FP32, nên
+    # được tính khi BẤT KỬ method nào bật (kể cả chỉ --method ema/swa) — nhờ
+    # vậy baseline luôn cùng precision với các bản average.
+    ranked = rank_checkpoints(run_dir) if Config.any_method() else []
+    mosaic_closed = resolve_mosaic_closed(ranked) if ranked else resolve_mosaic_closed()
+
+    if ranked:
+        print(f"\n  Checkpoint khả dụng (rank theo fitness val'): "
+              f"{[(p.name, round(f, 4)) for p, f, _ in ranked]}")
+        # Baseline K=1: raw FP32, không average, không đụng BN.
+        if Config.EVAL_TOP1_BASELINE:
+            results[STRATEGY_TOP1] = _val(
+                ranked[0][0], STRATEGY_TOP1,
+                f"Top-1 raw checkpoint — K=1, không average (split={split})",
+            )
+
+        # Control: ĐÚNG checkpoint đó nhưng đã BN-recalibrate, KHÔNG average.
+        # Mọi bản average bên dưới đều đi qua update_bn_stats(), nên nếu thiếu
+        # control này thì mọi cải thiện đều có thể bị quy cho BN thay vì
+        # averaging. Dùng chung mosaic_closed để xử lý hoàn toàn đối xứng.
+        if Config.USE_BN_UPDATE and Config.BN_UPDATE_CONTROL:
+            ctrl_path = run_dir / "weights" / "strategy1_bn_control.pt"
+            try:
+                shutil.copyfile(ranked[0][0], ctrl_path)
+                update_bn_stats(ctrl_path, data, mosaic_closed=mosaic_closed)
+                results[STRATEGY_BN_CONTROL] = _val(
+                    ctrl_path, STRATEGY_BN_CONTROL,
+                    f"Control — Top-1 raw + BN recal, KHÔNG average (split={split})",
+                )
+            finally:
+                if Config.DELETE_CHECKPOINTS_AFTER_RUN and ctrl_path.exists():
+                    ctrl_path.unlink()
+
     # ----- Strategy 2: average Top-K checkpoint tốt nhất trên val' -----
     if Config.USE_STRATEGY2:
-        ranked = rank_checkpoints(run_dir)
         if not ranked:
             print("  ⚠ Không tìm thấy checkpoint epoch nào để average — bỏ qua Strategy 2")
-            print("    (cần train với USE_STRATEGY2=True để lưu Top-K checkpoint)")
+            print("    (cần train với --method top-k để lưu Top-K checkpoint)")
         else:
-            print(f"\n  Checkpoint khả dụng (rank theo fitness val'): "
-                  f"{[(p.name, round(f, 4)) for p, f, _ in ranked]}")
-            mosaic_closed = resolve_mosaic_closed(ranked)
-
-            # Baseline K=1: raw FP32, không average, không đụng BN.
-            if Config.EVAL_TOP1_BASELINE:
-                results[STRATEGY_TOP1] = _val(
-                    ranked[0][0], STRATEGY_TOP1,
-                    f"Top-1 raw checkpoint — K=1, không average (split={split})",
-                )
-
             for k in sorted({int(k) for k in Config.TOP_K_VALUES}):
                 if k > len(ranked):
                     print(f"  ⚠ Top-{k}: chỉ có {len(ranked)} checkpoint — bỏ qua")
@@ -687,6 +722,31 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, excel_pat
                     if Config.DELETE_CHECKPOINTS_AFTER_RUN and avg_path.exists():
                         avg_path.unlink()
                         print(f"      ✓ Đã xóa averaged checkpoint tạm: {avg_path.name}")
+
+    # ----- Baselines EMA / SWA (shadow tích lũy trong lúc train) -----
+    # Cùng trajectory, cùng val để chọn snapshot, và ĐI QUA ĐÚNG cùng một BN
+    # recalibration như Top-K → khác biệt còn lại chỉ là toán tử average.
+    if shadows:
+        print(f"\n  Weight-averaging baselines (đọc {SHADOW_MANIFEST}):")
+    for entry in shadows:
+        shadow_path = run_dir / "weights" / entry["file"]
+        if not shadow_path.exists():
+            print(f"  ⚠ {entry['label']}: thiếu {shadow_path.name} — bỏ qua")
+            continue
+        print(
+            f"    • {entry['label']} — snapshot epoch {entry.get('epoch')} "
+            f"(chọn theo {entry.get('selection')}, val fitness {entry.get('val_fitness')})"
+        )
+        try:
+            if Config.USE_BN_UPDATE:
+                update_bn_stats(shadow_path, data, mosaic_closed=mosaic_closed)
+            results[entry["label"]] = _val(
+                shadow_path, entry["label"],
+                f"{entry['label']} — baseline weight averaging (split={split})",
+            )
+        finally:
+            if Config.DELETE_CHECKPOINTS_AFTER_RUN and shadow_path.exists():
+                shadow_path.unlink()
 
     # Dọn thư mục eval_plots rỗng khi SAVE_EVAL_PLOTS=False
     if not plots and eval_root.exists():
@@ -936,8 +996,85 @@ def _mean_std_frame(df, group_columns, metric_columns):
     return pd.DataFrame(rows)
 
 
+def _betacf(a, b, x, max_iter=200, eps=3e-16):
+    """Continued fraction cho incomplete beta (thuật toán Lentz, Numerical Recipes)."""
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < eps:
+            break
+    return h
+
+
+def _betainc(a, b, x):
+    """Regularized incomplete beta I_x(a, b) — chỉ cần math, không cần scipy."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    log_beta = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+    front = math.exp(log_beta + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - math.exp(
+        math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+        + b * math.log(1.0 - x) + a * math.log(x)
+    ) * _betacf(b, a, 1.0 - x) / b
+
+
+def paired_t_test(deltas):
+    """
+    Paired two-sided t-test trên list chênh lệch per-seed (H0: mean = 0).
+
+    Hợp lệ vì mọi method (Top-K, EMA, SWA) được tính từ CÙNG một training run
+    trên mỗi seed → cùng data split, cùng trajectory. Đây là thiết kế paired,
+    mạnh hơn hẳn unpaired t-test giữa các run độc lập.
+
+    Returns:
+        (t_stat, p_value, df) — (nan, nan, n-1) khi không đủ mẫu hoặc std = 0.
+    """
+    n = len(deltas)
+    if n < 2:
+        return float("nan"), float("nan"), max(n - 1, 0)
+    mean_d = sum(deltas) / n
+    variance = sum((d - mean_d) ** 2 for d in deltas) / (n - 1)
+    std_d = math.sqrt(variance)
+    if std_d == 0 or not math.isfinite(std_d):
+        return float("nan"), float("nan"), n - 1
+    t_stat = mean_d / (std_d / math.sqrt(n))
+    df = n - 1
+    p_value = _betainc(df / 2.0, 0.5, df / (df + t_stat * t_stat))
+    return t_stat, p_value, df
+
+
 def _delta_frame(summary_df, metric_columns, baseline_name):
-    """Chênh lệch ghép cặp theo seed so với baseline + số seed thắng."""
+    """Chênh lệch ghép cặp theo seed so với baseline + số seed thắng + t-test."""
     if baseline_name not in set(summary_df["Strategy"]):
         return pd.DataFrame()
 
@@ -958,6 +1095,12 @@ def _delta_frame(summary_df, metric_columns, baseline_name):
             std = float(deltas.std(ddof=1)) if len(deltas) > 1 else 0.0
             row[f"Δ {column} mean"] = round(mean, 6)
             row[f"Δ {column} std"] = round(std, 6)
+            # Paired t-test: hợp lệ vì cùng seed = cùng trajectory cho mọi method.
+            t_stat, p_value, dof = paired_t_test([float(d) for d in deltas])
+            row[f"Δ {column} t"] = t_stat
+            row[f"Δ {column} p (paired, 2-sided)"] = p_value
+            row[f"Δ {column} df"] = dof
+            row[f"Δ {column} wins"] = f"{int((deltas > 0).sum())}/{len(deltas)}"
             if column == HEADLINE_METRIC:
                 row["Seeds tốt hơn baseline"] = f"{int((deltas > 0).sum())}/{len(deltas)}"
         rows.append(row)
