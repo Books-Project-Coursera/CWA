@@ -7,6 +7,12 @@ hay dùng override được qua CLI (pattern như repo gốc).
     # Train (model lấy từ Config.MODEL, hoặc override --model)
     python main.py train --exp-name yolov8s_exp1
 
+    # So sánh method: Top-K (của bạn) vs EMA vs SWA — MỘT lần train cho cả ba,
+    # cùng seed / cùng config / cùng trajectory ⇒ so sánh paired theo seed.
+    python main.py train --exp-name voc_compare_run01 --method top-k ema swa
+    python main.py train --exp-name voc_ema_swa      --method EMA,SWA
+    python main.py train --exp-name voc_topk_only    --method top-k
+
     Kết quả nằm gọn trong results/detection/yolov8s_exp1/:
         SUMMARY.xlsx            mean ± std của cả 5 seed × mọi strategy
         charts/                 5 chart tổng hợp
@@ -95,7 +101,73 @@ def add_common_args(parser):
         choices=EVAL_SPLIT_CHOICES,
         help="Split cho báo cáo cuối (Config.EVAL_SPLIT). Mặc định 'test' = VOC2007 test.",
     )
-    # Các cờ Strategy 2 dùng chung cho cả `train` lẫn `strategies`
+    # Các cờ method/Strategy 2 dùng chung cho cả `train` lẫn `strategies`
+    parser.add_argument(
+        "--method", "--methods", nargs="+", dest="methods", metavar="M",
+        help="Method weight-averaging cần chạy: top-k | ema | swa (hoặc 'all'/'none'). "
+             "Cho phép tổ hợp và dấu phẩy: --method top-k ema swa | --method EMA,SWA. "
+             "Tất cả method được tính trên CÙNG một trajectory nên chạy một lần là "
+             "đủ để so sánh paired theo seed. Override Config.METHODS.",
+    )
+    parser.add_argument(
+        "--ema-decay", "--ema_decay", dest="ema_decays", type=float, nargs="+",
+        help="Override Config.EMA_DECAYS (decay theo optimizer step), ví dụ: "
+             "--ema-decay 0.99 0.999 0.9999.",
+    )
+    parser.add_argument(
+        "--ema-update-period", "--ema_update_period", dest="ema_update_period", type=int,
+        help="Override Config.EMA_UPDATE_PERIOD (cập nhật EMA mỗi N optimizer step).",
+    )
+    parser.add_argument(
+        "--swa-start", "--swa_start", dest="swa_start_fracs", type=float, nargs="+",
+        help="Override Config.SWA_START_FRACS — mốc bắt đầu SWA theo tỉ lệ budget, "
+             "ví dụ: --swa-start 0.75 (mặc định, đúng Izmailov et al.).",
+    )
+    parser.add_argument("--swa-period", "--swa_period", dest="swa_period", type=int,
+                        help="Override Config.SWA_PERIOD (average mỗi N epoch).")
+    parser.add_argument(
+        "--swa-lr-schedule", "--swa_lr_schedule", dest="swa_lr_schedule",
+        choices=["inherit", "extend", "truncate", "constant"],
+        help="LR cho pha SWA. 'inherit' (MẶC ĐỊNH): giữ cosine chung — cùng trajectory "
+             "với Top-K/EMA. 'extend' (= alias 'constant'): chạy TRỌN cosine của bạn "
+             "(đúng bằng run Top-K) rồi NỐI THÊM --swa-extra-budget × EPOCHS epoch "
+             "constant LR. 'truncate': cắt cosine ở --swa-lr-start rồi chạy nốt bằng "
+             "constant, tổng budget giữ nguyên. Hai mode sau ĐỔI TRAJECTORY ⇒ là "
+             "experiment riêng, nên chạy kèm --methods swa --patience 0.",
+    )
+    parser.add_argument(
+        "--swa-extra-budget", "--swa_extra_budget", dest="swa_extra_budget", type=float,
+        help="Chỉ cho mode 'extend': số epoch constant-LR nối thêm, theo tỉ lệ EPOCHS "
+             "(0.25 ⇒ 100+25=125 epoch = 1.25 budget). Override Config.SWA_EXTRA_BUDGET.",
+    )
+    parser.add_argument("--swa-lr", "--swa_lr", dest="swa_lr", type=float,
+                        help="Override Config.SWA_LR — giá trị constant LR của pha SWA.")
+    parser.add_argument(
+        "--swa-lr-start", "--swa_lr_start", dest="swa_lr_start_frac", type=float,
+        help="Override Config.SWA_LR_START_FRAC — mốc chuyển sang constant LR "
+             "theo tỉ lệ budget (mặc định 0.75).",
+    )
+    parser.add_argument(
+        "--shadow-select", "--shadow_select", dest="shadow_select",
+        choices=["best_val", "final"],
+        help="Chọn snapshot EMA/SWA: 'final' (trạng thái ở epoch cuối — MẶC ĐỊNH, "
+             "đúng cách dùng chuẩn của cả hai paper) hoặc 'best_val' (epoch tốt nhất trên "
+             "val, cần --shadow-val). Override Config.SHADOW_SELECT.",
+    )
+    parser.add_argument(
+        "--shadow-val-period", "--shadow_val_period", dest="shadow_val_period", type=int,
+        help="Khi đã bật --shadow-val: val shadow mỗi N epoch (mặc định 1).",
+    )
+    parser.add_argument(
+        "--shadow-val", action="store_true",
+        help="Bật val shadow EMA/SWA trên tập val mỗi epoch — sinh đường cong fitness "
+             "cho phụ lục (ghi vào averaging_shadows.json) và là điều kiện để dùng "
+             "--shadow-select best_val. Mặc định TẮT → không tốn thêm thời gian train.",
+    )
+    parser.add_argument(
+        "--no-shadow-val", action="store_true",
+        help="Tắt hẳn việc val shadow EMA/SWA trên val' → snapshot lấy ở epoch cuối.",
+    )
     parser.add_argument(
         "--top-k", type=int, nargs="+", dest="top_k_values",
         help="Override Config.TOP_K_VALUES, ví dụ: --top-k 2 3 5.",
@@ -112,7 +184,8 @@ def parse_args():
         description="Strategy 2 - Object Detection pipeline (Ultralytics YOLO + Pascal VOC).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    # required=False: gõ trống `python main.py` thì mặc định là `train` (xem cuối hàm).
+    subparsers = parser.add_subparsers(dest="command")
 
     p_train = subparsers.add_parser(
         "train",
@@ -166,7 +239,13 @@ def parse_args():
     p_export_model.add_argument("--format", dest="export_format", help="Override Config.EXPORT_FORMAT.")
     p_export_model.add_argument("--half", action="store_true", help="Export FP16 (Config.EXPORT_HALF).")
 
-    return parser.parse_args()
+    # `python main.py` (không subcommand) ⇒ hiểu là `python main.py train`, để
+    # chạy thẳng bằng toàn bộ default trong config.py.
+    argv = sys.argv[1:]
+    if not argv or argv[0].startswith("-"):
+        print("[main] Không có subcommand → mặc định chạy 'train' với config.py hiện tại.")
+        argv = ["train", *argv]
+    return parser.parse_args(argv)
 
 
 def apply_cli_overrides(args):
@@ -197,13 +276,30 @@ def apply_cli_overrides(args):
         ("EXPORT_FORMAT", getattr(args, "export_format", None)),
         ("TOP_K_VALUES", getattr(args, "top_k_values", None)),
         ("BN_UPDATE_BATCHES", getattr(args, "bn_batches", None)),
+        ("EMA_DECAYS", getattr(args, "ema_decays", None)),
+        ("EMA_UPDATE_PERIOD", getattr(args, "ema_update_period", None)),
+        ("SWA_START_FRACS", getattr(args, "swa_start_fracs", None)),
+        ("SWA_PERIOD", getattr(args, "swa_period", None)),
+        ("SWA_LR_SCHEDULE", getattr(args, "swa_lr_schedule", None)),
+        ("SWA_LR", getattr(args, "swa_lr", None)),
+        ("SWA_EXTRA_BUDGET", getattr(args, "swa_extra_budget", None)),
+        ("SWA_LR_START_FRAC", getattr(args, "swa_lr_start_frac", None)),
+        ("SHADOW_SELECT", getattr(args, "shadow_select", None)),
+        ("SHADOW_VAL_PERIOD", getattr(args, "shadow_val_period", None)),
     ]
     for attr, value in overrides:
         if value is not None:
             setattr(Config, attr, value)
 
+    if getattr(args, "methods", None):
+        Config.normalize_methods(args.methods)
+    if getattr(args, "shadow_val", False):
+        Config.SHADOW_VAL_ENABLED = True
+    if getattr(args, "no_shadow_val", False):
+        Config.SHADOW_VAL_ENABLED = False
     if getattr(args, "no_strategy2", False):
-        Config.USE_STRATEGY2 = False
+        # Giữ tương thích ngược: tắt Top-K nhưng không đụng EMA/SWA.
+        Config.normalize_methods([m for m in Config.METHODS if m != "top-k"])
     if getattr(args, "no_bn_update", False):
         Config.USE_BN_UPDATE = False
     if getattr(args, "keep_checkpoints", False):

@@ -1,3 +1,16 @@
-# Chạy từ thư mục Capstone_KD trên server.
-# Đổi run01 thành run02/run03 cho lần chạy mới; tên đã tồn tại sẽ bị từ chối.
-python main.py train --exp_name voc_yolov8s_raw_topk_run01
+# Chạy từ thư mục code trên server. Cần ĐỦ 2 RUN cho bảng so sánh.
+# Đổi run01 → run02/run03 cho lần chạy mới; tên đã tồn tại sẽ bị từ chối.
+#
+# Mọi tham số khác đã chốt sẵn trong config.py (5 seed 1/10/42/100/500,
+# 100 epoch, SGD lr0=5e-3 cosine → lrf=0.01, EMA decay 0.999, SWA constant LR
+# tự tính (lr0+lr0·lrf)/2 = 2.525e-3 từ 75% budget).
+
+# ---- RUN 1: Top-K (method của bạn) + EMA, cosine schedule chuẩn, 100 epoch ----
+# Cùng một trajectory ⇒ so sánh paired theo seed.
+python main.py train --exp_name voc_yolov8s_run01
+
+# ---- RUN 2: SWA đúng thuật toán gốc, 100 epoch (cùng budget với RUN 1) ----
+# 75% đầu cosine trùng khít RUN 1, 25% sau constant LR.
+# --patience 0 là BẮT BUỘC (constant LR làm val đi ngang → early stopping sẽ
+# cắt mất pha SWA). Code sẽ báo lỗi nếu thiếu, hoặc nếu bạn bật kèm top-k/ema.
+python main.py train --exp_name voc_yolov8s_swa_run01 --methods swa --patience 0

@@ -694,8 +694,14 @@ def export_experiment_summary(all_runs_results, exp_dir, config_snapshot=None, b
         return None
 
     if baseline_name is None:
+        available = set(per_seed_df["Strategy"].values)
+        # Baseline paired PHẢI là Strategy 1 (checkpoint đơn) — nếu chọn nhầm
+        # EMA/SWA làm mốc thì mọi cột Δ và t-test đều vô nghĩa.
         baseline_name = next(
-            (n for n in order if n in per_seed_df["Strategy"].values and "Top-" not in n),
+            (n for n in order if n in available and n.startswith("Strategy 1 (best")),
+            None,
+        ) or next(
+            (n for n in order if n in available and n.startswith("Strategy 1")),
             order[0] if order else None,
         )
 

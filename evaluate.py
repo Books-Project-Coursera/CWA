@@ -22,6 +22,7 @@ from pathlib import Path
 
 import yaml
 
+from averaging import SHADOW_MANIFEST, load_shadow_manifest
 from config import Config
 from memory import (
     cpu_quota,
@@ -551,6 +552,13 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_ex
                               để tách phần cải thiện do averaging khỏi phần do
                               hiệu chỉnh BN) — bật/tắt bằng Config.BN_UPDATE_CONTROL
       - Strategy 2 (Top-K)  : average Top-K checkpoint, K ∈ Config.TOP_K_VALUES
+      - EMA (decay ...)     : baseline EMA of weights, snapshot do averaging.py
+                              tích lũy trong lúc train (--method ema)
+      - SWA (start ...)     : baseline Stochastic Weight Averaging (--method swa)
+
+    Cả ba họ method dùng CHUNG một trajectory, CHUNG val' để chọn checkpoint/
+    snapshot, và CHUNG một quy trình BN recalibration → khác biệt duy nhất là
+    toán tử average.
 
     Returns:
         dict {"strategy_records": [...], "ranking": [...], "excel": path|None}
@@ -562,11 +570,13 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_ex
 
     print("\n" + "=" * 70)
     print(f" STRATEGY EVALUATION (split={split or 'default'}, data={data})")
+    print(f" Methods: {', '.join(Config.METHODS) or '(none)'}")
     print("=" * 70)
 
     records = []
     temp_files = []
-    ranked = rank_checkpoints(run_dir) if Config.USE_STRATEGY2 else []
+    ranked = rank_checkpoints(run_dir) if Config.any_method() else []
+    shadows = load_shadow_manifest(run_dir)
     if ranked:
         print("  Ranking checkpoint theo fitness trên val' (cao → thấp):")
         for rank, (path, fitness, epoch) in enumerate(ranked, start=1):
@@ -598,9 +608,10 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_ex
             ))
 
             # ----- Control: baseline + BN recalibration -----
-            # Strategy 2 được BN-recalibrate; nếu không có control này thì không
-            # thể biết phần cải thiện đến từ averaging hay từ hiệu chỉnh BN.
-            if Config.USE_STRATEGY2 and Config.USE_BN_UPDATE and Config.BN_UPDATE_CONTROL and ranked:
+            # MỌI bản average (Top-K, EMA, SWA) đều được BN-recalibrate; không
+            # có control này thì không thể biết phần cải thiện đến từ averaging
+            # hay từ hiệu chỉnh BN.
+            if Config.any_method() and Config.USE_BN_UPDATE and Config.BN_UPDATE_CONTROL and ranked:
                 bn_ctrl_path = weights_dir / "strategy1_bn_control.pt"
                 temp_files.append(bn_ctrl_path)
                 shutil.copyfile(baseline_path, bn_ctrl_path)
@@ -615,7 +626,7 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_ex
         if Config.USE_STRATEGY2:
             if not ranked:
                 print("  ⚠ Không tìm thấy checkpoint epoch nào để average — bỏ qua Strategy 2")
-                print("    (cần train với USE_STRATEGY2=True để lưu Top-K checkpoint)")
+                print("    (cần train với --method top-k để lưu Top-K checkpoint)")
             for k in sorted(int(k) for k in Config.TOP_K_VALUES):
                 if k > len(ranked):
                     print(f"  ⚠ Top-{k}: chỉ có {len(ranked)} checkpoint — bỏ qua")
@@ -633,6 +644,31 @@ def run_strategy_evaluation(run_dir, data=None, split=None, seed=None, export_ex
                     k=k, epochs=[e for _, _, e in selected],
                     bn_update=bool(Config.USE_BN_UPDATE),
                 ))
+
+        # ----- Baselines EMA / SWA (shadow tích lũy trong lúc train) -----
+        # Cùng trajectory, cùng val' để chọn snapshot, và ĐI QUA ĐÚNG cùng một
+        # BN recalibration như Top-K → khác biệt còn lại chỉ là toán tử average.
+        if shadows:
+            print(f"\n  Weight-averaging baselines (đọc {SHADOW_MANIFEST}):")
+        for entry in shadows:
+            shadow_path = weights_dir / entry["file"]
+            if not shadow_path.exists():
+                print(f"  ⚠ {entry['label']}: thiếu {shadow_path.name} — bỏ qua")
+                continue
+            selected_epochs = entry.get("averaged_epochs") or [entry.get("epoch")]
+            print(
+                f"    • {entry['label']} — snapshot epoch {entry.get('epoch')} "
+                f"(chọn theo {entry.get('selection')}, val fitness "
+                f"{entry.get('val_fitness')})"
+            )
+            if Config.USE_BN_UPDATE:
+                update_bn_stats(shadow_path, data)
+            records.append(_eval_record(
+                shadow_path, data, split, run_dir,
+                name=entry["label"], short=entry["short"], kind=entry["method"],
+                k=None, epochs=[e for e in selected_epochs if e is not None],
+                bn_update=bool(Config.USE_BN_UPDATE),
+            ))
     finally:
         # Checkpoint average/control chỉ cần tồn tại trong lúc model.val().
         if Config.DELETE_CHECKPOINTS_AFTER_RUN:
