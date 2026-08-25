@@ -1,16 +1,21 @@
-# Chạy từ thư mục code trên server. Cần ĐỦ 2 RUN cho bảng so sánh.
+# Chạy từ thư mục code trên server. CHỈ CẦN MỘT LỆNH.
 # Đổi run01 → run02/run03 cho lần chạy mới; tên đã tồn tại sẽ bị từ chối.
-#
-# Mọi tham số khác đã chốt sẵn trong config.py (5 seed 1/10/42/100/500,
-# 100 epoch, SGD lr0=5e-3 cosine → lrf=0.01, EMA decay 0.996, SWA constant LR
-# tự tính (lr0+lr0·lrf)/2 = 2.525e-3 từ 75% budget).
 
-# ---- RUN 1: Top-K (method của bạn) + EMA, cosine schedule chuẩn, 100 epoch ----
-# Cùng một trajectory ⇒ so sánh paired theo seed.
 python main.py train --exp_name carparts_yolov8s_run01
 
-# ---- RUN 2: SWA đúng thuật toán gốc, 100 epoch (cùng budget với RUN 1) ----
-# 75% đầu cosine trùng khít RUN 1, 25% sau constant LR.
-# --patience 0 là BẮT BUỘC (constant LR làm val đi ngang → early stopping sẽ
-# cắt mất pha SWA). Code sẽ báo lỗi nếu thiếu, hoặc nếu bạn bật kèm top-k/ema.
-python main.py train --exp_name carparts_yolov8s_swa_run01 --methods swa --patience 0
+# Lệnh trên tự TÁCH thành 2 EXPERIMENT nối nhau, vì swa đổi LR schedule còn
+# top-k/ema thì không (xem train.run_experiments):
+#
+#   1. carparts_yolov8s_run01       methods=[top-k, ema]  cosine chuẩn   patience=10
+#   2. carparts_yolov8s_run01_swa   methods=[swa]         constant LR     patience=0
+#
+# Mỗi experiment 5 seed [1,10,42,100,500] × 100 epoch ⇒ tổng 10 lần train.
+# Cùng budget 100 epoch ⇒ công bằng giữa các method.
+#
+# Mọi tham số đã chốt trong config.py: SGD lr0=5e-3 cosine → lrf=0.01,
+# EMA decay 0.996 (không warmup), SWA constant LR = (lr0+lr0·lrf)/2 = 2.525e-3
+# từ 75% budget, K ∈ {2,3,4,5}.
+
+# ---- Chạy lẻ từng phần nếu cần ----
+# python main.py train --exp_name carparts_yolov8s_run01     --methods top-k ema
+# python main.py train --exp_name carparts_yolov8s_swa_run01 --methods swa

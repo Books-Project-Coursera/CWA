@@ -291,9 +291,9 @@ def main():
 
     if args.command == "train":
         Config.validate_config(require_model=True)
-        from train import train_detector
+        from train import run_experiments
 
-        train_detector()
+        run_experiments()
 
     elif args.command == "strategies":
         Config.validate_config(require_model=False)
