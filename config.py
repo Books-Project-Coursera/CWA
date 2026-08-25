@@ -87,25 +87,24 @@ class Config:
     COPY_PASTE = 0.15
 
     # ===================== Method Comparison =====================
-    # Các phương pháp weight-averaging được bật trong MỘT lần train.
-    #   "top-k" : Strategy 2 của bạn — uniform average Top-K checkpoint tốt
-    #             nhất trên val' (chọn theo fitness).
-    #   "ema"   : Exponential Moving Average of weights (Morales-Brotons et
-    #             al., TMLR 2024; công thức = ModelEMA của Ultralytics).
-    #   "swa"   : Stochastic Weight Averaging (Izmailov et al., UAI 2018) —
-    #             uniform average các epoch cuối trajectory.
+    # Method weight-averaging cần chạy:
+    #   "top-k" : Strategy 2 của bạn — uniform average Top-K checkpoint tốt nhất.
+    #   "ema"   : Exponential Moving Average of weights (Morales-Brotons, TMLR 2024).
+    #   "swa"   : Stochastic Weight Averaging (Izmailov, UAI 2018) + constant LR.
     #
-    # ⚠ KHÁCH QUAN: cả ba method đều được tính TRÊN CÙNG MỘT trajectory (cùng
-    # seed, cùng config, cùng LR schedule). Không method nào can thiệp vào
-    # optimization, nên chạy `--method top-k ema swa` một lần cho ra so sánh
-    # PAIRED trên từng seed — tốt hơn hẳn việc train riêng cho mỗi method.
-    # CLI: --method top-k ema swa   |   --method EMA,SWA   |   --method all
-    # MẶC ĐỊNH = RUN 1 (bảng chính): top-k + ema trên cosine schedule chuẩn,
-    # cùng trajectory ⇒ so sánh paired. SWA KHÔNG nằm ở đây vì nó đã được chốt
-    # chạy constant LR (xem SWA_LR_SCHEDULE) ⇒ đổi trajectory, phải là run riêng:
-    #     RUN 1: python main.py                          (top-k + ema, 100 epoch)
-    #     RUN 2: python main.py --methods swa --patience 0   (SWA, 100 epoch)
-    METHODS = ["top-k", "ema"]
+    # ⭐ TỰ TÁCH RUN THEO LR SCHEDULE (xem train.run_experiments):
+    #   - top-k và ema chỉ QUAN SÁT weights, KHÔNG đổi LR schedule ⇒ chung MỘT run,
+    #     cùng trajectory ⇒ so sánh PAIRED theo seed.
+    #   - swa (mode "truncate"/"extend") giữ LR HẰNG SỐ ở pha cuối ⇒ ĐỔI trajectory
+    #     ⇒ tự động tách thành EXPERIMENT RIÊNG, kèm PATIENCE=0.
+    #
+    # Vậy `python main.py` (mặc định dưới đây) sẽ chạy NỐI NHAU 2 experiment:
+    #     <exp>       methods=[top-k, ema]  cosine chuẩn,  patience=10
+    #     <exp>_swa   methods=[swa]         constant LR,    patience=0
+    # Tổng 2 run × 5 seed = 10 lần train, mỗi lần 100 epoch.
+    #
+    # CLI: --methods swa,ema | --methods top-k ema swa | --methods all | --methods swa
+    METHODS = ["top-k", "ema", "swa"]
     VALID_METHODS = ("top-k", "ema", "swa")
 
     # ---- EMA (baseline 1) ----
@@ -564,22 +563,22 @@ class Config:
                 # trở đi. Nếu top-k/ema cùng bật thì chúng bị tính trên một LR
                 # schedule KHÔNG PHẢI của chúng ⇒ số liệu vô giá trị cho paper.
                 # Chặn hẳn để không thể vô tình trộn hai trajectory vào một bảng.
-                clash = [m for m in ("top-k", "ema") if cls.method_enabled(m)]
-                if clash:
-                    raise ValueError(
-                        f"SWA_LR_SCHEDULE={mode!r} đổi LR schedule từ {float(cls.SWA_LR_START_FRAC):.0%} "
-                        f"budget trở đi, nhưng {clash} cũng đang bật. Constant LR là một phần "
-                        f"THUẬT TOÁN của SWA, KHÔNG phải của {clash} — chạy chung sẽ cho ra số "
-                        "Top-K/EMA trên một schedule không phải của chúng.\n"
-                        "  → RUN 1 (Top-K + EMA): python main.py\n"
-                        "  → RUN 2 (SWA)         : python main.py --methods swa --patience 0"
+                # KHÔNG raise: run_experiments() trong train.py tự TÁCH METHODS
+                # thành các leg có LR schedule khác nhau rồi chạy tuần tự — leg
+                # top-k/ema dùng cosine chuẩn, leg swa dùng constant LR + patience=0.
+                # Ở đây chỉ báo cho biết sẽ có mấy experiment.
+                shared = [m for m in ("top-k", "ema") if cls.method_enabled(m)]
+                if shared:
+                    print(
+                        f"ℹ {shared} không đổi LR schedule còn 'swa' thì có ⇒ sẽ chạy "
+                        f"2 EXPERIMENT RIÊNG BIỆT nối nhau: leg 1 = {shared} (cosine chuẩn), "
+                        "leg 2 = ['swa'] (constant LR, patience=0). Xem run_experiments()."
                     )
                 if int(cls.PATIENCE) > 0:
-                    raise ValueError(
-                        f"SWA_LR_SCHEDULE={mode!r} + PATIENCE={cls.PATIENCE}: constant LR làm val "
-                        "fitness đi ngang nên early stopping gần như chắc chắn cắt mất pha SWA "
-                        "(SWA sẽ average thiếu epoch mà không báo gì).\n"
-                        "  → Chạy với --patience 0 (Ultralytics hiểu 0 = tắt early stopping)."
+                    print(
+                        f"ℹ Leg SWA sẽ tự dùng PATIENCE=0 (thay vì {cls.PATIENCE}): constant LR "
+                        "làm val fitness đi ngang nên early stopping sẽ cắt mất pha SWA. "
+                        "Các leg khác giữ nguyên PATIENCE."
                     )
 
         if str(cls.SHADOW_SELECT).lower() not in ("best_val", "final"):

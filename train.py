@@ -584,6 +584,87 @@ def _train_one_seed(seed, exp_dir):
                 tidy_run_dir(run_dir)
 
 
+def run_experiments():
+    """
+    Điều phối cấp trên ``train_detector()``: tách ``Config.METHODS`` thành các
+    "leg" có LR SCHEDULE KHÁC NHAU rồi chạy tuần tự, mỗi leg một experiment riêng.
+
+    Vì sao phải tách:
+
+    - ``top-k`` và ``ema`` chỉ QUAN SÁT weights, KHÔNG đổi LR schedule ⇒ chung
+      một run, cùng một trajectory ⇒ so sánh paired theo seed.
+    - ``swa`` ở mode ``truncate``/``extend`` giữ LR HẰNG SỐ ở pha cuối ⇒ ĐỔI
+      trajectory ⇒ bắt buộc run riêng, không được dính vào run của Top-K/EMA.
+      Leg này cũng bị ép ``PATIENCE = 0`` vì constant LR làm val fitness đi ngang,
+      early stopping sẽ cắt mất pha SWA mà không báo gì.
+    - Nếu ``SWA_LR_SCHEDULE = "inherit"`` thì SWA không đổi schedule ⇒ gộp chung
+      cả ba vào MỘT run như cũ.
+
+    ``python main.py --methods swa,ema`` vì vậy sẽ chạy 2 experiment nối nhau:
+    ``<exp>`` (ema) và ``<exp>_swa`` (swa).
+
+    Returns:
+        list[dict] — kết quả gộp của mọi leg.
+    """
+    methods = list(Config.METHODS)
+    if not methods:
+        return train_detector()
+
+    # SWA chỉ cần tách khi nó thực sự đổi LR schedule.
+    swa_isolated = "swa" in methods and Config.swa_lr_mode() != "inherit"
+    if not swa_isolated:
+        return train_detector()
+
+    shared = [m for m in methods if m != "swa"]
+    legs = []
+    if shared:
+        legs.append({"methods": shared, "suffix": "", "patience": Config.PATIENCE})
+    legs.append({"methods": ["swa"], "suffix": "_swa" if shared else "", "patience": 0})
+
+    orig_methods = list(Config.METHODS)
+    orig_patience = Config.PATIENCE
+    orig_exp_name = Config.EXP_NAME
+
+    # Không có --exp-name mà lại có 2 leg thì phải chốt base name MỘT lần, nếu
+    # không mỗi leg sẽ tự sinh timestamp khác nhau và rất khó ghép cặp.
+    base_name = orig_exp_name
+    if not base_name and len(legs) > 1:
+        model_stem = Path(str(Config.MODEL)).stem
+        base_name = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{model_stem}"
+
+    if len(legs) > 1:
+        print("\n" + "=" * 70)
+        print(f"  {len(legs)} EXPERIMENT RIÊNG BIỆT (LR schedule khác nhau)")
+        for idx, leg in enumerate(legs, 1):
+            name = f"{base_name}{leg['suffix']}" if base_name else "(auto)"
+            sched = ("cosine chuẩn" if "swa" not in leg["methods"]
+                     else f"constant LR từ {float(Config.SWA_LR_START_FRAC):.0%} budget "
+                          f"({Config.swa_lr_mode()})")
+            print(f"    {idx}. {name:<34} methods={leg['methods']}  |  {sched}"
+                  + ("  |  patience=0" if leg["patience"] == 0 != orig_patience else ""))
+        print("=" * 70)
+
+    combined = []
+    try:
+        for idx, leg in enumerate(legs, 1):
+            Config.normalize_methods(leg["methods"])
+            Config.PATIENCE = leg["patience"]
+            Config.EXP_NAME = f"{base_name}{leg['suffix']}" if base_name else None
+            print("\n" + "#" * 70)
+            print(f"#  EXPERIMENT {idx}/{len(legs)}: methods={Config.METHODS} "
+                  f"| exp_name={Config.EXP_NAME or '(auto timestamp)'}")
+            print("#" * 70)
+            results = train_detector()
+            if results:
+                combined.extend(results)
+    finally:
+        Config.normalize_methods(orig_methods)
+        Config.PATIENCE = orig_patience
+        Config.EXP_NAME = orig_exp_name
+
+    return combined
+
+
 def train_detector():
     """
     Pipeline train hoàn chỉnh:
