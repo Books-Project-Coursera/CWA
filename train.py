@@ -12,6 +12,7 @@ import torch.optim as optim
 from tqdm import tqdm
 from collections import Counter
 
+from averaging import ShadowAveragingManager
 from config import Config
 from models import get_model
 from losses import PolyFocalLoss, compute_class_weights
@@ -173,6 +174,7 @@ def train_one_epoch(
     device,
     freeze_backbone=True,
     mixup_fn=None,
+    shadow_manager=None,
 ):
     """Train for one epoch"""
     model.train()
@@ -227,6 +229,11 @@ def train_one_epoch(
                 max_norm=Config.GRAD_CLIP_NORM,
             )
         optimizer.step()
+
+        # EMA shadow cap nhat sau MOI optimizer step (khong phai moi batch:
+        # neu sau nay them gradient accumulation thi van dung nhip).
+        if shadow_manager is not None:
+            shadow_manager.on_optimizer_step(model)
 
         if profile_batches and batch_idx <= profile_batches:
             if device.type == 'cuda':
@@ -504,6 +511,18 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         keep_top_k=Config.KEEP_TOP_K_CHECKPOINTS
     )
     
+    # ---- EMA/SWA shadow (torch.optim.swa_utils) ----
+    # Nuoi song song voi training, KHONG can thiep optimization. Chi 'swa' o mode
+    # truncate moi doi LR schedule - va khi do main.py da tach no ra run rieng.
+    shadow_manager = ShadowAveragingManager(
+        model,
+        num_epochs=Config.NUM_EPOCHS,
+        steps_per_epoch=len(train_loader),
+        base_lr=Config.LEARNING_RATE,
+        eta_min=Config.ETA_MIN,
+    )
+    train_start_time = time.time()
+
     best_val_loss = float('inf')
     
     # Training history for visualization
@@ -518,6 +537,13 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
     # Training loop
     for epoch in range(1, Config.NUM_EPOCHS + 1):
         epoch_start_time = time.time()
+
+        # Pha SWA: ep LR ve hang so TRUOC khi train epoch nay, nen LR thuc dung
+        # dung bang Config.resolved_swa_lr() bat ke scheduler da step toi dau.
+        swa_lr = shadow_manager.swa_lr_override(epoch)
+        if swa_lr is not None:
+            for group in optimizer.param_groups:
+                group['lr'] = swa_lr
         
         # Train
         train_loss, train_acc = train_one_epoch(
@@ -528,6 +554,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
             device,
             freeze_backbone=False,
             mixup_fn=mixup_fn,
+            shadow_manager=shadow_manager,
         )
         
         # Validate
@@ -548,6 +575,9 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
         print(f"  Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%")
         print(f"  Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%")
         
+        # SWA snapshot cuoi epoch (uniform average), truoc khi scheduler doi LR.
+        shadow_manager.on_epoch_end(epoch, model)
+
         # Learning rate scheduler step
         scheduler.step()
         
@@ -567,6 +597,14 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
     
     # Save checkpoint info
     checkpoint_manager.save_checkpoint_info()
+
+    train_seconds = time.time() - train_start_time
+    shadows = shadow_manager.finalize()
+    train_extra = {
+        'shadows': shadows,
+        'train_seconds': train_seconds,
+        'shadow_overhead_seconds': shadow_manager.overhead_seconds,
+    }
     
     print(f"\n✓ Training completed for {model_name}")
     print(f"  Best Val Loss: {best_val_loss:.4f}")
@@ -625,7 +663,7 @@ def train_model(model_name, train_loader, val_loader, num_classes, device, class
     patience_plot_path = os.path.join(curves_dir, f"{model_name}_patience_period.png")
     plot_patience_period(history, Config.EARLY_STOPPING_PATIENCE, model_name, save_path=patience_plot_path)
     
-    return checkpoint_manager, history
+    return checkpoint_manager, history, train_extra
 
 
 if __name__ == "__main__":
@@ -667,7 +705,7 @@ if __name__ == "__main__":
                            class_names)
     
     # Train first model as test
-    checkpoint_manager, history = train_model(
+    checkpoint_manager, history, train_extra = train_model(
         Config.MODELS[0],
         train_loader,
         val_loader,

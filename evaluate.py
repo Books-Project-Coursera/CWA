@@ -2,6 +2,7 @@
 Evaluation script with 3 strategies and result export
 """
 import os
+import time
 import copy
 import torch
 import numpy as np
@@ -465,7 +466,69 @@ def strategy_3_last_n_average(model_name, checkpoint_manager, test_loader, train
     return result
 
 
-def evaluate_all_strategies(model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names=None, save_dir=None):
+
+def strategy_shadow_average(model_name, shadow, test_loader, train_loader, num_classes,
+                            device, class_names=None, save_dir=None):
+    """
+    Danh gia mot shadow EMA/SWA da duoc nuoi trong luc train (averaging.py).
+
+    Di qua DUNG cung mot quy trinh nhu Strategy 2/3: nap weights da average ->
+    update_bn() tren train -> evaluate_model() tren test. Nho vay khac biet giua
+    cac method chi den tu TOAN TU AVERAGE, khong den tu cach xu ly BatchNorm.
+
+    Args:
+        shadow: dict tu ShadowAveragingManager.finalize() - co cac khoa 'label',
+                'kind', 'state_dict', 'params', 'updates', 'overhead_seconds'.
+
+    Returns:
+        result: dict co 'metrics', 'per_class', 'confusion_matrix', 'timing'.
+    """
+    label = shadow["label"]
+    print("")
+    print("  %s (%s baseline)" % (label, shadow["kind"].upper()))
+    print("    updates: %d | %s" % (shadow["updates"], shadow["params"].get("impl", "")))
+
+    started = time.time()
+
+    model = get_model(model_name, num_classes, freeze_backbone=False)
+    model.load_state_dict(shadow["state_dict"], strict=True)
+    model = model.to(device)
+
+    # CRITICAL: giong het Strategy 2/3 - BN stats phai duoc uoc luong lai sau khi
+    # average, neu khong moi ban average deu bi tut oan.
+    print("    Updating BatchNorm statistics...")
+    update_bn(model, train_loader, device, num_batches=100)
+    build_seconds = time.time() - started
+
+    eval_started = time.time()
+    result = evaluate_model(model, test_loader, device, num_classes, class_names)
+    eval_seconds = time.time() - eval_started
+
+    result["timing"] = {
+        "method_seconds": float(shadow.get("overhead_seconds", 0.0)) + build_seconds,
+        "eval_seconds": eval_seconds,
+    }
+
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+        safe = "".join(c if c.isalnum() else "_" for c in label).strip("_")
+        save_path = os.path.join(save_dir, safe + ".pth")
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "strategy": label,
+            "kind": shadow["kind"],
+            "params": shadow["params"],
+            "updates": shadow["updates"],
+            "epochs_averaged": shadow.get("epochs_seen"),
+        }, save_path)
+        print("    OK Strategy checkpoint saved: " + save_path)
+
+    _print_eval_results(result["metrics"], result["per_class"], prefix="    ",
+                        header="TEST RESULTS - " + label)
+    return result
+
+
+def evaluate_all_strategies(model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names=None, save_dir=None, shadows=None, train_seconds=0.0):
     """
     Evaluate all 3 strategies for a model
 
@@ -491,21 +554,49 @@ def evaluate_all_strategies(model_name, checkpoint_manager, test_loader, train_l
     all_results = {}
 
     # Strategy 1: Best single checkpoint (no averaging, no BN update needed)
+    # Strategy 1 LUON chay - day la baseline chung cho moi method.
+    _t0 = time.time()
     all_results['Strategy 1'] = strategy_1_best_checkpoint(
         model_name, checkpoint_manager, test_loader, num_classes, device, class_names, save_dir=save_dir
     )
+    all_results['Strategy 1'].setdefault('timing', {})['eval_seconds'] = time.time() - _t0
 
     # Strategy 2: Top-K averaging (with BN update)
-    strategy_2_results = strategy_2_top_k_average(
-        model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
-    )
-    for k, result in strategy_2_results.items():
-        all_results[f'Strategy 2 (K={k})'] = result
+    if Config.method_enabled('top-k'):
+        _t0 = time.time()
+        strategy_2_results = strategy_2_top_k_average(
+            model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
+        )
+        _share = (time.time() - _t0) / max(len(strategy_2_results), 1)
+        for k, result in strategy_2_results.items():
+            result.setdefault('timing', {})['method_seconds'] = _share
+            all_results[f'Strategy 2 (K={k})'] = result
 
     # Strategy 3: Last N epochs averaging (with BN update - MOST CRITICAL)
-    all_results['Strategy 3'] = strategy_3_last_n_average(
-        model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
-    )
+    if Config.method_enabled('last-n'):
+        _t0 = time.time()
+        all_results['Strategy 3'] = strategy_3_last_n_average(
+            model_name, checkpoint_manager, test_loader, train_loader, num_classes, device, class_names, save_dir=save_dir
+        )
+        all_results['Strategy 3'].setdefault('timing', {})['method_seconds'] = time.time() - _t0
+
+    # ---- Baseline EMA / SWA: shadow da duoc nuoi trong luc train ----
+    for shadow in (shadows or []):
+        all_results[shadow['label']] = strategy_shadow_average(
+            model_name, shadow, test_loader, train_loader, num_classes, device,
+            class_names=class_names, save_dir=save_dir,
+        )
+
+    # Thoi gian train la CHUNG cho moi method trong cung mot run: cac method chi
+    # QUAN SAT weights nen khong the tach rieng phan train cua tung method.
+    for result in all_results.values():
+        timing = result.setdefault('timing', {})
+        timing['train_seconds'] = float(train_seconds)
+        timing['total_seconds'] = (
+            float(train_seconds)
+            + float(timing.get('method_seconds', 0.0))
+            + float(timing.get('eval_seconds', 0.0))
+        )
 
     return all_results
 
@@ -533,7 +624,12 @@ def export_results_to_excel(all_model_results, output_path, class_names=None):
             macro_row = {
                 'Model': model_name,
                 'Strategy': strategy_name,
-                **result['metrics']
+                **result['metrics'],
+                # Tong thoi gian tu luc bat dau train den khi ra ket qua cua
+                # method nay = train (chung) + chi phi rieng cua method + eval.
+                'Total Time (s)': round(
+                    float(result.get('timing', {}).get('total_seconds', 0.0)), 1
+                ),
             }
             macro_rows.append(macro_row)
 
@@ -550,7 +646,7 @@ def export_results_to_excel(all_model_results, output_path, class_names=None):
     # Macro dataframe
     df = pd.DataFrame(macro_rows)
     column_order = ['Model', 'Strategy', 'Test Loss', 'Accuracy (%)', 'Precision (%)',
-                   'Recall (%)', 'F1-Score (%)', 'AUC (%)']
+                   'Recall (%)', 'F1-Score (%)', 'AUC (%)', 'Total Time (s)']
     df = df[column_order]
 
     # Per-class dataframe

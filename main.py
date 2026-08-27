@@ -151,6 +151,57 @@ def parse_args():
         action="store_true",
         help="Print image-size dataset statistics before training. This opens up to 1000 images per run.",
     )
+    parser.add_argument("--_method-leg", dest="_method_leg", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--methods",
+        "--method",
+        dest="methods",
+        nargs="+",
+        metavar="M",
+        help=(
+            "Method weight-averaging can chay: top-k | last-n | ema | swa "
+            "(hoac 'all'/'none'). Cho phep to hop va dau phay: "
+            "--methods top-k ema swa | --methods EMA,SWA. "
+            "Strategy 1 (best checkpoint) LUON duoc eval lam baseline. "
+            "'swa' doi LR schedule o 25%% cuoi nen tu dong duoc tach thanh mot "
+            "experiment RIENG (run folder co hau to '_swa')."
+        ),
+    )
+    parser.add_argument(
+        "--ema-window-epochs",
+        dest="ema_window_epochs",
+        type=float,
+        help="Override Config.EMA_WINDOW_EPOCHS - cua so trung binh cua EMA tinh theo epoch.",
+    )
+    parser.add_argument(
+        "--ema-decay",
+        dest="ema_decays",
+        type=float,
+        nargs="+",
+        help="Override Config.EMA_DECAYS (dat tay). Bo qua de tu suy tu --ema-window-epochs.",
+    )
+    parser.add_argument(
+        "--swa-lr",
+        dest="swa_lr",
+        type=float,
+        help="Override Config.SWA_LR. Bo qua de tu tinh (LEARNING_RATE + ETA_MIN) / 2.",
+    )
+    parser.add_argument(
+        "--swa-lr-start",
+        dest="swa_lr_start_frac",
+        type=float,
+        help="Override Config.SWA_LR_START_FRAC - moc chuyen sang constant LR (mac dinh 0.75).",
+    )
+    parser.add_argument(
+        "--swa-lr-schedule",
+        dest="swa_lr_schedule",
+        choices=["truncate", "inherit"],
+        help=(
+            "'truncate' (mac dinh): 75%% dau chay scheduler chuan, 25%% sau giu LR hang so. "
+            "'inherit': SWA average ngay tren cosine, khong doi LR (cung trajectory)."
+        ),
+    )
     parser.add_argument("--seed", type=int, help="Override Config.RANDOM_SEED.")
     parser.add_argument(
         "--seeds",
@@ -201,6 +252,17 @@ def parse_args():
 
 
 def apply_cli_overrides(args):
+    if getattr(args, "methods", None):
+        Config.normalize_methods(args.methods)
+    for attr, value in (
+        ("EMA_WINDOW_EPOCHS", getattr(args, "ema_window_epochs", None)),
+        ("EMA_DECAYS", getattr(args, "ema_decays", None)),
+        ("SWA_LR", getattr(args, "swa_lr", None)),
+        ("SWA_LR_START_FRAC", getattr(args, "swa_lr_start_frac", None)),
+        ("SWA_LR_SCHEDULE", getattr(args, "swa_lr_schedule", None)),
+    ):
+        if value is not None:
+            setattr(Config, attr, value)
     models = parse_model_list(args.models)
     if models:
         Config.MODELS = models
@@ -263,6 +325,83 @@ def apply_cli_overrides(args):
         Config.AUTO_DELETE_CHECKPOINTS = True
     if args.keep_checkpoints:
         Config.AUTO_DELETE_CHECKPOINTS = False
+
+
+def run_method_legs_if_needed(args):
+    """
+    Tach Config.METHODS thanh cac "leg" co LR SCHEDULE KHAC NHAU roi chay tuan tu.
+
+    Vi sao phai tach:
+
+    - top-k / last-n / ema chi QUAN SAT weights, KHONG doi LR schedule => chung
+      mot run, cung mot trajectory => so sanh PAIRED theo seed.
+    - swa o mode 'truncate' giu LR HANG SO o 25% cuoi => DOI trajectory => bat
+      buoc run rieng. Neu de chung, so lieu top-k/last-n/ema se duoc tinh tren
+      mot LR schedule KHONG PHAI cua chung.
+
+    Moi leg la mot process rieng (giong run_seed_jobs_if_needed) de Config va
+    scheduler khong bi dinh trang thai cua leg truoc.
+
+    Returns:
+        True neu da spawn cac leg con (caller nen return ngay).
+    """
+    if getattr(args, "_method_leg", False):
+        return False
+    if not Config.swa_changes_schedule():
+        return False
+
+    shared = [m for m in Config.METHODS if m != "swa"]
+    if not shared:
+        return False
+
+    base_args = [a for a in sys.argv[1:]]
+    # Bo --methods/--method va --run-name cu: moi leg tu dat gia tri rieng, de
+    # lai se thanh co trung lap trong argv cua process con.
+    strip_flags = ("--methods", "--method", "--run-name")
+    cleaned = []
+    skip = False
+    for token in base_args:
+        if token in strip_flags or any(token.startswith(f + "=") for f in strip_flags):
+            skip = not token.count("=")
+            continue
+        if skip:
+            if token.startswith("-"):
+                skip = False
+            else:
+                continue
+        cleaned.append(token)
+
+    base_name = sanitize_run_name(args.run_name) if args.run_name else sanitize_run_name(
+        "_".join(Config.MODELS) if Config.MODELS else "models"
+    )
+
+    legs = [
+        {"methods": shared, "run_name": base_name},
+        {"methods": ["swa"], "run_name": base_name + "_swa"},
+    ]
+
+    print("" + chr(10) + "=" * 70)
+    print(" %d EXPERIMENT RIENG BIET (LR schedule khac nhau)" % len(legs))
+    for idx, leg in enumerate(legs, 1):
+        sched = "scheduler chuan" if "swa" not in leg["methods"] else (
+            "constant LR %g tu %.0f%% budget" % (Config.resolved_swa_lr(),
+                                                 float(Config.SWA_LR_START_FRAC) * 100))
+        print("   %d. %-28s methods=%s  |  %s" % (idx, leg["run_name"], leg["methods"], sched))
+    print("=" * 70)
+
+    for idx, leg in enumerate(legs, 1):
+        child = cleaned + ["--methods", *leg["methods"], "--run-name", leg["run_name"],
+                           "--_method-leg"]
+        print("" + chr(10) + "#" * 70)
+        print("#  EXPERIMENT %d/%d: methods=%s | run_name=%s"
+              % (idx, len(legs), leg["methods"], leg["run_name"]))
+        print("#" * 70)
+        subprocess.run([sys.executable, __file__, *child], check=True)
+
+    print("" + chr(10) + "=" * 70)
+    print(" METHOD LEGS COMPLETED")
+    print("=" * 70)
+    return True
 
 
 def run_seed_jobs_if_needed(args):
@@ -382,7 +521,10 @@ def save_model_results(model_name, results, output_dir):
         row = {
             'Model': model_name,
             'Strategy': strategy_name,
-            **result['metrics']
+            **result['metrics'],
+            'Total Time (s)': round(
+                float(result.get('timing', {}).get('total_seconds', 0.0)), 1
+            ),
         }
         macro_rows.append(row)
 
@@ -390,7 +532,7 @@ def save_model_results(model_name, results, output_dir):
 
     # Reorder columns (including Test Loss)
     column_order = ['Model', 'Strategy', 'Test Loss', 'Accuracy (%)', 'Precision (%)',
-                   'Recall (%)', 'F1-Score (%)', 'AUC (%)']
+                   'Recall (%)', 'F1-Score (%)', 'AUC (%)', 'Total Time (s)']
     df_macro = df_macro[column_order]
 
     # Sheet 2: Per-class metrics
@@ -671,6 +813,8 @@ def main():
     args = parse_args()
     apply_cli_overrides(args)
     torch.set_float32_matmul_precision(Config.FLOAT32_MATMUL_PRECISION)
+    if run_method_legs_if_needed(args):
+        return
     if run_seed_jobs_if_needed(args):
         return
 
@@ -815,7 +959,7 @@ def main():
                 print(f"\n  [Fold {fold_idx}] Training {model_name}...")
                 try:
                     fold_ckpt_dir = os.path.join(fold_folder, model_name, 'training_checkpoints')
-                    checkpoint_manager, history = train_model(
+                    checkpoint_manager, history, train_extra = train_model(
                         model_name,
                         fold_train_loader,
                         fold_val_loader,
@@ -834,7 +978,9 @@ def main():
                     )
                     results = evaluate_all_strategies(
                         model_name, checkpoint_manager, fold_test_loader, fold_train_loader,
-                        num_classes, device, class_names=class_names, save_dir=strategy_ckpt_dir
+                        num_classes, device, class_names=class_names, save_dir=strategy_ckpt_dir,
+                        shadows=train_extra.get('shadows'),
+                        train_seconds=train_extra.get('train_seconds', 0.0),
                     )
                     
                     if model_name not in all_fold_results:
@@ -995,7 +1141,7 @@ def main():
         try:
             # 3.1: Train model
             print(f"\n  [3.1] Training {model_name}...")
-            checkpoint_manager, history = train_model(
+            checkpoint_manager, history, train_extra = train_model(
                 model_name,
                 train_loader,
                 val_loader,
@@ -1023,7 +1169,9 @@ def main():
                 num_classes,
                 device,
                 class_names=class_names,
-                save_dir=strategy_checkpoint_dir
+                save_dir=strategy_checkpoint_dir,
+                shadows=train_extra.get('shadows'),
+                train_seconds=train_extra.get('train_seconds', 0.0),
             )
             all_model_results[model_name] = results
             print(f"  ✓ Evaluation completed for {model_name}")

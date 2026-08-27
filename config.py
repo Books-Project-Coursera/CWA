@@ -40,7 +40,7 @@ class Config:
     SUPPORTED_OPTIMIZERS = ("adamw", "adam", "sgd", "rmsprop")  # khớp với OPTIMIZER_CLASSES trong train.py
     OPTIMIZER = "adam"
     OPTIMIZER_BETAS = (0.9, 0.999)  # adam / adamw
-    OPTIMIZER_EPS = 1e-8            # adam / adamw / rmsprop
+    OPTIMIZER_EPS = 0.0             # adam / adamw / rmsprop (khop run baseline efficientnet_b0)
     SGD_MOMENTUM = 0.9              # sgd / rmsprop
     SGD_NESTEROV = True             # sgd
     RMSPROP_ALPHA = 0.99            # rmsprop
@@ -86,7 +86,7 @@ class Config:
 
     # ===================== Model Configuration =====================
     MODELS = [
-    'vgg16']
+    'efficientnet_b0']
     PRETRAINED = True
     VIT_PRETRAINED_MODEL_ID = "vit_base_patch16_224.augreg2_in21k_ft_in1k"
     
@@ -117,6 +117,72 @@ class Config:
     RANDOM_ERASING_RATIO = (0.3, 3.3)
     RANDOM_ERASING_VALUE = "random"
     
+    # ===================== Method Comparison (EMA / SWA baselines) =====================
+    # Method weight-averaging cần chạy. Strategy 1 (best checkpoint) LUÔN được
+    # eval làm baseline, không cần khai ở đây.
+    #   "top-k"  : Strategy 2 của bạn — uniform average Top-K checkpoint tốt nhất.
+    #   "last-n" : Strategy 3 — uniform average N epoch cuối.
+    #   "ema"    : Exponential Moving Average of weights (Morales-Brotons, TMLR 2024).
+    #   "swa"    : Stochastic Weight Averaging (Izmailov, UAI 2018) + constant LR.
+    #
+    # ⭐ TỰ TÁCH RUN THEO LR SCHEDULE (xem main.run_method_legs_if_needed):
+    #   - top-k / last-n / ema chỉ QUAN SÁT weights, KHÔNG đổi LR schedule ⇒ chung
+    #     MỘT run, cùng trajectory ⇒ so sánh PAIRED theo seed.
+    #   - swa giữ LR HẰNG SỐ ở 25% cuối ⇒ ĐỔI trajectory ⇒ tự động tách thành
+    #     EXPERIMENT RIÊNG (run folder riêng, hậu tố "_swa").
+    #
+    # Vậy `python main.py` sẽ chạy NỐI NHAU 2 experiment:
+    #     <run>       methods=[top-k, last-n, ema]  cosine chuẩn
+    #     <run>_swa   methods=[swa]                 constant LR từ 75% budget
+    # CLI: --methods swa,ema | --methods top-k ema swa | --methods all | --methods swa
+    METHODS = ["top-k", "last-n", "ema", "swa"]
+    VALID_METHODS = ("top-k", "last-n", "ema", "swa")
+
+    # ---- EMA ----
+    # torch.optim.swa_utils.AveragedModel + get_ema_multi_avg_fn:
+    #     w_ema ← decay · w_ema + (1 − decay) · w_t      (mỗi optimizer step)
+    # KHÔNG warmup/ramp — công thức lũy thừa thuần của thư viện.
+    #
+    # EMA_DECAYS = None ⇒ TỰ SUY decay từ cửa sổ mục tiêu:
+    #     decay = 1 − 1 / (EMA_WINDOW_EPOCHS × steps_per_epoch)
+    # Vì sao phải tự suy: cửa sổ của EMA tính theo OPTIMIZER STEP, mà số step/epoch
+    # chênh nhau hàng lần giữa ba bộ dữ liệu (CIFAR-100 ~351, Tiny ImageNet ~87).
+    # Một hằng số decay dùng chung sẽ cho ba cửa sổ hoàn toàn khác nhau ⇒ không so
+    # sánh được. Tự suy theo cửa sổ thì mọi dataset đều có EMA "nhớ" đúng 10 epoch.
+    #
+    # ⚠ RÀNG BUỘC decay khi không warmup: phần weights KHỞ I TẠO còn sót lại trong
+    # EMA cuối = decay^N. Với cách tự suy ở trên, residue rút gọn thành e^(−E/W)
+    # — KHÔNG phụ thuộc dataset: E=60, W=10 ⇒ 0.25%. An toàn (ngưỡng 1%).
+    # train.py in cửa sổ + residue ra log ngay khi bắt đầu train.
+    EMA_WINDOW_EPOCHS = 10
+    EMA_DECAYS = None       # None = tự suy; hoặc đặt list, ví dụ [0.999]
+
+    # ---- SWA ----
+    # torch.optim.swa_utils.AveragedModel + get_swa_multi_avg_fn:
+    #     w_swa ← (w_swa · n + w_t) / (n + 1)      (mỗi epoch, cycle length c = 1)
+    # use_buffers=False ⇒ PyTorch average đúng learnable params còn BN running stats
+    # được ĐỒNG BỘ từ model nguồn — khớp Algorithm 1, nơi BN được tính lại bằng
+    # một lượt forward trên train sau khi average (evaluate.update_bn).
+    #
+    # ⭐ CHỐT CHO PAPER: "truncate" — 75% đầu chạy ĐÚNG scheduler của bạn
+    #    (LinearLR warmup + CosineAnnealingLR), 25% sau giữ LR HẰNG SỐ = SWA_LR.
+    #    TỔNG BUDGET GIỮ NGUYÊN ⇒ công bằng tuyệt đối về số epoch với các method khác.
+    #    Biến thể "1 budget" của Izmailov et al. §3.2: "we first run standard SGD
+    #    training for ≈75% of the training budget ... we just stop the training
+    #    early WITHOUT MODIFYING the learning rate schedule".
+    #    "inherit" = không đổi LR (SWA average ngay trên cosine) — giữ để tham khảo.
+    SWA_LR_SCHEDULE = "truncate"   # "truncate" (chốt) | "inherit"
+    SWA_LR_START_FRAC = 0.75       # mốc chuyển sang constant LR + bắt đầu average
+
+    SWA_LR = 1e-5                  # ĐẶT TAY = 1e-5. Ban dau None = tu tinh (LEARNING_RATE + ETA_MIN)/2
+                                   # và nhỏ nhất của annealing schedule, đúng khuyến
+                                   # nghị Izmailov et al. §4.3 ("intermediate value
+                                   # between the largest and the smallest learning
+                                   # rate used in the annealing scheme"):
+                                   #     SWA_LR = (LEARNING_RATE + ETA_MIN) / 2
+                                   # Tự tính theo LEARNING_RATE/ETA_MIN HIỆN HÀNH nên
+                                   # --lr trên CLI cũng được tôn trọng.
+
     # ===================== Evaluation Configuration =====================
     TOP_K_VALUES = [2, 3, 4, 5]
     LAST_N_EPOCHS = 10
@@ -146,6 +212,148 @@ class Config:
     WANDB_ENTITY = None
     EXPERIMENT_NAME = "baseline_exp1"
     
+    # Alias nguoi dung hay go -> ten chuan trong VALID_METHODS
+    METHOD_ALIASES = {
+        "topk": "top-k", "top_k": "top-k", "top-k": "top-k",
+        "strategy2": "top-k", "s2": "top-k", "cwa": "top-k",
+        "lastn": "last-n", "last_n": "last-n", "last-n": "last-n",
+        "strategy3": "last-n", "s3": "last-n",
+        "ema": "ema",
+        "swa": "swa",
+    }
+
+    @classmethod
+    def normalize_methods(cls, methods=None):
+        """
+        Chuan hoa cls.METHODS: parse alias, tach dau phay, bo trung, giu thu tu.
+
+        Chap nhan: ["top-k", "ema"], "EMA,SWA", ["all"], ["none"].
+        """
+        raw = cls.METHODS if methods is None else methods
+        if raw is None:
+            raw = []
+        if isinstance(raw, str):
+            raw = [raw]
+
+        tokens = []
+        for item in raw:
+            tokens.extend(str(item).replace(";", ",").split(","))
+
+        resolved = []
+        for token in tokens:
+            name = token.strip().lower()
+            if not name:
+                continue
+            if name == "all":
+                resolved.extend(cls.VALID_METHODS)
+                continue
+            if name in ("none", "off"):
+                resolved = []
+                continue
+            canonical = cls.METHOD_ALIASES.get(name)
+            if canonical is None:
+                raise ValueError(
+                    f"--methods {token!r} khong hop le. Chon trong "
+                    f"{list(cls.VALID_METHODS)} (hoac 'all'/'none'), "
+                    "vi du: --methods top-k ema swa | --methods EMA,SWA"
+                )
+            resolved.append(canonical)
+
+        # Giu thu tu chuan de bang ket qua luon nhat quan giua cac lan chay.
+        cls.METHODS = [m for m in cls.VALID_METHODS if m in set(resolved)]
+        return cls.METHODS
+
+    @classmethod
+    def method_enabled(cls, name):
+        return str(name).lower() in cls.METHODS
+
+    @classmethod
+    def swa_lr_mode(cls):
+        """'inherit' | 'truncate' - chuan hoa, chap nhan alias 'constant'."""
+        mode = str(cls.SWA_LR_SCHEDULE).strip().lower()
+        if mode == "constant":
+            return "truncate"
+        if mode not in ("inherit", "truncate"):
+            raise ValueError(
+                f"SWA_LR_SCHEDULE={cls.SWA_LR_SCHEDULE!r} khong hop le. "
+                "Chon 'truncate' hoac 'inherit'."
+            )
+        return mode
+
+    @classmethod
+    def swa_changes_schedule(cls):
+        """SWA co doi LR schedule khong => co phai tach run rieng khong."""
+        return cls.method_enabled("swa") and cls.swa_lr_mode() != "inherit"
+
+    @classmethod
+    def resolved_swa_lr(cls):
+        """
+        Gia tri constant LR thuc te cua pha SWA.
+
+        SWA_LR = None => trung binh cong cua LR lon nhat va nho nhat trong
+        annealing schedule: (LEARNING_RATE + ETA_MIN) / 2 - "intermediate value
+        between the largest and the smallest learning rate used in the annealing
+        scheme" (Izmailov et al. 4.3).
+        """
+        if cls.SWA_LR is None:
+            return (float(cls.LEARNING_RATE) + float(cls.ETA_MIN)) / 2.0
+        return float(cls.SWA_LR)
+
+    @classmethod
+    def validate_methods(cls):
+        """Kiem tra cau hinh EMA/SWA; goi tu validate_config()."""
+        cls.normalize_methods()
+
+        if cls.method_enabled("ema"):
+            if cls.EMA_DECAYS is not None:
+                if not cls.EMA_DECAYS:
+                    raise ValueError("EMA_DECAYS phai la None (tu suy) hoac list khong rong")
+                for decay in cls.EMA_DECAYS:
+                    if not 0.0 < float(decay) < 1.0:
+                        raise ValueError(f"EMA decay phai trong khoang (0, 1), nhan {decay}")
+            elif float(cls.EMA_WINDOW_EPOCHS) <= 0:
+                raise ValueError("EMA_WINDOW_EPOCHS phai duong")
+
+        if cls.method_enabled("swa"):
+            mode = cls.swa_lr_mode()
+            if not 0.0 <= float(cls.SWA_LR_START_FRAC) < 1.0:
+                raise ValueError("SWA_LR_START_FRAC phai trong [0, 1)")
+            if cls.SWA_LR is not None and float(cls.SWA_LR) <= 0.0:
+                raise ValueError("SWA_LR phai duong, hoac None de tu tinh (lr + eta_min)/2")
+            if mode != "inherit":
+                start = int(float(cls.SWA_LR_START_FRAC) * int(cls.NUM_EPOCHS))
+                print(
+                    "⚠ SWA_LR_SCHEDULE='%s': LR giu hang %g tu epoch %d/%d (%.0f%% budget). "
+                    "Day la TRAJECTORY KHAC voi run chuan => phai bao cao nhu mot experiment rieng."
+                    % (mode, cls.resolved_swa_lr(), start + 1, cls.NUM_EPOCHS,
+                       float(cls.SWA_LR_START_FRAC) * 100)
+                )
+                others = [m for m in ("top-k", "last-n", "ema") if cls.method_enabled(m)]
+                if others:
+                    print(
+                        "ℹ %s khong doi LR schedule con 'swa' thi co => se chay 2 EXPERIMENT "
+                        "RIENG BIET noi nhau: leg 1 = %s (scheduler chuan), leg 2 = ['swa'] "
+                        "(constant LR). Xem main.run_method_legs_if_needed()." % (others, others)
+                    )
+
+    @classmethod
+    def print_methods(cls):
+        print("  Methods: %s" % (", ".join(cls.METHODS) if cls.METHODS else "(none)"))
+        if cls.method_enabled("top-k"):
+            print("    top-k  : K in %s (Strategy 2)" % list(cls.TOP_K_VALUES))
+        if cls.method_enabled("last-n"):
+            print("    last-n : N = %s (Strategy 3)" % cls.LAST_N_EPOCHS)
+        if cls.method_enabled("ema"):
+            detail = ("dat tay %s" % list(cls.EMA_DECAYS)) if cls.EMA_DECAYS else (
+                "tu suy cho cua so %s epoch" % cls.EMA_WINDOW_EPOCHS)
+            print("    ema    : decay %s, khong warmup" % detail)
+        if cls.method_enabled("swa"):
+            mode = cls.swa_lr_mode()
+            tail = ("LR HANG SO %g - TRAJECTORY RIENG" % cls.resolved_swa_lr()
+                    if mode != "inherit" else "LR theo scheduler chung (inherit)")
+            print("    swa    : average tu %.0f%% budget, %s"
+                  % (float(cls.SWA_LR_START_FRAC) * 100, tail))
+
     @classmethod
     def get_num_classes(cls):
         """Return the known number of CIFAR-100 (fine label) classes."""
@@ -212,8 +420,11 @@ class Config:
         if cls.OPTIMIZER.lower() == "sgd" and cls.SGD_NESTEROV and cls.SGD_MOMENTUM <= 0:
             raise ValueError("SGD_NESTEROV=True requires SGD_MOMENTUM > 0")
         
+        cls.validate_methods()
+
         print("[OK] Config validated successfully")
         print(f"  Dataset: {cls.DATASET_NAME} (root={cls.DATA_ROOT})")
         print(f"  Number of classes: {cls.get_num_classes()}")
         print(f"  Optimizer: {cls.OPTIMIZER}")
         print(f"  Models to train: {len(cls.MODELS)}")
+        cls.print_methods()
