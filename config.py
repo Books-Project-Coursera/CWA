@@ -40,7 +40,10 @@ class Config:
     SUPPORTED_OPTIMIZERS = ("adamw", "adam", "sgd", "rmsprop")  # khớp với OPTIMIZER_CLASSES trong train.py
     OPTIMIZER = "adam"
     OPTIMIZER_BETAS = (0.9, 0.999)  # adam / adamw
-    OPTIMIZER_EPS = 0.0             # adam / adamw / rmsprop (khop run baseline efficientnet_b0)
+    OPTIMIZER_EPS = 1e-8           # adam/adamw/rmsprop. KHONG dat 0.0: Adam eps=0 gay
+                                   # 0/0 = NaN o cac param co second-moment = 0 (thay o
+                                   # seed1/seed100 NaN tu epoch 1). run_config.xlsx ghi 0.0
+                                   # la LATENT BUG, 1e-8 la default PyTorch.
     SGD_MOMENTUM = 0.9              # sgd / rmsprop
     SGD_NESTEROV = True             # sgd
     RMSPROP_ALPHA = 0.99            # rmsprop
@@ -328,6 +331,22 @@ class Config:
                     % (mode, cls.resolved_swa_lr(), start + 1, cls.NUM_EPOCHS,
                        float(cls.SWA_LR_START_FRAC) * 100)
                 )
+                # BAT BUOC tat early stopping khi SWA doi schedule: SWA bat dau
+                # average tu epoch floor(start_frac*E)+1 (75% => epoch 46/60).
+                # Neu early stopping cat truoc moc do, SWA gom 0 snapshot => KHONG
+                # co dong SWA nao trong ket qua (da thay o seed42 dung epoch 40,
+                # seed10 dung epoch 33). Dat patience = NUM_EPOCHS-1 => khong bao
+                # gio trigger, dam bao chay du budget de SWA co du epoch.
+                start = int(float(cls.SWA_LR_START_FRAC) * int(cls.NUM_EPOCHS)) + 1
+                if int(cls.EARLY_STOPPING_PATIENCE) != 0:
+                    print(
+                        "⚠ SWA can chay du %d epoch (average tu epoch %d) nhung "
+                        "EARLY_STOPPING_PATIENCE=%d co the cat truoc do => TU DONG dat "
+                        "EARLY_STOPPING_PATIENCE = 0 (TAT early stopping) cho leg SWA."
+                        % (int(cls.NUM_EPOCHS), start, int(cls.EARLY_STOPPING_PATIENCE))
+                    )
+                    cls.EARLY_STOPPING_PATIENCE = 0
+
                 others = [m for m in ("top-k", "last-n", "ema") if cls.method_enabled(m)]
                 if others:
                     print(

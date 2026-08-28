@@ -504,8 +504,13 @@ def strategy_shadow_average(model_name, shadow, test_loader, train_loader, num_c
     result = evaluate_model(model, test_loader, device, num_classes, class_names)
     eval_seconds = time.time() - eval_started
 
+    # method_seconds = CHI phi HAU-train de dung ra model cua method nay (BN recal).
+    # Overhead nuoi shadow trong luc train ("overhead_seconds") KHONG cong o day vi
+    # no da nam trong train_seconds (do wall-clock quanh vong train) => cong lai se
+    # DEM 2 LAN. Giu overhead_seconds rieng de tham khao neu can.
     result["timing"] = {
-        "method_seconds": float(shadow.get("overhead_seconds", 0.0)) + build_seconds,
+        "method_seconds": build_seconds,
+        "shadow_train_overhead_seconds": float(shadow.get("overhead_seconds", 0.0)),
         "eval_seconds": eval_seconds,
     }
 

@@ -45,6 +45,12 @@ class EarlyStopping:
         self.early_stop = False
     
     def __call__(self, val_loss):
+        # patience <= 0 => TAT HAN early stopping (giong Ultralytics). LUU Y: KHONG
+        # phai "dung ngay" - implementation nay neu patience=0 ma khong guard se
+        # dung o epoch dau tien khong cai thien (counter>=0 luon True). Guard nay
+        # cho phep dat EARLY_STOPPING_PATIENCE=0 de tat, dung nhu leg SWA can.
+        if self.patience is None or self.patience <= 0:
+            return
         if self.best_loss is None:
             self.best_loss = val_loss
         elif val_loss > self.best_loss - self.min_delta:
